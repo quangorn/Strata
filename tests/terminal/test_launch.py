@@ -900,6 +900,22 @@ class FlagsCommand(unittest.TestCase):
         self.assertEqual(p["settings"]["extra"], {"--dspark": "on"})
         self.assertIn("--set dspark=on", p["flags"])
 
+    def test_conversation_disk_persist_takes_a_word_and_not_a_bare_flag(self):
+        # the preset's "--conversation-disk-persist": "on" used to become a lone "--conversation-disk-persist" in the launch
+        # file, and the engine refused to start ("--conversation-disk-persist needs a value")
+        from strata_cli.launch import settings as S
+        from strata_control import tune_knobs
+        base = ["--pack", "p", "--conversation-disk-dir", "D:\\tmp\\conv"]
+        for word in ("on", "off", "exit-only"):
+            a, _ = S.as_argv_changes({"--conversation-disk-persist": word}, tune_knobs.BOOL_FLAGS)
+            self.assertEqual(a, {"--conversation-disk-persist": word})
+            out = tune_knobs.apply_to_argv(base, a)
+            self.assertEqual(out[-2:], ["--conversation-disk-persist", word], word)
+            self.assertNotEqual(out[-1], "", word)
+        a, _ = S.as_argv_changes({"--conversation-disk-persist": "ON"}, tune_knobs.BOOL_FLAGS)
+        self.assertEqual(a, {"--conversation-disk-persist": "on"})
+        self.assertEqual(S.as_argv_changes({"--conversation-disk-persist": ""}, tune_knobs.BOOL_FLAGS)[0], {})
+
     def test_api_key_flags(self):
         p = self.plan("--model", "q2_0", "--access", "lan", "--api-key", "sk-mine")
         self.assertEqual(p["settings"]["api_key"], "set")

@@ -279,8 +279,9 @@ def settings_from_pairs(pairs: list[str]) -> dict[str, str]:
 
 #: Options whose value is a WORD the engine reads (on, off, auto, none): the word goes through as typed. Making "on" a bare flag
 #: started strata-dsv41 with a lone `--dspark`, which it refuses ("--dspark needs a value", #3959), and "off" removed the flag instead of
-#: switching the drafter off.
-WORD_VALUE_FLAGS = frozenset({"--dspark"})
+#: switching the drafter off. `--conversation-disk-persist off|on|exit-only` is the same case: "on" is the value the engine wants,
+#: a bare `--conversation-disk-persist` stops it at the argument parse ("needs a value") and the launch dies while loading.
+WORD_VALUE_FLAGS = frozenset({"--dspark", "--conversation-disk-persist"})
 
 
 def as_argv_changes(extra: dict[str, str], bool_flags: frozenset[str]) -> tuple[dict[str, Any], dict[str, str | None]]:
