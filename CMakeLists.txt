@@ -20,7 +20,11 @@ if(STRATA_ENABLE_SYCL)
   add_subdirectory(sycl)
   return()
 endif()
-add_compile_definitions(STRATA_VERSION="${PROJECT_VERSION}")
+# A fork's build names itself: STRATA_VERSION_SUFFIX is appended to the project version in every version string the
+# engine prints (`strata --version`, the INFO engine= line the web monitor shows, and the engine= field in its log).
+# Empty is the default, so a build of this tree keeps naming itself "0.1.55" exactly as the release does.
+set(STRATA_VERSION_SUFFIX "" CACHE STRING "suffix for the engine's own version string, e.g. -local")
+add_compile_definitions(STRATA_VERSION="${PROJECT_VERSION}${STRATA_VERSION_SUFFIX}")
 # issue #31: release builds keep a PDB beside the exe (not shipped in it), so a minidump from a stalled engine can
 # be read back to the exact source line
 if(MSVC AND CMAKE_BUILD_TYPE STREQUAL "Release")
