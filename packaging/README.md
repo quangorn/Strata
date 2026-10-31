@@ -52,6 +52,58 @@ strata-dsv41.exe --variant rdna3` (about 240 MiB, 280 files). Strata puts the pa
 Cross-compilation is not attempted for the desktop app. Tauri bundles are per OS, and the Windows installer is built on Windows.
 The Python contracts, the owner transport, the checks and the engine build recipes are portable.
 
+## A local Windows CUDA engine (this PC)
+
+`packaging/build_engine_win_local.py` builds the CUDA engine from this checkout on this PC and puts it in the per-user component
+folder. It is the quick way to try a branch or a fix on a real model: nothing is downloaded or uploaded, and the build is kept
+between runs, so a second run after a source edit recompiles only what changed.
+
+```sh
+/usr/bin/python3 packaging/build_engine_win_local.py plan     # show paths, archs and versions; build nothing
+/usr/bin/python3 packaging/build_engine_win_local.py engine   # strata.exe and strata_kq.dll only
+/usr/bin/python3 packaging/build_engine_win_local.py vision   # only the picture reader, into the last build
+/usr/bin/python3 packaging/build_engine_win_local.py package  # only the package from the last build
+/usr/bin/python3 packaging/build_engine_win_local.py          # all three: engine, picture reader, package
+```
+
+Run it in cygwin bash with cygwin's `/usr/bin/python3`. In cmd or PowerShell the checkout's own
+`.venv\Scripts\python.exe` works instead; the cygwin shell must use cygwin Python because of the path conversion it does
+(`cygpath` on `PATH` makes a Windows Python treat `/cygdrive/c/...` as a real path).
+
+It finds Visual Studio through `vswhere` (install the Desktop development with C++ workload; `STRATA_VCVARS` names
+`vcvars64.bat` by hand) and the CUDA toolkit through `CUDA_PATH` / `CUDA_ROOT`, then the newest `CUDA\v*` folder. The MSVC
+environment is read once and given to cmake, ninja and nvcc, so no "x64 Native Tools" prompt is needed. The builds are
+`Release` with `-DSTRATA_ENABLE_CUDA=ON`, and `BUILD_DIR` defaults to `build-c13-win`.
+
+Settings are environment variables, all optional:
+
+| Variable | Default | What it changes |
+| --- | --- | --- |
+| `ARCHS` | `89` (RTX 4080) | CUDA architectures, semicolons; the release cuda13 list is `75;86;89;120` |
+| `BUILD_JOBS` | `24` | compile jobs; a 24-job build of this tree on this PC (48 GB) needed at most 4 GB |
+| `BUILD_DIR` | `build-c13-win` | the build folder, kept between runs |
+| `STAGE` | `<build>/stage` | where `strata.exe`, `strata_kq.dll` and `BUILD.json` are staged |
+| `OUT` | `%LOCALAPPDATA%\Strata\components\engine` | where the package is written |
+| `VERSION_SUFFIX` | `-local` | the suffix the engine prints (`strata 0.1.55-local`); empty reports the release version |
+| `STRATA_PORTABLE` | `OFF` | `ON` builds for other PCs (AVX2 floor, static MSVC runtime) |
+| `STRATA_ISA_FLOOR` | AVX2 | `avx` or `none` for a CPU without AVX2 |
+| `EXTRA_FLAGS` | empty | more Release flags for C, C++ and nvcc |
+| `VCVARS_VER` | newest | an older MSVC toolset, e.g. `14.42` |
+| `CUDA_ROOT` / `STRATA_VCVARS` | found automatically | the toolkit / `vcvars64.bat` to use |
+
+To test a branch without touching the installed component, point the build, stage and output at a scratch folder:
+
+```sh
+BUILD_DIR=/cygdrive/c/Projects/Strata-fork/build-c13-win \
+STAGE='D:\tmp\my-branch\stage' OUT='D:\tmp\my-branch\out' VERSION_SUFFIX=-mybranch \
+  /usr/bin/python3 packaging/build_engine_win_local.py engine
+```
+
+The script removes `strata.exe` before the relink, so a binary left from an older commit cannot pass for the new build, and it
+runs the new `strata.exe --version` before staging. A run config can then name that binary directly in `"exe"`; the installed
+`component:strata-engine` package is not rebuilt unless `package` (or the default `all`) writes into `OUT`. The script needs a
+Windows PC with an NVIDIA card; Linux builds use `packaging/build_cuda_linux.sh`, and the Mac uses `packaging/build_vision_mac.sh`.
+
 ## The private Node runtime
 
 The desktop bundle ships a pinned standalone Node beside the App Host, so an end user supplies no runtime. It is not committed
