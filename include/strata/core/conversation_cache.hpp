@@ -246,8 +246,11 @@ public:
         uint64_t serial = 0;   // the entry's identity; its index shifts when entries before it go
     };
 
-    ConversationCache(size_t budget, size_t slots, int64_t min_tokens = 0)
-        : budget_(budget), slots_(slots), min_tokens_(min_tokens) {}
+    // `supersede_shorter`: the tenth rule (an older, shorter state of a conversation is superseded by a longer one).
+    // --serve leaves it on; --batch turns it off, because supersedes_richer() (#2526) only knows the deepest-checkpoint
+    // rule and would let a slot's park drop the main session's copy of the same conversation (#4420).
+    ConversationCache(size_t budget, size_t slots, int64_t min_tokens = 0, bool supersede_shorter = true)
+        : budget_(budget), slots_(slots), min_tokens_(min_tokens), supersede_shorter_(supersede_shorter) {}
     bool enabled() const { return budget_ != 0 && slots_ != 0; }
     /// `--conversation-cache-min-tokens`: whether a conversation of this length is worth one of `slots`.  Every
     /// parked conversation costs a whole slot whatever its length, so a client that interleaves short side requests
@@ -436,16 +439,17 @@ public:
     // the same conversation a turn back, whose DEEPEST checkpoint the outgoing chain still holds, so all it adds
     // is the tail the client rewrote (the reply as it was generated, before the next request re-rendered it) and
     // checkpoints older than that one.  A subagent's successive turns parked one such copy each, and make_room's
-    // oldest-first eviction then pushed the parent conversation out after `slots` turns.  Also superseded: an older,
-    // shorter state of this conversation with at most a tenth of its tokens not in the outgoing ones (rewritten turns
-    // back, when the chain's spread checkpoints no longer hold one near its end).  An entry without checkpoints, or
-    // another conversation that only shares the system prompt's root with it, is kept.  Returns how many were dropped.
+    // oldest-first eviction then pushed the parent conversation out after `slots` turns.  Also superseded (unless the
+    // cache was built with supersede_shorter off, as --batch builds it): an older, shorter state of this conversation
+    // with at most a tenth of its tokens not in the outgoing ones (rewritten turns back, when the chain's spread
+    // checkpoints no longer hold one near its end).  An entry without checkpoints, or another conversation that only
+    // shares the system prompt's root with it, is kept.  Returns how many were dropped.
     size_t drop_superseded(const std::vector<int32_t>& ids, const std::vector<ConversationImageKey>& images,
                            const std::vector<ConversationCheckpoint>& checkpoints, bool cvec) {
         size_t dropped = 0;
         for (size_t i = 0; i < entries_.size();) {
             const auto& e = entries_[i];
-            if (superseded_at(e, ids, images, checkpoints, cvec) > 0 &&
+            if (superseded_at(e, ids, images, checkpoints, cvec, supersede_shorter_) > 0 &&
                 !(guarded_ != 0 && serials_[i] == guarded_)) {
                 bytes_ -= e.bytes();
                 erase(i);
@@ -492,7 +496,7 @@ public:
     size_t parked_prefix_tokens(const std::vector<int32_t>& ids, const std::vector<ConversationImageKey>& images,
                                 const std::vector<ConversationCheckpoint>& checkpoints, bool cvec) const {
         size_t longest = 0;
-        for (const auto& e : entries_) longest = std::max(longest, superseded_at(e, ids, images, checkpoints, cvec));
+        for (const auto& e : entries_) longest = std::max(longest, superseded_at(e, ids, images, checkpoints, cvec, supersede_shorter_));
         return longest;
     }
 
@@ -511,7 +515,8 @@ private:
     // How many of `e`'s tokens the outgoing conversation holds when it supersedes `e (drop_superseded), else 0.
     static size_t superseded_at(const SavedConversation& e, const std::vector<int32_t>& ids,
                                 const std::vector<ConversationImageKey>& images,
-                                const std::vector<ConversationCheckpoint>& checkpoints, bool cvec) {
+                                const std::vector<ConversationCheckpoint>& checkpoints, bool cvec,
+                                bool supersede_shorter) {
         const ConversationCheckpoint* deepest = nullptr;
         for (const auto& c : e.checkpoints)
             if (!deepest || c.ids.size() > deepest->ids.size()) deepest = &c;
@@ -520,12 +525,27 @@ private:
         for (const auto& k : checkpoints)
             if (!held && k.ids == deepest->ids && k.imgs == deepest->imgs) held = true;
         if (held) return deepest->ids.size();
+        if (!supersede_shorter) return 0;
         // An entry holding a pinned shared prefix is what suffix queries branch from (request key pin=N); dropping it
         // takes that prefix out of the cache for all of them, and the next request re-reads it.  #2325/#4420.
         if (e.pinned()) return 0;
         const auto& own = e.live.ids;
         const size_t shared = std::mismatch(own.begin(), own.end(), ids.begin(), ids.end()).first - own.begin();
-        return ids.size() > own.size() && own.size() - shared <= own.size() / 10 ? shared : 0;
+        if (!(ids.size() > own.size() && own.size() - shared <= own.size() / 10)) return 0;
+        // The same token ids under another picture are different K/V: compare the images below the shared length.
+        return images_below_match(e, images, shared) ? shared : 0;
+    }
+    // The pictures at or past `n` belong to the tail; the ones below it are part of the shared prefix and must match.
+    // Both lists are in start order (the request builds them that way).
+    static bool images_below_match(const SavedConversation& e, const std::vector<ConversationImageKey>& images,
+                                   size_t n) {
+        size_t a = 0, b = 0;
+        while (a < e.live.imgs.size() && e.live.imgs[a].start < (int64_t) n) ++a;
+        while (b < images.size() && images[b].start < (int64_t) n) ++b;
+        if (a != b) return false;
+        for (size_t i = 0; i < a; ++i)
+            if (!(e.live.imgs[i] == images[i])) return false;
+        return true;
     }
     void erase(size_t index) {
         entries_.erase(entries_.begin() + (std::ptrdiff_t) index);
@@ -533,6 +553,7 @@ private:
     }
     size_t budget_ = 0, slots_ = 0, bytes_ = 0, evictions_ = 0, superseded_ = 0, borrowed_ = 0;
     int64_t min_tokens_ = 0;   // --conversation-cache-min-tokens: 0 parks every conversation, whatever its size
+    bool supersede_shorter_ = true;   // the tenth rule; off with --batch (supersedes_richer() does not see it)
     std::deque<SavedConversation> entries_; // least recently active first
     std::deque<uint64_t> serials_;          // entries_[i]'s identity, never reused
     uint64_t next_serial_ = 1, guarded_ = 0;

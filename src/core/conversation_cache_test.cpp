@@ -435,21 +435,25 @@ int main() {
         // a subagent that shares a 7900-token opening with the outgoing conversation and has its own tail after it:
         // 100 of 8000 tokens not shared, within the tenth, so the copy is dropped and that conversation's next turn
         // reads its opening again.  Measured behavior of the rule, pinned here.
-        auto sibling = [&](int32_t shared, int32_t tail) {
+        auto tail_after = [&](int32_t shared, int32_t tail, int32_t base) {
+            std::vector<int32_t> v = first(shared);
+            for (int32_t i = 0; i < tail; ++i) v.push_back(base + i);
+            return v;
+        };
+        auto sibling = [&](int32_t shared, int32_t tail, int32_t outgoing_tail) {
             ConversationCache cache(1 << 20, 8);
             SavedConversation copy = image({});
-            copy.live.ids = first(shared + tail);   // the shared opening and its own tail after it
+            copy.live.ids = tail_after(shared, tail, 9000);   // the shared opening and its own tail after it
             copy.checkpoints = {cp(first(shared))};
             cache.put(std::move(copy));
-            std::vector<int32_t> out = first(shared);   // a sibling conversation: the same opening, a different tail
-            out.insert(out.end(), 9000, 9000 + tail);
+            std::vector<int32_t> out = tail_after(shared, outgoing_tail, 8000);   // a sibling: the same opening, another tail
             reported = cache.parked_prefix_tokens(out, {}, {}, true);
             SavedConversation now = image({});
             now.live.ids = out;
             cache.put(std::move(now));
             return cache.superseded();
         };
-        check(sibling(7900, 500) == 1 && reported == 7900, "7900 of 8000 tokens shared: the sibling's copy is dropped");
+        check(sibling(7900, 100, 500) == 1 && reported == 7900, "7900 of 8000 tokens shared: the sibling's copy is dropped");
 
         // a parked copy holding a pinned shared prefix (the request key pin=N) is what suffix queries branch from;
         // dropping it takes that prefix out of the cache for all of them, and the next request re-reads it (#2325).
@@ -460,8 +464,7 @@ int main() {
             copy.checkpoints = {cp(first(5000))};
             copy.checkpoints[0].pinned = true;
             cache.put(std::move(copy));
-            std::vector<int32_t> out = first(5000);
-            out.insert(out.end(), 9000, 9500);
+            std::vector<int32_t> out = tail_after(5000, 500, 8000);
             reported = cache.parked_prefix_tokens(out, {}, {}, true);
             SavedConversation now = image({});
             now.live.ids = out;
@@ -469,6 +472,52 @@ int main() {
             return cache.superseded();
         };
         check(pinned_prefix() == 0 && reported == 0, "a pinned shared prefix is never superseded");
+
+        // the same token ids under another picture are different K/V: only the images below the shared length matter
+        auto with_images = [&](const std::vector<ConversationImageKey>& own_imgs,
+                               const std::vector<ConversationImageKey>& out_imgs,
+                               const std::vector<int32_t>& own_ids, const std::vector<int32_t>& out_ids) {
+            ConversationCache cache(1 << 20, 8);
+            SavedConversation copy = image({});
+            copy.live.ids = own_ids;
+            copy.live.imgs = own_imgs;
+            copy.checkpoints = {cp(first(100))};
+            cache.put(std::move(copy));
+            reported = cache.parked_prefix_tokens(out_ids, out_imgs, {}, true);
+            SavedConversation now = image({});
+            now.live.ids = out_ids;
+            now.live.imgs = out_imgs;
+            cache.put(std::move(now));
+            return cache.superseded();
+        };
+        const std::vector<int32_t> own8k = first(8000);
+        const std::vector<int32_t> out8k = tail_after(8000, 100, 8000);
+        check(with_images({{4000, 111}}, {{4000, 111}}, own8k, out8k) == 1 && reported == 8000,
+              "same ids and the same picture below the shared length: dropped");
+        check(with_images({{4000, 111}}, {{4000, 222}}, own8k, out8k) == 0 && reported == 0,
+              "same ids, another picture below the shared length: kept");
+        check(with_images({{4000, 111}}, {}, own8k, out8k) == 0 && reported == 0,
+              "a picture on one side only: kept");
+        check(with_images({{7950, 111}}, {{7950, 222}}, first(8000), tail_after(7900, 500, 8000)) == 1,
+              "a picture past the shared length does not stop the drop");
+
+        // --batch builds the cache with the shorter-state rule off: a slot's park leaves the main session's copy of the
+        // same conversation in place (supersedes_richer() only guards the deepest-checkpoint rule, #2526/#4420).
+        auto batch_cache = [&]() {
+            ConversationCache cache(1 << 20, 4, 0, false);
+            SavedConversation main_copy = image({});
+            main_copy.live.ids = first(8000);
+            main_copy.checkpoints = {cp(first(100))};   // the chain's spread checkpoints no longer hold its end
+            check(cache.put(std::move(main_copy)), "batch: park the main session's copy");
+            std::vector<int32_t> slot_ids = tail_after(7900, 500, 8000);   // the slot's longer state of it
+            reported = cache.parked_prefix_tokens(slot_ids, {}, {}, true);
+            SavedConversation slot = image({});
+            slot.live.ids = slot_ids;
+            check(cache.put(std::move(slot)) && cache.superseded() == 0 && cache.size() == 2,
+                  "batch: the shorter-state rule is off, so the main session's copy stays");
+            return reported;
+        };
+        check(batch_cache() == 0, "batch: a park reports nothing to supersede");
     }
     {
         // --conversation-cache-park-gain N: parked_prefix_tokens reports what a park now would supersede, so a
