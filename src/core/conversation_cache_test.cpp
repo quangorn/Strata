@@ -2,6 +2,7 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <numeric>
 #include <vector>
 
 using namespace strata::core;
@@ -351,9 +352,11 @@ int main() {
             return std::pair<int64_t, int64_t>(a_found, b_found);
         };
         const auto baseline = replay(false, false);
-        check(baseline.first == 14 && baseline.second == 0, "baseline: A returns to its prompt-read state, B to nothing (as measured)");
+        // the tenth rule drops the parked copy of a conversation when a longer state of the same conversation is
+        // parked, so B's copy at 15 is no longer there to be pushed out by slot pressure: its third turn finds it.
+        check(baseline.first == 14 && baseline.second == 15, "baseline: A returns to its prompt-read state, B to its own parked state");
         const auto parks_only = replay(true, false);
-        check(parks_only.first == 17 && parks_only.second == 0, "slot parks alone: A whole, B's copy evicted by a stale initial image");
+        check(parks_only.first == 17 && parks_only.second == 17, "slot parks alone: both return whole, the copies a park supersedes free the slot");
         const auto both = replay(true, true);
         check(both.first == 17 && both.second == 17, "slot parks + checkpoints back: both return whole");
     }
@@ -385,6 +388,87 @@ int main() {
         huge.live.gdn.resize(2 << 20);
         check(!cache.put(std::move(huge)) && cache.size() == 5 && cache.superseded() == 1,
               "an oversized put drops nothing");
+    }
+    {
+        // an older, shorter state of this conversation, rewritten from token 36 on; the outgoing chain holds only the
+        // root (spread checkpoints thinned out).  At most a tenth of its tokens not shared: superseded; more: kept.
+        auto cp = [](std::vector<int32_t> ids) { ConversationCheckpoint c; c.ids = std::move(ids); return c; };
+        auto first = [](int32_t n) { std::vector<int32_t> v(n); std::iota(v.begin(), v.end(), 1); return v; };
+        std::vector<int32_t> rewritten = first(36);   // and grown past the old state since
+        rewritten.insert(rewritten.end(), {900, 901, 902, 903, 904, 905, 906, 907, 908, 909});
+        const std::vector<ConversationCheckpoint> chain = {cp(first(4))};
+        size_t reported = 0;
+        auto superseded_after_rewrite = [&](int32_t tokens) {
+            ConversationCache cache(1 << 20, 8);
+            SavedConversation old = image({});
+            old.live.ids = first(tokens);
+            old.checkpoints = {cp(first(4)), cp(first(36)), cp(first(tokens - 1))};
+            cache.put(std::move(old));
+            reported = cache.parked_prefix_tokens(rewritten, {}, chain, true);
+            SavedConversation now = image({});
+            now.live.ids = rewritten;
+            now.checkpoints = chain;
+            cache.put(std::move(now));
+            return cache.superseded();
+        };
+        check(superseded_after_rewrite(40) == 1 && reported == 36, "4 of 40 tokens not shared: dropped");
+        check(superseded_after_rewrite(41) == 0 && reported == 0, "5 of 41 tokens not shared: kept");
+
+        // the plain append a client that only grows its history sends: the copy's last checkpoint fell out of the
+        // chain as the checkpoints spread, and every token of the copy is shared, so nothing is not shared.
+        auto append = [&](int32_t parked, int32_t outgoing) {
+            ConversationCache cache(1 << 20, 8);
+            SavedConversation copy = image({});
+            copy.live.ids = first(parked);
+            copy.checkpoints = {cp(first(200)), cp(first(3000)), cp(first(parked - 100))};
+            cache.put(std::move(copy));
+            const std::vector<ConversationCheckpoint> grown = {cp(first(200)), cp(first(7000)), cp(first(8000))};
+            reported = cache.parked_prefix_tokens(first(outgoing), {}, grown, true);
+            SavedConversation now = image({});
+            now.live.ids = first(outgoing);
+            now.checkpoints = grown;
+            cache.put(std::move(now));
+            return cache.superseded();
+        };
+        check(append(6000, 8500) == 1 && reported == 6000, "an append past a parked copy supersedes it");
+
+        // a subagent that shares a 7900-token opening with the outgoing conversation and has its own tail after it:
+        // 100 of 8000 tokens not shared, within the tenth, so the copy is dropped and that conversation's next turn
+        // reads its opening again.  Measured behavior of the rule, pinned here.
+        auto sibling = [&](int32_t shared, int32_t tail) {
+            ConversationCache cache(1 << 20, 8);
+            SavedConversation copy = image({});
+            copy.live.ids = first(shared + tail);   // the shared opening and its own tail after it
+            copy.checkpoints = {cp(first(shared))};
+            cache.put(std::move(copy));
+            std::vector<int32_t> out = first(shared);   // a sibling conversation: the same opening, a different tail
+            out.insert(out.end(), 9000, 9000 + tail);
+            reported = cache.parked_prefix_tokens(out, {}, {}, true);
+            SavedConversation now = image({});
+            now.live.ids = out;
+            cache.put(std::move(now));
+            return cache.superseded();
+        };
+        check(sibling(7900, 500) == 1 && reported == 7900, "7900 of 8000 tokens shared: the sibling's copy is dropped");
+
+        // a parked copy holding a pinned shared prefix (the request key pin=N) is what suffix queries branch from;
+        // dropping it takes that prefix out of the cache for all of them, and the next request re-reads it (#2325).
+        auto pinned_prefix = [&]() {
+            ConversationCache cache(1 << 20, 8);
+            SavedConversation copy = image({});
+            copy.live.ids = first(5000);
+            copy.checkpoints = {cp(first(5000))};
+            copy.checkpoints[0].pinned = true;
+            cache.put(std::move(copy));
+            std::vector<int32_t> out = first(5000);
+            out.insert(out.end(), 9000, 9500);
+            reported = cache.parked_prefix_tokens(out, {}, {}, true);
+            SavedConversation now = image({});
+            now.live.ids = out;
+            cache.put(std::move(now));
+            return cache.superseded();
+        };
+        check(pinned_prefix() == 0 && reported == 0, "a pinned shared prefix is never superseded");
     }
     {
         // --conversation-cache-park-gain N: parked_prefix_tokens reports what a park now would supersede, so a
