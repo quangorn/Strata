@@ -642,7 +642,11 @@ bool read_kv_payload(Bytes& in, const ConversationDiskBlock& rec, int64_t tokens
             kv.cells = round_up(tokens, page);
             kv.pooled_rows = row ? tokens / page + 1 : 0;
         } else if (kv.format != (int) format || kv.heads != heads || kv.head_dim != head_dim ||
-                   kv.page_size != page || kv.idx_dim != idx_dim || (size_t) kv.idx_dim * sizeof(float) != row) {
+                   kv.page_size != page || kv.idx_dim != idx_dim ||
+                   // the writer's rule (`plan_of`, line 340): rows exist only for a layer with an indexer, and there
+                   // one row is `idx_dim` floats.  The drafter's ring layer has an `idx_dim` and no rows at all, so
+                   // its blocks carry row 0 and must not be asked for `idx_dim * 4`.
+                   (row ? (size_t) kv.idx_dim * sizeof(float) != row : kv.pooled_rows != 0)) {
             error = "the kv blocks of a stage disagree on their layers";
             return false;
         }

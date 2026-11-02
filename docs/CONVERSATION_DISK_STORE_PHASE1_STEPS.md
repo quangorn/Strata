@@ -417,6 +417,54 @@ sessions against a same-day run without the change, the `new blocks versus a rew
 and start-up with a full folder. None of it is run, and nothing here claims a saving. The Windows build is done - this
 PC is Windows and MSVC 14.44, and `--target strata` is green - but no serving session was measured.
 
+**Follow-up, 2026-11-03: the store served on this PC, the writes and the append are good, and one reader rule
+was wrong.** The engine of package `0.1.55.3-windows-x86_64-cuda-cuda13` (its own string `strata 0.1.55-local`,
+manifest `build_id 73430364c9bf` = step 9, `BUILD.json` version `0.1.55`) served with
+`--conversation-disk-dir E:\strata-conv-data --conversation-disk-mib 153600 --conversation-disk-persist on`.
+The traffic was synthetic: 25 requests over 21 conversations of 24k-48k tokens, started through
+`/v1/chat/completions`, so parking (a switch-time event) and the RAM-cache evictions that feed the disk were real.
+Nineteen writes landed: 18 new entries and one append; the folder holds 18 entries (12 GiB). Measured:
+
+- **writes**: 18 of them. The biggest: `wrote 48196 tokens: 865 MiB in 28 blocks (24 new kv, 414.8 MiB;
+  4 new state, 450.4 MiB), index 0.6 MiB rewritten, 1 file, 1048 ms (866 MB/s)`. The per-block lines matched
+  the parsed block tables block by block (`new kv block stage 0: tokens 22528-24576, 17.6 MiB at 203305408`).
+- **append**: `wrote 24662 tokens (appended): 663 MiB in 1 blocks (0 new kv, 0.0 MiB; 1 new state, 112.6 MiB)`.
+  The entry grew by its delta only, and the index stamp `last_used_s` of a read that had bumped it was published
+  with the append.
+- **the folder stayed consistent under the live writes**: 18 `.idx` and 18 `.bin`, every `.bin` named by an index,
+  no `.tmp`, every `.bin` size = the 64-byte header + its blocks (no torn tail), kv blocks contiguous from token 0
+  in page-aligned pieces of at most 2048 tokens, state blocks with `start == end`, `used` stamps of the checkpoints
+  in the records. The `.bin` headers all read `STRACNV2` version 2 with this model and these settings.
+- **reads: 5 attempts, 0 disk hits.** Every one failed the same way:
+  `read of 24649 tokens: the state at 24649 could not be read (the kv blocks of a stage disagree on their layers)`,
+  then the same for the state at 16384, then `read of 24649 tokens failed after N ms`. The reason is in the reader,
+  not in the files: the drafter's ring layer (layer 12 of this model's 13-layer stage) carries `idx_dim = 128` and
+  `pooled_rows = 0` - `layer.cpp`'s `kv_plan` gives the drafter no indexer, and `valid()` refuses a capture with
+  `index = true` there - so every kv block of it writes `row = 0`, which is what the writer's own rule does
+  (`plan_of`, line 340, applies `row == idx_dim * 4` only to a layer that has rows). The reader compared
+  `(size_t) kv.idx_dim * sizeof(float) != row` for every layer and demanded 512 bytes from a layer that has none.
+  The blocks themselves agree byte for byte: parsing the `.bin` of the failed entries showed all 13 layers' headers
+  identical block by block, with `idx_dim=128, row=512` on the 12 indexed layers and `idx_dim=128, row=0` on the ring.
+
+The reader's rule is now the writer's rule: a block that carries rows must carry `idx_dim * 4` bytes, and a layer
+that established no rows must keep `row = 0`. A block that tries to carry rows for a row-0 layer was already refused
+by the copy path (`rec.tokens_start / page + rows > kv.pooled_rows`). The test added is the store's own: a stage of
+three K/V layers, the last one with an `idx_dim` and no indexer rows, written as two appends and read back. Measured
+on this PC (same build folder, Release): `conversation_disk_test`: **229 checks, exit 0** (219 before; 10 new). The
+rest of the suite is unchanged: `conversation_file_test` 183 checks with the golden sample (17 878 535 bytes, hash
+`0x70f812b350360d09`), `conversation_snapshot_test` 4865, `conversation_validation_test` 972,
+`session_save_reclaim_test` 119, `conversation_cache_test` 4854. The engine: `--target strata` built, exit 0.
+
+**Not yet measured**: the serving model runs the reader that fails, so the live disk read has not passed on hardware.
+The fixed engine has to be packaged and served, and then the same traffic must give a `disk hit` line. The plan's
+own comparison (a day of agent sessions against a run without the change) is still not run.
+
+**The version rule held**: `project(strata VERSION 0.1.55)` is unchanged, the engine names itself `0.1.55-local`,
+and the build number lives only in the package folder and manifest (`0.1.55.3-...`). The index identity hash is
+built from the settings and the engine's version string (`conversation_file.cpp:891` writes the pair
+`"engine", c.engine_version`; `generate.cpp:10507` sets it to `STRATA_VERSION`), so a package folder named
+`0.1.55.3` does not empty the store, and the start line reports `0 refused`.
+
 ## What each step must not touch
 
 - the session files of the HTTP API (`/slots/0?action=save|restore`) - keep v1 byte-identical,

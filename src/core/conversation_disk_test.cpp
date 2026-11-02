@@ -104,6 +104,23 @@ SavedConversation split_image(size_t tokens, uint8_t seed, int32_t first = 1000)
     return s;
 }
 
+// the drafter's ring layer, as `layer.cpp`'s kv_plan gives it (`pooled_rows = 2`, "the drafter has no indexer"):
+// its K/V has an `idx_dim` the capture carries, and no indexer rows, so every kv block of it writes row 0.
+// This is the layer the read path must not ask for `idx_dim * 4` bytes.
+SavedConversation with_ring_layer(SavedConversation s, uint8_t seed) {
+    const int64_t page = 4;
+    const int64_t cells = int64_t((s.live.ids.size() + size_t(page) - 1) / size_t(page)) * page;
+    ConversationKv kv;
+    kv.format = 2; kv.cells = cells; kv.heads = 1; kv.head_dim = 256; kv.page_size = page;
+    kv.pooled_rows = 0; kv.idx_dim = 128;
+    kv.k = pattern(size_t(cells) * 256 * 2, uint8_t(seed + 60));
+    kv.v = pattern(size_t(cells) * 256 * 2, uint8_t(seed + 70));
+    kv.k_scale = pattern(size_t(cells) * 4 * 2, uint8_t(seed + 80));
+    kv.v_scale = pattern(size_t(cells) * 4 * 2, uint8_t(seed + 90));
+    s.kv.push_back(std::move(kv));
+    return s;
+}
+
 bool same_checkpoint(const ConversationCheckpoint& a, const ConversationCheckpoint& b) {
     return a.ids == b.ids && a.imgs == b.imgs && a.gdn == b.gdn && a.ple == b.ple && a.tails == b.tails &&
            a.dead == b.dead && a.block_pos == b.block_pos && a.used == b.used && a.pinned == b.pinned;
@@ -600,6 +617,50 @@ int main() {
             check(tier.best(prompt_of(1700), {}, false).tokens == 1600, "supersede: the longer entry is the one left");
         }
         fs::remove_all(sdir);
+    }
+
+    {   // the drafter's ring layer (test 9): a K/V layer that carries an `idx_dim` and has no indexer rows.
+        // Every kv block of it writes row 0, and the reader must take it back instead of asking for `idx_dim * 4`.
+        const fs::path rdir = dir / "ring";
+        fs::create_directories(rdir);
+        const SessionFileIdentity sid{11, 11};
+        auto store = [&] {
+            auto o = opts(rdir, GiB);
+            o.persist = true;
+            o.identity = sid;
+            return o;
+        };
+        auto ring = [&](size_t tokens) { return with_ring_layer(image(tokens, 51, 7000, 0, 48, 1), 51); };
+        {
+            ConversationDiskTier tier(store());
+            check(tier.open(e) && tier.put(ring(600)), "ring: put 600 tokens with a ring layer");
+            tier.wait_idle();
+            check(tier.put(ring(4200)), "ring: put the longer image");
+            tier.wait_idle();
+            check(tier.size() == 1 && logged(" (appended)"), "ring: the delta appended to the entry");
+        }
+        ConversationDiskEntry idx;
+        for (const auto& f : fs::directory_iterator(rdir))
+            if (f.path().extension() == ".idx")
+                check(conversation_disk_index_read(f.path().string(), sid, idx), "ring: the index reads back");
+        check(idx.tokens == 4200 && idx.stages[0].blocks.size() == 9, "ring: the same table a layer with rows gives");
+        const SavedConversation expect = ring(4200);
+        {
+            ConversationDiskTier tier(store());
+            check(tier.open(e) && tier.size() == 1, "ring: open to read back");
+            const auto m = tier.best(prompt_of(4300, 7000), {}, false);
+            SavedConversation back;
+            const bool ok = tier.take(m.id, m.tokens, back, e);
+            check(ok, ok ? "ring: the read lands on the state with a row-0 layer"
+                         : ("ring: the read failed: " + e).c_str());
+            check(back.kv.size() == 3 && back.kv[2].pooled.empty() && back.kv[2].pooled_rows == 0 &&
+                  same_kv(back.kv[2], expect.kv[2]), "ring: the row-0 layer comes back byte for byte");
+            check(same_kv(back.kv[0], expect.kv[0]) && same_kv(back.kv[1], expect.kv[1]),
+                  "ring: the indexed layers read back as before");
+            check(same_checkpoint(back.live, expect.live) && back.checkpoints.size() == 5,
+                  "ring: the states are there, deepest first");
+        }
+        fs::remove_all(rdir);
     }
 
     {   // history rewrite (the plan's test 10): a client that edited its own history sends tokens that diverge from
