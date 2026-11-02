@@ -2,7 +2,8 @@
 // (ConversationCache::set_on_evict) are written by a background thread to a block store - one `.bin` per layer-split
 // stage, appended to, and one `.idx` naming its blocks - and read back when a request continues them, within a byte
 // budget and (unless `persist`) this run only.  A read keeps the entry: the next eviction of the same conversation
-// appends only its delta.  `persist`: the files are bound to the session files' identity (model
+// appends only its delta.  The budget evicts whole conversations, the least recently used first (`last_used_s`, which a
+// read stamps; `written_s` for one never read).  `persist`: the files are bound to the session files' identity (model
 // and settings), and the next start picks them up (the budget only).  A folder written by an older build (the v1
 // session files one per stage) is removed at start: its entries are not read.
 #pragma once
@@ -214,6 +215,7 @@ private:
     SessionFileIdentity file_identity() const;
     bool write_index_v2(Entry& e, std::string& error) const; // v2: the block store's index
     bool read_index(const std::string& path, Entry& e) const;   // v2 only: a v1 index is refused and removed
+    bool check_files(const Entry& e) const;                  // start-up: a state block, a header and a length per stage
     std::string scan_folder(size_t& stale, std::error_code& ec);   // open(): take in or remove; its log part
 
     ConversationDiskOptions options_;
@@ -221,7 +223,7 @@ private:
     uint64_t nonce_ = 0, next_id_ = 0, bytes_ = 0;
     mutable std::mutex m_;
     std::condition_variable cv_;
-    std::deque<Entry> entries_;   ///< on the disk, oldest first
+    std::deque<Entry> entries_;   ///< on the disk, least recently used first (the budget's order)
     std::deque<Job> queue_;       ///< waiting for the writer, oldest first
     bool writing_ = false;        ///< the writer holds a job (writing_entry_ is its keys)
     Entry writing_entry_;

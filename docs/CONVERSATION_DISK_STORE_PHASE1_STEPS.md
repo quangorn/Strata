@@ -52,11 +52,11 @@ tests 2-7 run on what steps 3 and 4 give.
 
 ## Where each step stands
 
-2026-11-02. **Steps 1, 2, 3 and 4 are done and green.** Step 1 touched only the gate's test; steps 2-4
+2026-11-02. **Steps 1, 2, 3, 4 and 5 are done and green.** Step 1 touched only the gate's test; steps 2-5
 the tier's own files. A park now writes the block store, a read keeps the entry and reads only the blocks its
-state needs, and a folder of the previous build is refused and removed at start (decision 3). The default path
-(no `--conversation-disk-dir`) is untouched, and every test run uses its own temporary folder - never the
-serving model's storage (decision 4).
+state needs, the budget evicts whole conversations by use, and a folder of the previous build is refused and
+removed at start (decision 3). The default path (no `--conversation-disk-dir`) is untouched, and every test run
+uses its own temporary folder - never the serving model's storage (decision 4).
 
 **Step 1, the gate: passes.** Measured on this PC (RTX 4080, sm_89, CUDA 13.4, MSVC 14.44.35207,
 build folder `build-c13-gate`, Release):
@@ -267,10 +267,39 @@ Measured on this PC (same build folder, Release):
 - the engine: `--target strata` built, exit 0; the only warnings from the touched files are the tree's own `getenv`
   C4996 lines in `generate.cpp`.
 
-**Next: step 5, budget and start-up** - the unit of eviction is the whole conversation chosen by `last_used_s`
-(oldest first), which `take()` now stamps; the start-up scan gains its newest rules (an entry with no `state` block,
-a `.bin` shorter than the table says or with a header of another entry or stage, and a `.bin` longer than the last
-indexed block kept and its excess ignored).
+**Step 5, budget and start-up: done.** The budget evicts whole conversations by use, not by write order, and the
+start-up scan refuses what a read could not rebuild. What landed:
+
+- `lru_s()` and `lru_victim()` (`src/core/conversation_disk.cpp`): an entry's use is the later of `last_used_s` (a
+  read's stamp, step 4) and `written_s` (a publish's), so an entry written after a read is not old; a tie falls to the
+  lower id. Both budget loops (`write()` step 3 and the scan's trim at start) take the victim from `lru_victim()`, so
+  what goes is the least recently used conversation that is neither the entry being extended nor one a read holds -
+  never a block and never a part of a conversation. The scan keeps `entries_` in that order.
+- `check_files()`, called by `read_index()` and so only at start: an entry is taken in only when every stage holds a
+  `state` block, every stage's `.bin` is at least as long as the table says (a longer file is a torn tail: kept, with
+  the excess ignored until the next append), its header names this model and these settings, and it names this entry
+  and this stage. The id and the stage are compared against the `.bin`'s own name (`name_ids()`), so a file of another
+  entry or another stage left under an index is refused; a name the tier's shape does not match is checked by its
+  header's stage alone.
+- nothing else moved: `write()`'s append rules, `take()`, the index format and the session files stay steps 3's and 4's.
+
+Measured on this PC (same build folder, Release):
+
+- `conversation_disk_test`: **187 checks, exit 0** (156 before; 31 new: three conversations where the oldest is read
+  and the second-oldest is the one a fourth evicts; a stateless index removed at start; a stage without state blocks
+  removed; a `.bin` cut into its last block removed; a `.bin` whose header names another id removed; one naming
+  another stage removed; a `.bin` with a 1000-byte torn tail taken in, kept and read back). The persist test that
+  copies one entry's `.bin` over another's now restores the second file's own header before the read, so it still
+  proves the block hashes catch foreign bytes while the header-of-another-entry case is a start-up refusal.
+- `ctest -C Release -R "conversation_|session_save"`: 11 of 11 passed (`conversation_disk_test` 4.8 s: the LRU order
+  is in seconds, so the budget test sleeps three times to order its writes). The usual GPU flake appeared in one run
+  and passed on the next (`_ckpt_vram_slots`, with the serving model holding 15.6 GB of the card's 16 GB; that test
+  does not include `conversation_disk.hpp`).
+- the engine: `--target strata` built, exit 0; no warning from the touched files.
+
+**Next: step 6, `used` and `pinned` in the index** - the LRU stamp and the shared-prefix pin move out of the
+checkpoint payload into the `state` block record, so both survive a restart, while the slot-save format stays v1 and
+byte-identical.
 
 ## What each step must not touch
 

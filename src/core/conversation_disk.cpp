@@ -4,6 +4,7 @@
 #include "strata/core/conversation_file.hpp"
 
 #include <algorithm>
+#include <charconv>
 #include <chrono>
 #include <cstdarg>
 #include <cstdio>
@@ -55,6 +56,55 @@ std::vector<std::string> files_of(const ConversationDiskEntry& e) {
     std::vector<std::string> out;
     for (const auto& stage : e.stages) out.push_back(stage.file);
     return out;
+}
+
+// The budget's order (phase 1, step 5): when the conversation was last used.  A read stamps `last_used_s`, a publish
+// stamps `written_s`, so the later of the two is the use - an entry written after a read is not old.  Seconds, as the
+// index holds them; a tie falls to the older id, the order entries are created in.
+int64_t lru_s(const ConversationDiskEntry& e) { return std::max(e.last_used_s, e.written_s); }
+
+// The whole conversation the budget removes next: the least recently used one that is neither the entry a write is
+// extending nor one a read holds.  `entries.size()` when nothing may go (the write then goes over the budget, which
+// the RAM cache does too: an entry is never split and never left half-written).
+size_t lru_victim(const std::deque<ConversationDiskEntry>& entries, uint64_t except) {
+    size_t victim = entries.size();
+    for (size_t i = 0; i < entries.size(); ++i) {
+        const auto& e = entries[i];
+        if (e.id == except || e.readers > 0) continue;
+        if (victim == entries.size() || lru_s(e) < lru_s(entries[victim]) ||
+            (lru_s(e) == lru_s(entries[victim]) && e.id < entries[victim].id))
+            victim = i;
+    }
+    return victim;
+}
+
+// The id and stage a `.bin`'s name holds ("strata-conv-<nonce>-<id>-<stage>.bin").  False when the name is not that
+// shape (a file a test or a person renamed): then only the header's stage can be checked against the index.
+bool name_ids(const std::string& file, uint64_t& id, uint32_t& stage) {
+    const std::string name = fs::path(file).filename().string();
+    const std::string prefix = ConversationDiskTier::file_prefix();
+    if (name.rfind(prefix, 0) != 0) return false;
+    std::string rest = name.substr(prefix.size());
+    if (rest.size() < 4 || rest.compare(rest.size() - 4, 4, ".bin") != 0) return false;
+    rest.resize(rest.size() - 4);
+    auto number = [](const std::string& s, unsigned& v) {
+        const auto r = std::from_chars(s.data(), s.data() + s.size(), v);
+        return !s.empty() && r.ec == std::errc{} && r.ptr == s.data() + s.size();
+    };
+    const size_t last = rest.rfind('-');
+    if (last == std::string::npos) return false;
+    unsigned nstage = 0;
+    if (!number(rest.substr(last + 1), nstage)) return false;
+    rest.resize(last);
+    const size_t second = rest.rfind('-');
+    if (second == std::string::npos) return false;
+    unsigned long long nid = 0;
+    const std::string id_s = rest.substr(second + 1);
+    const auto r = std::from_chars(id_s.data(), id_s.data() + id_s.size(), nid);
+    if (id_s.empty() || r.ec != std::errc{} || r.ptr != id_s.data() + id_s.size()) return false;
+    id = nid;
+    stage = nstage;
+    return true;
 }
 
 // The index file of a persistent entry: native-endian fields (the session files refuse a big-endian build too),
@@ -1004,6 +1054,55 @@ bool ConversationDiskTier::write_index_v2(Entry& e, std::string& error) const {
     return true;
 }
 
+bool ConversationDiskTier::check_files(const Entry& e) const {
+    // A restorable entry has a state block in every stage: a crash between the first K/V append and the first state
+    // append leaves blocks nobody can restore from.
+    for (const auto& stage : e.stages) {
+        bool have_state = false;
+        for (const auto& block : stage.blocks)
+            if (block.kind == ConversationDiskBlock::state) have_state = true;
+        if (!have_state) return false;
+    }
+    // Every stage's `.bin`: its header (this model and settings, this entry, this stage) and at least the bytes the
+    // table names.  A longer file is a torn tail past the last indexed block: it stays and is ignored until the next
+    // append writes over it.
+    const SessionFileIdentity want = file_identity();
+    uint64_t entry_id = 0;
+    bool have_id = false;
+    for (size_t s = 0; s < e.stages.size(); ++s) {
+        const auto& stage = e.stages[s];
+        std::error_code ec;
+        const fs::path path(stage.file);
+        if (!fs::is_regular_file(path, ec)) return false;
+        uint8_t bytes[kConversationDiskBinHeader];
+        {
+            std::ifstream f(path, std::ios::binary);
+            f.read(reinterpret_cast<char*>(bytes), (std::streamsize) sizeof bytes);
+            if (!f) return false;
+        }
+        ConversationDiskBinHeader header;
+        if (!conversation_disk_bin_header_read(bytes, sizeof bytes, header)) return false;
+        if (header.model != want.model || header.config != want.config) return false;
+        uint64_t file_id = 0;
+        uint32_t file_stage = 0;
+        if (name_ids(stage.file, file_id, file_stage)) {
+            if (header.id != file_id || header.stage != file_stage) return false;   // another entry's or stage's file
+        }
+        if (header.stage != (uint32_t) s) return false;
+        if (!have_id) {
+            entry_id = header.id;
+            have_id = true;
+        } else if (header.id != entry_id) {
+            return false;   // the stages of one entry are written under one id
+        }
+        uint64_t end = kConversationDiskBinHeader;
+        for (const auto& block : stage.blocks) end = std::max(end, block.offset + block.size);
+        const auto size = fs::file_size(path, ec);
+        if (ec || size < end) return false;   // the index outlived its data
+    }
+    return true;
+}
+
 bool ConversationDiskTier::read_index(const std::string& path, Entry& e) const {
     std::ifstream f(fs::path(path), std::ios::binary);
     const std::string b((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
@@ -1011,10 +1110,8 @@ bool ConversationDiskTier::read_index(const std::string& path, Entry& e) const {
     if (b.size() >= sizeof magic) std::memcpy(&magic, b.data(), sizeof magic);
     if (magic != kIndexMagicV2) return false;   // a v1 index ("STRCIDX1") or not an index: the scan removes it
     if (!read_index_v2(b, file_identity(), e)) return false;
-    std::error_code ec;
     for (auto& stage : e.stages) stage.file = (fs::path(options_.dir) / fs::path(stage.file).filename()).string();
-    for (const auto& stage : e.stages)
-        if (!fs::is_regular_file(fs::path(stage.file), ec)) return false;
+    if (!check_files(e)) return false;
     e.index = path;
     return true;
 }
@@ -1040,7 +1137,7 @@ std::string ConversationDiskTier::scan_folder(size_t& stale, std::error_code& ec
     }
     for (const auto& p : others)
         if (!kept.count(p)) { remove_file(p); ++stale; }
-    std::sort(found.begin(), found.end(), [](const Entry& a, const Entry& b) { return a.written_s < b.written_s; });
+    std::sort(found.begin(), found.end(), [](const Entry& a, const Entry& b) { return lru_s(a) < lru_s(b); });
     for (auto& e : found) {
         e.id = ++next_id_;
         bytes_ += e.bytes;
@@ -1048,12 +1145,14 @@ std::string ConversationDiskTier::scan_folder(size_t& stale, std::error_code& ec
     }
     size_t over = 0;
     while (!entries_.empty() && bytes_ > options_.budget_bytes) {
-        remove_locked(0, true);
+        const size_t victim = lru_victim(entries_, 0);
+        if (victim == entries_.size()) break;
+        remove_locked(victim, true);
         ++over;
     }
     return fmt("persistent (budget only): %zu conversations from earlier runs (%.0f MiB), %zu refused (a v1 index, "
-               "another model, engine version or settings), %zu over the budget removed", entries_.size(), mib(bytes_),
-               refused, over);
+               "another model, engine version or settings, a missing state block, a file the table outgrew), %zu over "
+               "the budget removed", entries_.size(), mib(bytes_), refused, over);
 }
 
 void ConversationDiskTier::log(const std::string& line) const {
@@ -1254,17 +1353,13 @@ void ConversationDiskTier::write(Job& job) {
     }
     need += index_estimate(updated) + 72 * new_blocks;   // the v2 index, rewritten whole on every publish
 
-    // 3. the budget: whole conversations, the oldest first, never the entry being extended
+    // 3. the budget: whole conversations, the least recently used first, never the entry being extended or one a read
+    // holds
     size_t made_room = 0;
     if (error.empty()) {
         std::lock_guard<std::mutex> lock(m_);
         while (bytes_ + need > options_.budget_bytes) {
-            size_t victim = entries_.size();
-            for (size_t i = 0; i < entries_.size(); ++i)
-                if (entries_[i].id != target && entries_[i].readers == 0) {   // a read holds its files
-                    victim = i;
-                    break;
-                }
+            const size_t victim = lru_victim(entries_, target);
             if (victim == entries_.size()) break;   // nothing removable is left (the target, or a read holds it)
             remove_locked(victim, true);
             ++made_room;

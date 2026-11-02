@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -12,6 +13,7 @@
 #include <future>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -659,7 +661,22 @@ int main() {
             if (f.path().extension() == ".bin") bins.push_back(f.path());
         std::sort(bins.begin(), bins.end());
         check(bins.size() == 2, "persist: two images");
+        ConversationDiskBinHeader b_head;
+        {
+            uint8_t bytes[kConversationDiskBinHeader];
+            std::ifstream f(bins[1], std::ios::binary);
+            f.read(reinterpret_cast<char*>(bytes), sizeof bytes);
+            check(f.good() && conversation_disk_bin_header_read(bytes, sizeof bytes, b_head), "persist: b's header");
+        }
         fs::copy_file(bins[0], bins[1], fs::copy_options::overwrite_existing);   // b's index now names a's image
+        {
+            // under b's own header (a header of another entry is refused at start, step 5): the blocks' hashes are
+            // what must catch a's bytes in b's file
+            uint8_t bytes[kConversationDiskBinHeader];
+            conversation_disk_bin_header_write(bytes, b_head);
+            std::fstream f(bins[1], std::ios::binary | std::ios::in | std::ios::out);
+            f.write(reinterpret_cast<const char*>(bytes), sizeof bytes);
+        }
         {
             ConversationDiskTier tier(persistent(4));
             check(tier.open(e) && tier.size() == 2, "persist: both taken in");
@@ -789,6 +806,172 @@ int main() {
                   "damage: and lowers restore_tokens after it");
         }
         fs::remove_all(rdir);
+    }
+
+    {   // the budget by use (step 5): three conversations, the oldest is read, a fourth arrives - the second-oldest
+        // goes, not the one just read
+        const fs::path bdir = dir / "budget";
+        fs::remove_all(bdir);
+        fs::create_directories(bdir);
+        const uint64_t three = 21ull << 20;   // three ~6.8 MiB conversations, not four
+        ConversationDiskTier tier(opts(bdir, three));
+        check(tier.open(e), "budget by use: open");
+        auto pause = [] { std::this_thread::sleep_for(std::chrono::milliseconds(1100)); };   // the LRU order is seconds
+        check(tier.put(image(400, 80, 1000)), "budget by use: put a");
+        tier.wait_idle();
+        pause();
+        check(tier.put(image(400, 81, 5000)), "budget by use: put b");
+        tier.wait_idle();
+        pause();
+        check(tier.put(image(400, 82, 9000)), "budget by use: put c");
+        tier.wait_idle();
+        check(tier.size() == 3 && tier.stats().evicted == 0, "budget by use: three fit");
+        pause();
+        const auto a = tier.best(prompt_of(450, 1000), {}, false);
+        SavedConversation back;
+        check(a.tokens == 400 && a.live && tier.take(a.id, a.tokens, back, e), "budget by use: read a, the oldest");
+        pause();
+        check(tier.put(image(400, 83, 13000)), "budget by use: put d");
+        tier.wait_idle();
+        check(tier.size() == 3 && tier.stats().evicted == 1, "budget by use: one conversation goes for d");
+        check(tier.best(prompt_of(450, 5000), {}, false).tokens == 0, "budget by use: b, the second oldest, went");
+        check(tier.best(prompt_of(450, 1000), {}, false).tokens == 400, "budget by use: a, just read, stayed");
+        check(tier.best(prompt_of(450, 9000), {}, false).tokens == 400 &&
+                  tier.best(prompt_of(450, 13000), {}, false).tokens == 400,
+              "budget by use: c and d stayed");
+        fs::remove_all(bdir);
+    }
+
+    {   // start-up (step 5): an entry is taken in only if it has a state block, its .bin is as long as the table says
+        // and its header names this entry and this stage; a longer .bin stays, its excess ignored
+        const fs::path sdir = dir / "startup";
+        const SessionFileIdentity sid{8, 8};
+        auto store = [&] {
+            auto o = opts(sdir, GiB);
+            o.persist = true;
+            o.identity = sid;
+            return o;
+        };
+        auto reset = [&] {
+            fs::remove_all(sdir);
+            fs::create_directories(sdir);
+            ConversationDiskTier tier(store());
+            check(tier.open(e) && tier.put(image(600, 90, 1000, 0, 48, 1)), "start-up: write an entry");
+            tier.wait_idle();
+        };
+        auto files = [&](const char* extension) {
+            std::vector<fs::path> out;
+            for (const auto& f : fs::directory_iterator(sdir))
+                if (f.path().extension() == extension) out.push_back(f.path());
+            std::sort(out.begin(), out.end());
+            return out;
+        };
+        auto lines_clear = [] { std::lock_guard<std::mutex> g(lines_m); lines.clear(); };
+        auto refused_at_start = [&](const char* label) {
+            ConversationDiskTier tier(store());
+            check(tier.open(e) && tier.size() == 0 && tier_files(sdir) == 0 && logged("1 refused"), label);
+        };
+
+        reset();
+        {
+            const fs::path index = files(".idx").front();
+            ConversationDiskEntry entry;
+            check(conversation_disk_index_read(index.string(), sid, entry), "start-up: read the index back");
+            auto& blocks = entry.stages[0].blocks;
+            blocks.erase(std::remove_if(blocks.begin(), blocks.end(),
+                                        [](const ConversationDiskBlock& b) {
+                                            return b.kind == ConversationDiskBlock::state;
+                                        }),
+                         blocks.end());
+            std::string ierr;
+            check(conversation_disk_index_write(index.string(), entry, sid, ierr),
+                  "start-up: publish an index of kv blocks only");
+        }
+        lines_clear();
+        refused_at_start("start-up: an entry with no state block is removed");
+
+        fs::remove_all(sdir);
+        fs::create_directories(sdir);
+        {
+            ConversationDiskTier tier(store());
+            check(tier.open(e) && tier.put(split_image(600, 91)), "start-up: write a two-stage entry");
+            tier.wait_idle();
+        }
+        {
+            const fs::path index = files(".idx").front();
+            ConversationDiskEntry entry;
+            check(conversation_disk_index_read(index.string(), sid, entry) && entry.stages.size() == 2,
+                  "start-up: two stages");
+            auto& blocks = entry.stages[1].blocks;
+            blocks.erase(std::remove_if(blocks.begin(), blocks.end(),
+                                        [](const ConversationDiskBlock& b) {
+                                            return b.kind == ConversationDiskBlock::state;
+                                        }),
+                         blocks.end());
+            std::string ierr;
+            check(conversation_disk_index_write(index.string(), entry, sid, ierr),
+                  "start-up: publish it without the second stage's state blocks");
+        }
+        lines_clear();
+        refused_at_start("start-up: a stage with no state block is removed");
+
+        reset();
+        {
+            const fs::path bin = files(".bin").front();
+            fs::resize_file(bin, fs::file_size(bin) - 100);   // into the last indexed block
+        }
+        lines_clear();
+        refused_at_start("start-up: a .bin shorter than the table says is removed");
+
+        reset();
+        {
+            const fs::path bin = files(".bin").front();
+            ConversationDiskBinHeader head;
+            head.model = sid.model;
+            head.config = sid.config;
+            head.id = 12345;   // the name says another id
+            head.stage = 0;
+            uint8_t bytes[kConversationDiskBinHeader];
+            conversation_disk_bin_header_write(bytes, head);
+            std::fstream f(bin, std::ios::binary | std::ios::in | std::ios::out);
+            f.write(reinterpret_cast<const char*>(bytes), sizeof bytes);
+        }
+        lines_clear();
+        refused_at_start("start-up: a .bin whose header names another entry is removed");
+
+        reset();
+        {
+            const fs::path bin = files(".bin").front();
+            ConversationDiskBinHeader head;
+            head.model = sid.model;
+            head.config = sid.config;
+            head.id = 1;       // the entry's own id, but the second stage
+            head.stage = 1;
+            uint8_t bytes[kConversationDiskBinHeader];
+            conversation_disk_bin_header_write(bytes, head);
+            std::fstream f(bin, std::ios::binary | std::ios::in | std::ios::out);
+            f.write(reinterpret_cast<const char*>(bytes), sizeof bytes);
+        }
+        lines_clear();
+        refused_at_start("start-up: a .bin whose header names another stage is removed");
+
+        reset();
+        const uint64_t last_block = fs::file_size(files(".bin").front());
+        {
+            std::ofstream f(files(".bin").front(), std::ios::binary | std::ios::app);
+            f << std::string(1000, 'x');   // a torn tail past the last indexed block
+        }
+        {
+            ConversationDiskTier tier(store());
+            check(tier.open(e) && tier.size() == 1, "start-up: a .bin longer than the table is taken in");
+            check(fs::file_size(files(".bin").front()) == last_block + 1000,
+                  "start-up: and the excess is kept until the next append");
+            const auto m = tier.best(prompt_of(650), {}, false);
+            SavedConversation back;
+            check(m.tokens == 600 && tier.take(m.id, m.tokens, back, e), "start-up: the entry reads back");
+            check(tier.size() == 1 && tier_files(sdir) == 2, "start-up: the entry and its files stay");
+        }
+        fs::remove_all(sdir);
     }
 
     fs::remove_all(dir);
