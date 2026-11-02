@@ -11,6 +11,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iterator>
+#include <map>
 #include <random>
 #include <set>
 #include <system_error>
@@ -146,8 +147,6 @@ void index_v2_bytes(IndexWriter& out, const ConversationDiskEntry& e, const Sess
     out.put<uint8_t>(e.cvec ? 1 : 0);
     out.put<uint64_t>(e.bytes);
     for (int64_t g : e.geometry) out.put<int64_t>(g);
-    out.put<int64_t>(e.layer_lo);
-    out.put<int64_t>(e.layer_hi);
     out.put<int64_t>(e.tokens);
     out.key(e.live);
     out.put<uint32_t>((uint32_t) e.checkpoints.size());
@@ -155,6 +154,9 @@ void index_v2_bytes(IndexWriter& out, const ConversationDiskEntry& e, const Sess
     out.put<uint32_t>((uint32_t) e.stages.size());
     for (const auto& s : e.stages) {
         out.str(fs::path(s.file).filename().string());   // the name: a read resolves it against the folder
+        out.put<int64_t>(s.layer_lo);
+        out.put<int64_t>(s.layer_hi);
+        out.put<uint32_t>(s.layers);
         out.put<uint32_t>((uint32_t) s.blocks.size());
         for (const auto& b : s.blocks) put_block(out, b);
     }
@@ -171,8 +173,6 @@ bool read_index_v2(const std::string& b, const SessionFileIdentity& id, Conversa
     e.cvec = in.get<uint8_t>() != 0;
     e.bytes = in.get<uint64_t>();
     for (auto& g : e.geometry) g = in.get<int64_t>();
-    e.layer_lo = in.get<int64_t>();
-    e.layer_hi = in.get<int64_t>();
     e.tokens = in.get<int64_t>();
     if (!in.key(e.live)) return false;
     const uint32_t nck = in.get<uint32_t>();
@@ -182,12 +182,16 @@ bool read_index_v2(const std::string& b, const SessionFileIdentity& id, Conversa
         if (in.key(c)) e.checkpoints.push_back(std::move(c));
     }
     const uint32_t nstages = in.get<uint32_t>();
-    if (!in.ok || nstages == 0 || nstages > in.left() / 8) return false;
+    if (!in.ok || nstages == 0 || nstages > in.left() / 20) return false;
     for (uint32_t s = 0; in.ok && s < nstages; ++s) {
         ConversationDiskStage stage;
         stage.file = in.str();
+        stage.layer_lo = in.get<int64_t>();
+        stage.layer_hi = in.get<int64_t>();
+        stage.layers = in.get<uint32_t>();
         const uint32_t nblocks = in.get<uint32_t>();
-        if (!in.ok || stage.file.empty() || nblocks > in.left() / 64) return false;
+        if (!in.ok || stage.file.empty() || stage.layers > 1u << 16 || nblocks > in.left() / 64) return false;
+        if (stage.layer_lo < 0 || stage.layer_hi < stage.layer_lo) return false;
         uint64_t end = kConversationDiskBinHeader;   // the first block starts after the header, and they only grow
         for (uint32_t k = 0; in.ok && k < nblocks; ++k) {
             ConversationDiskBlock block;
@@ -224,6 +228,575 @@ bool read_index_v2(const std::string& b, const SessionFileIdentity& id, Conversa
                 have_state = true;
             }
     return !have_state || e.tokens == deepest;
+}
+
+// ---- the block store's write path (phase 1, step 3) and the read path take() uses (step 4 adds the selective
+// reading, the chain check and the fallback to an earlier state).
+
+constexpr int64_t kBlockTokens = 2048;   // a kv block holds at most this many tokens, rounded down to the page
+
+// A block's 128 bits: one SessionHasher run per seed.  The hashes detect accidental corruption, not tampering (as
+// the session files').
+constexpr uint64_t kBlockSeedLo = 0x535452414b56324cull;   // "STRAKV2L"
+constexpr uint64_t kBlockSeedHi = 0x535452414b563248ull;   // "STRAKV2H"
+
+int64_t round_up(int64_t n, int64_t page) { return ((n + page - 1) / page) * page; }
+
+// The layout a stage image's K/V layers share: its extent, its page, and the bytes one cell (and one indexer row)
+// takes in each part.  All of it is derived from the image and checked, so an image whose parts are not whole cells,
+// or whose indexer rows are not one per page, is refused instead of being sliced wrongly.
+struct KvPlan {
+    int64_t upto = 0, page = 0, limit = 0;
+    std::vector<std::array<size_t, 4>> stride;   // per layer: k, v, k_scale, v_scale bytes per cell
+    std::vector<size_t> row;                     // per layer: one indexer row's bytes (0: no indexer)
+};
+
+bool kv_plan(const SavedConversation& img, KvPlan& plan, std::string& error) {
+    plan = {};
+    plan.upto = (int64_t) img.live.ids.size();
+    if (img.kv.empty()) return true;
+    plan.page = img.kv.front().page_size;
+    if (plan.page <= 0) {
+        error = "the image's K/V has no page size";
+        return false;
+    }
+    plan.limit = (plan.upto / plan.page) * plan.page;
+    const int64_t cells = plan.upto ? round_up(plan.upto, plan.page) : 0;
+    for (const auto& kv : img.kv) {
+        if (kv.page_size != plan.page || kv.cells != cells || kv.heads <= 0 || kv.head_dim <= 0) {
+            error = "the image's K/V layers disagree on their geometry";
+            return false;
+        }
+        std::array<size_t, 4> stride{};
+        const ConversationBuffer* parts[4] = {&kv.k, &kv.v, &kv.k_scale, &kv.v_scale};
+        for (size_t p = 0; p < 4; ++p) {
+            if (!cells) {
+                if (parts[p]->size()) {
+                    error = "a K/V part of an empty image is not empty";
+                    return false;
+                }
+                continue;
+            }
+            if (parts[p]->size() % (size_t) cells) {
+                error = "a K/V part is not a whole number of cells";
+                return false;
+            }
+            stride[p] = parts[p]->size() / (size_t) cells;
+        }
+        size_t row = 0;
+        if (kv.pooled_rows > 0) {
+            if (kv.idx_dim <= 0 || kv.pooled.size() % (size_t) kv.pooled_rows) {
+                error = "the indexer's rows are not a whole number of bytes";
+                return false;
+            }
+            row = kv.pooled.size() / (size_t) kv.pooled_rows;
+            // the store slices the indexer's rows on the page boundary, which is the indexer's block in this engine
+            if (row != (size_t) kv.idx_dim * sizeof(float) || kv.pooled_rows != plan.upto / plan.page + 1) {
+                error = "the indexer's rows are not one per page of tokens";
+                return false;
+            }
+        }
+        plan.stride.push_back(stride);
+        plan.row.push_back(row);
+    }
+    return true;
+}
+
+// The chained prefix digest: every token and image below `start`, seeded by the digest of the block before this one
+// in the stage's table.  It binds a block to its place in the conversation, so a block of another conversation (or of
+// another position in this one) never fits; phase 3 turns it into the store's key.
+uint64_t prefix_digest(const std::vector<int32_t>& ids, const std::vector<ConversationImageKey>& imgs, size_t start,
+                       uint64_t previous) {
+    SessionHasher h(previous);
+    if (start) h.update(ids.data(), start * sizeof(int32_t));
+    for (const auto& image : imgs) {
+        if (image.start >= (int64_t) start) break;
+        h.update(&image, sizeof image);
+    }
+    return h.digest();
+}
+
+// One stage's `.bin`, appended to: the 64-byte header, then blocks.  A write starts at the end of the last indexed
+// block, so a torn tail (a write that ended before its index was published) is overwritten by the next append.
+class BinFile {
+public:
+    bool open_new(const std::string& path, const ConversationDiskBinHeader& header, std::string& error) {
+        path_ = path;
+        f_.open(fs::path(path), std::ios::binary | std::ios::out | std::ios::trunc);
+        if (!f_) {
+            error = "cannot create " + path;
+            return false;
+        }
+        uint8_t bytes[kConversationDiskBinHeader];
+        conversation_disk_bin_header_write(bytes, header);
+        f_.write(reinterpret_cast<const char*>(bytes), (std::streamsize) kConversationDiskBinHeader);
+        if (!f_) {
+            error = "cannot write the header of " + path;
+            return false;
+        }
+        at_ = kConversationDiskBinHeader;
+        return true;
+    }
+    bool open_append(const std::string& path, const ConversationDiskBinHeader& header, uint64_t end,
+                     std::string& error) {
+        path_ = path;
+        f_.open(fs::path(path), std::ios::binary | std::ios::in | std::ios::out);
+        if (!f_) {
+            error = "cannot open " + path + " to append";
+            return false;
+        }
+        uint8_t bytes[kConversationDiskBinHeader];
+        f_.read(reinterpret_cast<char*>(bytes), (std::streamsize) kConversationDiskBinHeader);
+        ConversationDiskBinHeader found;
+        // the id is not compared: the start-up scan renumbers the entries it takes in (as it does for the v1 index), so
+        // the header's id is the one the write used, not the tier's.  The file's name and the stage bind it.
+        if (!f_ || !conversation_disk_bin_header_read(bytes, kConversationDiskBinHeader, found) ||
+            found.model != header.model || found.config != header.config || found.stage != header.stage) {
+            error = "the header of " + path + " names another file";
+            return false;
+        }
+        f_.seekp((std::streamoff) end);
+        if (!f_) {
+            error = "cannot seek in " + path;
+            return false;
+        }
+        at_ = end;
+        return true;
+    }
+    bool write(const void* p, size_t n) {
+        if (!n) return true;
+        f_.write(reinterpret_cast<const char*>(p), (std::streamsize) n);
+        if (!f_) return false;
+        at_ += n;
+        return true;
+    }
+    // closes and cuts a torn tail past the last indexed block
+    bool close(std::string& error) {
+        f_.close();
+        std::error_code ec;
+        fs::resize_file(fs::path(path_), at_, ec);
+        if (ec) {
+            error = "cannot cut " + path_ + " back: " + ec.message();
+            return false;
+        }
+        return true;
+    }
+    uint64_t at() const { return at_; }
+private:
+    std::fstream f_;
+    std::string path_;
+    uint64_t at_ = 0;
+};
+
+// Writes one block's bytes and hashes them: the record's 128 bits are the two SessionHasher runs of what was written.
+class BlockOut {
+public:
+    explicit BlockOut(BinFile& f) : f_(f), offset_(f.at()), lo_(kBlockSeedLo), hi_(kBlockSeedHi) {}
+    void u64(uint64_t v) { raw(&v, 8); }
+    void i64(int64_t v) { raw(&v, 8); }
+    void raw(const void* p, size_t n) {
+        if (!ok_ || !n) return;
+        if (!f_.write(p, n)) {
+            ok_ = false;
+            return;
+        }
+        lo_.update(p, n);
+        hi_.update(p, n);
+        n_ += n;
+    }
+    bool buffer(const ConversationBuffer& b, size_t offset, size_t n) {
+        if (!n) return ok_;
+        b.visit(offset, n, [&](const uint8_t* p, size_t c, size_t) {
+            raw(p, c);
+            return ok_;
+        });
+        return ok_;
+    }
+    bool ok() const { return ok_; }
+    ConversationDiskBlock done(uint32_t kind, int64_t start, int64_t end) const {
+        ConversationDiskBlock b;
+        b.kind = kind;
+        b.offset = offset_;
+        b.size = n_;
+        b.hash_lo = lo_.digest();
+        b.hash_hi = hi_.digest();
+        b.tokens_start = start;
+        b.tokens_end = end;
+        return b;
+    }
+private:
+    BinFile& f_;
+    uint64_t offset_;
+    uint64_t n_ = 0;
+    SessionHasher lo_, hi_;
+    bool ok_ = true;
+};
+
+// A kv block's bytes: for every layer of the stage its K/V header, then the five parts of the range [start,end).  The
+// indexer's completed rows are the ones the range completes (rows [start/page, end/page)).
+bool write_kv_payload(BlockOut& out, const SavedConversation& img, const KvPlan& plan, int64_t start, int64_t end) {
+    out.u64(img.kv.size());
+    const size_t cells = (size_t) (end - start);
+    for (size_t l = 0; l < img.kv.size() && out.ok(); ++l) {
+        const ConversationKv& kv = img.kv[l];
+        out.i64(kv.format);
+        out.i64(kv.heads);
+        out.i64(kv.head_dim);
+        out.i64(kv.page_size);
+        out.i64(kv.idx_dim);
+        out.u64(plan.row[l]);
+        const ConversationBuffer* parts[4] = {&kv.k, &kv.v, &kv.k_scale, &kv.v_scale};
+        for (size_t p = 0; p < 4; ++p) {
+            const size_t stride = plan.stride[l][p];
+            out.u64(stride * cells);
+            if (stride) out.buffer(*parts[p], stride * (size_t) start, stride * cells);
+        }
+        const size_t rows = plan.row[l] ? (size_t) ((end - start) / plan.page) : 0;
+        out.u64(rows * plan.row[l]);
+        if (rows) out.buffer(kv.pooled, (size_t) (start / plan.page) * plan.row[l], rows * plan.row[l]);
+    }
+    return out.ok();
+}
+
+uint64_t kv_payload_size(const SavedConversation& img, const KvPlan& plan, int64_t start, int64_t end) {
+    const size_t cells = (size_t) (end - start);
+    uint64_t n = 8;
+    for (size_t l = 0; l < img.kv.size(); ++l) {
+        n += 6 * 8;
+        for (size_t p = 0; p < 4; ++p) n += 8 + plan.stride[l][p] * cells;
+        const size_t rows = plan.row[l] ? (size_t) ((end - start) / plan.page) : 0;
+        n += 8 + rows * plan.row[l];
+    }
+    return n;
+}
+
+// A state block's bytes: the checkpoint's running-state arrays.  Its ids and images are the index's key, and `used`
+// and `pinned` are in the block record, so neither is here.
+bool write_state_payload(BlockOut& out, const ConversationCheckpoint& c) {
+    for (const auto* v : {&c.gdn, &c.ple, &c.tails, &c.dead, &c.block_pos}) {
+        out.u64(v->size());
+        out.raw(v->data(), v->size());
+    }
+    return out.ok();
+}
+
+uint64_t state_payload_size(const ConversationCheckpoint& c) {
+    return 5 * 8 + c.gdn.size() + c.ple.size() + c.tails.size() + c.dead.size() + c.block_pos.size();
+}
+
+// The v2 index's size for an entry: its identity, keys and table, as index_v2_bytes writes them (a record is 69
+// bytes; the few bytes of slack cover the counts).
+uint64_t index_estimate(const ConversationDiskEntry& e) {
+    uint64_t n = 128 + e.stages.size() * 24;
+    auto key = [&](const ConversationCheckpoint& c) { n += 16 + c.ids.size() * 4 + c.imgs.size() * 16; };
+    key(e.live);
+    for (const auto& c : e.checkpoints) key(c);
+    for (const auto& s : e.stages) n += 12 + s.file.size() + s.blocks.size() * 72;
+    return n;
+}
+
+// A block's bytes, read whole and checked against the record's 128 bits.
+bool read_block(const std::string& path, const ConversationDiskBlock& b, std::vector<uint8_t>& out,
+                std::string& error) {
+    if (b.size > (uint64_t) SIZE_MAX) {
+        error = "a block is larger than this build can address";
+        return false;
+    }
+    out.assign((size_t) b.size, 0);
+    std::ifstream f(fs::path(path), std::ios::binary);
+    if (!f) {
+        error = "cannot open " + path;
+        return false;
+    }
+    f.seekg((std::streamoff) b.offset);
+    f.read(reinterpret_cast<char*>(out.data()), (std::streamsize) out.size());
+    if ((size_t) f.gcount() != out.size()) {
+        error = "the block at " + std::to_string(b.offset) + " of " + path + " is cut short";
+        return false;
+    }
+    if (session_hash64(out.data(), out.size(), kBlockSeedLo) != b.hash_lo ||
+        session_hash64(out.data(), out.size(), kBlockSeedHi) != b.hash_hi) {
+        error = "the block at " + std::to_string(b.offset) + " of " + path + " fails its hash";
+        return false;
+    }
+    return true;
+}
+
+// The block payloads' reader: counts before arrays, as the index.
+class Bytes {
+public:
+    explicit Bytes(const std::vector<uint8_t>& b) : b_(b) {}
+    bool u64(uint64_t& v) { return raw(&v, 8); }
+    bool i64(int64_t& v) { return raw(&v, 8); }
+    bool raw(void* p, size_t n) {
+        if (n > b_.size() - at_) return false;
+        std::memcpy(p, b_.data() + at_, n);
+        at_ += n;
+        return true;
+    }
+    bool slice(const uint8_t*& p, size_t& n) {
+        uint64_t c = 0;
+        if (!u64(c) || c > b_.size() - at_) return false;
+        p = b_.data() + at_;
+        n = (size_t) c;
+        at_ += n;
+        return true;
+    }
+    bool done() const { return at_ == b_.size(); }
+private:
+    const std::vector<uint8_t>& b_;
+    size_t at_ = 0;
+};
+
+bool read_state_payload(Bytes& in, ConversationCheckpoint& c) {
+    std::vector<uint8_t>* parts[5] = {&c.gdn, &c.ple, &c.tails, &c.dead, &c.block_pos};
+    for (auto* v : parts) {
+        const uint8_t* p = nullptr;
+        size_t n = 0;
+        if (!in.slice(p, n)) return false;
+        if (n) v->assign(p, p + n);
+        else v->clear();
+    }
+    return in.done();
+}
+
+// Fills a stage image's K/V buffers from one kv block.  The first block of a stage sizes every layer (its geometry is
+// in the payload); later blocks only fill the ranges they cover.
+bool read_kv_payload(Bytes& in, const ConversationDiskBlock& rec, int64_t tokens, uint32_t layers,
+                     SavedConversation& img, std::string& error) {
+    uint64_t nlayers = 0;
+    if (!in.u64(nlayers) || nlayers != layers) {
+        error = "a kv block holds another number of layers";
+        return false;
+    }
+    const size_t range = (size_t) (rec.tokens_end - rec.tokens_start);
+    if (!range) {
+        error = "a kv block covers no tokens";
+        return false;
+    }
+    const bool fresh = img.kv.empty();
+    if (fresh) img.kv.resize((size_t) nlayers);
+    for (size_t l = 0; l < (size_t) nlayers; ++l) {
+        int64_t format = 0, heads = 0, head_dim = 0, page = 0, idx_dim = 0;
+        uint64_t row = 0;
+        if (!in.i64(format) || !in.i64(heads) || !in.i64(head_dim) || !in.i64(page) || !in.i64(idx_dim) ||
+            !in.u64(row) || heads <= 0 || head_dim <= 0 || page <= 0 || idx_dim < 0 || row > SIZE_MAX) {
+            error = "a kv block's layer header is invalid";
+            return false;
+        }
+        ConversationKv& kv = img.kv[l];
+        if (fresh) {
+            kv.format = (int) format;
+            kv.heads = heads;
+            kv.head_dim = head_dim;
+            kv.page_size = page;
+            kv.idx_dim = idx_dim;
+            kv.cells = round_up(tokens, page);
+            kv.pooled_rows = row ? tokens / page + 1 : 0;
+        } else if (kv.format != (int) format || kv.heads != heads || kv.head_dim != head_dim ||
+                   kv.page_size != page || kv.idx_dim != idx_dim || (size_t) kv.idx_dim * sizeof(float) != row) {
+            error = "the kv blocks of a stage disagree on their layers";
+            return false;
+        }
+        for (size_t p = 0; p < 4; ++p) {
+            const uint8_t* pbytes = nullptr;
+            size_t n = 0;
+            if (!in.slice(pbytes, n) || n % range) {
+                error = "a K/V slice is not a whole number of cells";
+                return false;
+            }
+            const size_t stride = n / range;
+            ConversationBuffer* buf = p == 0 ? &kv.k : p == 1 ? &kv.v : p == 2 ? &kv.k_scale : &kv.v_scale;
+            if (fresh) buf->resize(stride * (size_t) kv.cells);
+            else if (buf->size() != stride * (size_t) kv.cells) {
+                error = "a K/V slice disagrees with the layer's geometry";
+                return false;
+            }
+            size_t at = 0;
+            if (n && (!buf->visit(stride * (size_t) rec.tokens_start, n, [&](uint8_t* d, size_t c, size_t) {
+                    std::memcpy(d, pbytes + at, c);
+                    at += c;
+                    return true;
+                }) || at != n)) {
+                error = "a K/V slice does not fit its layer";
+                return false;
+            }
+        }
+        const uint8_t* prow = nullptr;
+        size_t nrow = 0;
+        if (!in.slice(prow, nrow)) {
+            error = "a kv block ends early";
+            return false;
+        }
+        if (fresh) kv.pooled.resize((size_t) kv.pooled_rows * row);
+        if (nrow) {
+            const size_t rowsz = row;
+            if (!rowsz || nrow % rowsz || (size_t) (rec.tokens_end / page) > (size_t) kv.pooled_rows) {
+                error = "a pooled slice does not fit its layer";
+                return false;
+            }
+            size_t at = 0;
+            if (!kv.pooled.visit(((size_t) rec.tokens_start / (size_t) page) * rowsz, nrow,
+                                 [&](uint8_t* d, size_t c, size_t) {
+                                     std::memcpy(d, prow + at, c);
+                                     at += c;
+                                     return true;
+                                 })) {
+                error = "a pooled slice does not fit its layer";
+                return false;
+            }
+        }
+    }
+    if (!in.done()) {
+        error = "a kv block holds bytes past its last layer";
+        return false;
+    }
+    return true;
+}
+
+ConversationCheckpoint* state_at(SavedConversation& img, int64_t tokens) {
+    if ((int64_t) img.live.ids.size() == tokens) return &img.live;
+    for (auto& c : img.checkpoints)
+        if ((int64_t) c.ids.size() == tokens) return &c;
+    return nullptr;
+}
+
+ConversationCheckpoint key_only(const ConversationCheckpoint& c) {
+    ConversationCheckpoint k;
+    k.ids = c.ids;
+    k.imgs = c.imgs;
+    return k;
+}
+
+// The entry a write appends to: the same stages, layer carves and layer counts; the deepest stored state's tokens
+// and images equal to the image's at that length; and every stored block's chained digest recomputed from the image.
+// That is the entry a read would have picked, so it is the one worth extending.
+bool chain_prefix(const ConversationDiskEntry& e, const std::vector<SavedConversation>& images) {
+    if (e.stages.empty() || e.stages.size() != images.size() || e.cvec != images.front().cvec ||
+        e.geometry != images.front().geometry || e.tokens <= 0)
+        return false;
+    for (size_t s = 0; s < images.size(); ++s) {
+        const auto& stage = e.stages[s];
+        if (stage.layer_lo != images[s].layer_lo || stage.layer_hi != images[s].layer_hi ||
+            stage.layers != images[s].kv.size() || stage.blocks.empty())
+            return false;
+    }
+    const SavedConversation& img = images.front();
+    const size_t tokens = img.live.ids.size();
+    if ((size_t) e.tokens > tokens) return false;
+    auto same_state = [&](const ConversationCheckpoint& key) {
+        const size_t n = key.ids.size();
+        if (!n || n > tokens || !std::equal(key.ids.begin(), key.ids.end(), img.live.ids.begin())) return false;
+        size_t j = 0;
+        for (const auto& image : img.live.imgs) {
+            if (image.start >= (int64_t) n) break;
+            if (j >= key.imgs.size() || !(key.imgs[j] == image)) return false;
+            ++j;
+        }
+        return j == key.imgs.size();
+    };
+    if (!same_state(e.live)) return false;
+    for (const auto& c : e.checkpoints)
+        if (!same_state(c)) return false;
+    for (const auto& stage : e.stages) {
+        uint64_t prefix = 0;
+        for (const auto& b : stage.blocks) {
+            if (b.tokens_start < 0 || (size_t) b.tokens_start > tokens) return false;
+            const uint64_t digest = prefix_digest(img.live.ids, img.live.imgs, (size_t) b.tokens_start, prefix);
+            if (digest != b.prefix_digest) return false;
+            prefix = digest;
+        }
+    }
+    return true;
+}
+
+// The entry's states after this image: the deepest state is `live`, the rest are checkpoints, deepest first.  A state
+// the entry already holds at a position keeps its key (the chain check proved the image agrees there).
+void merge_keys(ConversationDiskEntry& e, const SavedConversation& img) {
+    std::map<int64_t, ConversationCheckpoint> by_position;
+    auto add = [&](const ConversationCheckpoint& k) {
+        const int64_t at = (int64_t) k.ids.size();
+        if (!by_position.count(at)) by_position[at] = key_only(k);
+    };
+    for (const auto& c : e.checkpoints) add(c);
+    add(e.live);
+    add(img.live);
+    for (const auto& c : img.checkpoints) add(c);
+    e.live = by_position.rbegin()->second;
+    e.checkpoints.clear();
+    for (auto it = std::next(by_position.rbegin()); it != by_position.rend(); ++it)
+        e.checkpoints.push_back(it->second);
+    e.tokens = (int64_t) e.live.ids.size();
+}
+
+// Reads an entry's blocks back into the image they describe: every stage's image, its live state and its
+// checkpoints, and its K/V at the deepest state's extent.  `admit` is asked for the blocks' bytes first.
+bool read_entry_image(const ConversationDiskEntry& e, SavedConversation& out, uint64_t& bytes,
+                      const std::function<bool(uint64_t, std::string&)>& admit, std::string& error) {
+    out = SavedConversation{};
+    bytes = 0;
+    uint64_t total = 0;
+    for (const auto& stage : e.stages)
+        for (const auto& b : stage.blocks) total += b.size;
+    if (admit && !admit(total, error)) return false;
+    if (e.stages.empty()) {
+        error = "the entry holds no image";
+        return false;
+    }
+    for (size_t s = 0; s < e.stages.size(); ++s) {
+        const ConversationDiskStage& stage = e.stages[s];
+        SavedConversation& img = s == 0 ? out : out.stage_images.emplace_back();
+        img.geometry = e.geometry;
+        img.cvec = e.cvec;
+        img.layer_lo = stage.layer_lo;
+        img.layer_hi = stage.layer_hi;
+        img.live = key_only(e.live);
+        for (const auto& c : e.checkpoints) img.checkpoints.push_back(key_only(c));
+        const int64_t tokens = (int64_t) img.live.ids.size();
+        std::vector<uint8_t> block;
+        for (const auto& b : stage.blocks) {
+            if (!read_block(stage.file, b, block, error)) return false;
+            Bytes in{block};
+            if (b.kind == ConversationDiskBlock::kv) {
+                if (!read_kv_payload(in, b, tokens, stage.layers, img, error)) return false;
+            } else {
+                ConversationCheckpoint* c = state_at(img, b.tokens_start);
+                if (c == nullptr) {
+                    error = "a state block at " + std::to_string(b.tokens_start) + " tokens has no key";
+                    return false;
+                }
+                c->used = b.used;
+                c->pinned = b.pinned;
+                if (!read_state_payload(in, *c)) {
+                    error = "a state block at " + std::to_string(b.tokens_start) + " tokens is malformed";
+                    return false;
+                }
+            }
+            bytes += b.size;
+        }
+        // the moving spare indexer row of the deepest state comes from its state block (the kv blocks hold the
+        // completed rows only), byte-identical to a capture at that position
+        if (!img.kv.empty()) {
+            const int64_t page = img.kv.front().page_size;
+            for (size_t l = 0; l < img.kv.size(); ++l) {
+                if (!img.kv[l].pooled_rows) continue;   // a layer without an indexer (the draft)
+                const size_t row = (size_t) img.kv[l].idx_dim * sizeof(float);
+                if (img.live.dead.size() < (l + 1) * row) {
+                    error = "the deepest state has no spare indexer row for layer " + std::to_string(l);
+                    return false;
+                }
+                if (!img.kv[l].pooled.visit((size_t) (tokens / page) * row, row, [&](uint8_t* d, size_t n, size_t) {
+                        std::memcpy(d, img.live.dead.data() + l * row, n);
+                        return true;
+                    })) {
+                    error = "the state's spare indexer row does not fit its layer";
+                    return false;
+                }
+            }
+        }
+        bytes += kConversationDiskBinHeader;
+    }
+    return true;
 }
 
 double mib(uint64_t bytes) { return double(bytes) / (1024.0 * 1024.0); }
@@ -345,43 +918,19 @@ SessionFileIdentity ConversationDiskTier::file_identity() const {
     return options_.persist ? options_.identity : SessionFileIdentity{nonce_, kTierConfig};
 }
 
-bool ConversationDiskTier::write_index(Entry& e, std::string& error) const {
-    char name[96];
-    std::snprintf(name, sizeof name, "%s%016llx-%llu.idx", file_prefix(), (unsigned long long) nonce_,
-                  (unsigned long long) e.id);
-    const fs::path path = fs::path(options_.dir) / name;
-    const fs::path temp = fs::path(options_.dir) / ("." + std::string(name) + ".tmp");
+bool ConversationDiskTier::write_index_v2(Entry& e, std::string& error) const {
+    fs::path path;
+    if (!e.index.empty()) {
+        path = fs::path(e.index);   // an entry taken in from an earlier run keeps its index file
+    } else {
+        char name[96];
+        std::snprintf(name, sizeof name, "%s%016llx-%llu.idx", file_prefix(), (unsigned long long) nonce_,
+                      (unsigned long long) e.id);
+        path = fs::path(options_.dir) / name;
+    }
     e.written_s = std::chrono::duration_cast<std::chrono::seconds>(
         std::chrono::system_clock::now().time_since_epoch()).count();
-    const SessionFileIdentity id = file_identity();
-    IndexWriter out;
-    out.put(kIndexMagic);
-    out.put(id.model);
-    out.put(id.config);
-    out.put<int64_t>(e.written_s);
-    out.put<uint8_t>(e.cvec ? 1 : 0);
-    out.put<uint64_t>(e.bytes);
-    out.put<uint32_t>((uint32_t) e.files.size());
-    for (const auto& f : e.files) out.str(fs::path(f).filename().string());
-    out.key(e.live);
-    out.put<uint32_t>((uint32_t) e.checkpoints.size());
-    for (const auto& c : e.checkpoints) out.key(c);
-    {
-        std::ofstream f(temp, std::ios::binary | std::ios::trunc);
-        f.write(out.b.data(), (std::streamsize) out.b.size());
-        if (!f) {
-            error = "cannot write the index " + temp.string();
-            remove_file(temp.string());
-            return false;
-        }
-    }
-    std::error_code ec;
-    fs::rename(temp, path, ec);   // a reader sees the whole index or none
-    if (ec) {
-        error = "cannot publish the index: " + ec.message();
-        remove_file(temp.string());
-        return false;
-    }
+    if (!conversation_disk_index_write(path.string(), e, file_identity(), error)) return false;
     e.index = path.string();
     return true;
 }
@@ -565,73 +1114,248 @@ void ConversationDiskTier::writer() {
 void ConversationDiskTier::write(Job& job) {
     if (options_.before_write) options_.before_write();
     const size_t tokens = job.entry.live.ids.size();
-    size_t made_room = 0;
+    const auto t0 = std::chrono::steady_clock::now();
+    // the image's stages: the first stage's, then each later stage's (the writer takes no nested images)
+    std::vector<SavedConversation> images;
+    images.push_back(std::move(job.image));
+    for (auto& stage : images.front().stage_images) images.push_back(std::move(stage));
+    images.front().stage_images.clear();
+
+    // 1. the entry to append to: the longest chain that is a prefix of this image (the one a read would pick)
+    Entry updated;
+    uint64_t target = 0;
     {
         std::lock_guard<std::mutex> lock(m_);
-        while (!entries_.empty() && bytes_ + job.entry.bytes > options_.budget_bytes) {
-            remove_locked(0, true);
+        for (const auto& e : entries_) {
+            if (!chain_prefix(e, images)) continue;
+            if (!target || e.tokens > updated.tokens) {
+                target = e.id;
+                updated = e;
+            }
+        }
+        if (!target) {
+            updated = Entry{};
+            updated.id = ++next_id_;
+        }
+    }
+    if (!target) {
+        updated.cvec = images.front().cvec;
+        updated.geometry = images.front().geometry;
+        updated.tokens = (int64_t) images.front().live.ids.size();
+        updated.live = key_of(images.front().live);
+        for (const auto& c : images.front().checkpoints) updated.checkpoints.push_back(key_of(c));
+        updated.stages.resize(images.size());
+        for (size_t s = 0; s < images.size(); ++s) {
+            updated.stages[s].layer_lo = images[s].layer_lo;
+            updated.stages[s].layer_hi = images[s].layer_hi;
+            updated.stages[s].layers = (uint32_t) images[s].kv.size();
+        }
+        updated.bytes = 0;
+    } else {
+        merge_keys(updated, images.front());
+    }
+
+    // 2. what the write will add: the blocks this image has and the entry does not (sizes only, before anything is
+    // written, so the budget can make room first)
+    std::string error;
+    std::vector<KvPlan> plans(images.size());
+    uint64_t need = 0;
+    size_t new_blocks = 0;
+    std::vector<std::vector<std::pair<int64_t, int64_t>>> ranges(images.size());   // per stage: the new kv ranges
+    std::vector<std::vector<const ConversationCheckpoint*>> states(images.size());
+    for (size_t s = 0; s < images.size() && error.empty(); ++s) {
+        const SavedConversation& img = images[s];
+        if (!kv_plan(img, plans[s], error)) break;
+        ConversationDiskStage& stage = updated.stages[s];
+        if (plans[s].page <= 0) {
+            if (!img.kv.empty()) {
+                error = "the image has no K/V page size";
+                break;
+            }
+        } else {
+            int64_t last = 0;
+            for (const auto& b : stage.blocks)
+                if (b.kind == ConversationDiskBlock::kv) last = std::max(last, b.tokens_end);
+            const int64_t page = plans[s].page;
+            const int64_t piece = std::max<int64_t>(page, (kBlockTokens / page) * page);
+            for (int64_t start = last; start < plans[s].limit; start += piece) {
+                const int64_t end = std::min<int64_t>(start + piece, plans[s].limit);
+                ranges[s].push_back({start, end});
+                need += kv_payload_size(img, plans[s], start, end);
+                ++new_blocks;
+            }
+        }
+        states[s].push_back(&img.live);
+        for (const auto& c : img.checkpoints) states[s].push_back(&c);
+        for (const auto* c : states[s]) {
+            const int64_t at = (int64_t) c->ids.size();
+            bool held = false;
+            for (const auto& b : stage.blocks)
+                if (b.kind == ConversationDiskBlock::state && b.tokens_start == at) held = true;
+            if (!held) {
+                need += state_payload_size(*c);
+                ++new_blocks;
+            }
+        }
+        if (stage.blocks.empty()) need += kConversationDiskBinHeader;
+    }
+    need += index_estimate(updated) + 72 * new_blocks;   // the v2 index, rewritten whole on every publish
+
+    // 3. the budget: whole conversations, the oldest first, never the entry being extended
+    size_t made_room = 0;
+    if (error.empty()) {
+        std::lock_guard<std::mutex> lock(m_);
+        while (bytes_ + need > options_.budget_bytes) {
+            size_t victim = entries_.size();
+            for (size_t i = 0; i < entries_.size(); ++i)
+                if (entries_[i].id != target) {
+                    victim = i;
+                    break;
+                }
+            if (victim == entries_.size()) break;   // only the entry being extended is left
+            remove_locked(victim, true);
             ++made_room;
         }
         stats_.evicted += made_room;
     }
-    const auto t0 = std::chrono::steady_clock::now();
-    // one session file per image: the first stage's, then each later stage's (the writer takes no nested images)
-    std::vector<SavedConversation> parts = std::move(job.image.stage_images);
-    job.image.stage_images.clear();
-    const SessionFileIdentity id = file_identity();
-    SessionWriteOptions wo;
-    wo.min_free_bytes = options_.min_free_bytes;
-    wo.durable = false;   // a cache: a file a power loss damages fails its hash check and is read again from the prompt
-    Entry e = std::move(job.entry);
-    e.bytes = 0;
-    std::string error;
-    auto write_one = [&](const SavedConversation& img, size_t k) -> bool {
-        char name[96];
-        std::snprintf(name, sizeof name, "%s%016llx-%llu-%zu.bin", file_prefix(), (unsigned long long) nonce_,
-                      (unsigned long long) e.id, k);
-        const std::string path = (fs::path(options_.dir) / name).string();
-        size_t written = 0;
-        if (!session_file_write(path, img, id, written, error, wo)) {
-            remove_file(path);
-            return false;
+
+    // 4. append the blocks: kv first, then the states this entry does not hold yet
+    const SessionFileIdentity fid = file_identity();
+    std::vector<std::string> created;   // this write's own files, removed when it fails before the index is published
+    size_t blocks_written = 0;
+    for (size_t s = 0; s < images.size() && error.empty(); ++s) {
+        const SavedConversation& img = images[s];
+        ConversationDiskStage& stage = updated.stages[s];
+        ConversationDiskBinHeader header;
+        header.model = fid.model;
+        header.config = fid.config;
+        header.id = updated.id;
+        header.stage = (uint32_t) s;
+        BinFile file;
+        if (stage.blocks.empty()) {
+            char name[96];
+            std::snprintf(name, sizeof name, "%s%016llx-%llu-%zu.bin", file_prefix(), (unsigned long long) nonce_,
+                          (unsigned long long) updated.id, s);
+            stage.file = (fs::path(options_.dir) / name).string();
+            created.push_back(stage.file);
+            if (!file.open_new(stage.file, header, error)) break;
+        } else {
+            const auto& last = stage.blocks.back();
+            if (!file.open_append(stage.file, header, last.offset + last.size, error)) break;
         }
-        e.files.push_back(path);
-        e.bytes += written;
-        return true;
-    };
-    bool ok = write_one(job.image, 0);
-    for (size_t k = 0; ok && k < parts.size(); ++k) ok = write_one(parts[k], k + 1);
-    if (ok && options_.persist) ok = write_index(e, error);   // after the images: an index names complete files only
+        uint64_t prefix = stage.blocks.empty() ? 0 : stage.blocks.back().prefix_digest;
+        for (const auto& r : ranges[s]) {
+            BlockOut out(file);
+            if (!write_kv_payload(out, img, plans[s], r.first, r.second)) {
+                error = "the K/V of " + std::to_string(r.first) + "-" + std::to_string(r.second) +
+                        " tokens could not be written";
+                break;
+            }
+            ConversationDiskBlock rec = out.done(ConversationDiskBlock::kv, r.first, r.second);
+            rec.prefix_digest = prefix_digest(img.live.ids, img.live.imgs, (size_t) r.first, prefix);
+            prefix = rec.prefix_digest;
+            stage.blocks.push_back(rec);
+            ++blocks_written;
+        }
+        for (const auto* c : states[s]) {
+            if (!error.empty()) break;
+            const int64_t at = (int64_t) c->ids.size();
+            bool held = false;
+            for (const auto& b : stage.blocks)
+                if (b.kind == ConversationDiskBlock::state && b.tokens_start == at) held = true;
+            if (held) continue;
+            BlockOut out(file);
+            if (!write_state_payload(out, *c)) {
+                error = "the state at " + std::to_string(at) + " tokens could not be written";
+                break;
+            }
+            ConversationDiskBlock rec = out.done(ConversationDiskBlock::state, at, at);
+            rec.prefix_digest = prefix_digest(img.live.ids, img.live.imgs, (size_t) at, prefix);
+            rec.used = c->used;
+            rec.pinned = c->pinned;
+            prefix = rec.prefix_digest;
+            stage.blocks.push_back(rec);
+            ++blocks_written;
+        }
+        if (error.empty() && !file.close(error)) break;
+    }
+
+    // 5. publish the index: the blocks are on disk, the index names them
+    uint64_t bin_bytes = 0, index_bytes = 0;
+    if (error.empty()) {
+        for (const auto& stage : updated.stages) {
+            bin_bytes += kConversationDiskBinHeader;
+            for (const auto& b : stage.blocks) bin_bytes += b.size;
+        }
+        updated.bytes = bin_bytes;
+        if (!write_index_v2(updated, error)) {
+            for (const auto& f : created) remove_file(f);
+            created.clear();
+        } else {
+            std::error_code ec;
+            index_bytes = fs::file_size(updated.index, ec);
+            if (ec) index_bytes = 0;   // a size the folder will not give back is not worth failing the write
+            updated.bytes += index_bytes;
+        }
+    }
     job.image = SavedConversation{};   // the RAM goes back now, written or not
-    parts.clear();
     const double ms = ms_since(t0);
-    if (!ok) {
-        for (const auto& f : e.files) remove_file(f);
+    if (!error.empty()) {
+        for (const auto& f : created) remove_file(f);
         {
             std::lock_guard<std::mutex> lock(m_);
             ++stats_.write_failed;
         }
+        images.clear();
         log(fmt("dropped %zu tokens: the write failed after %.0f ms (%s)", tokens, ms, error.c_str()));
         return;
     }
-    const uint64_t b = e.bytes;
-    const size_t nfiles = e.files.size();
+
+    // 6. publish it in memory and remove the entries this image supersedes (a shorter state of the same conversation,
+    // which a read never picks again)
+    const uint64_t new_bytes = updated.bytes;
+    const uint64_t new_id = updated.id;
+    const int64_t new_tokens = updated.tokens;
+    const size_t nstages = updated.stages.size();
     size_t on_disk = 0;
+    size_t superseded = 0;
     uint64_t disk_bytes = 0;
     {
         std::lock_guard<std::mutex> lock(m_);
-        bytes_ += e.bytes;
-        entries_.push_back(std::move(e));
+        bool installed = false;
+        for (size_t i = 0; i < entries_.size(); ++i)
+            if (entries_[i].id == new_id) {
+                bytes_ -= entries_[i].bytes;
+                entries_[i] = std::move(updated);
+                bytes_ += new_bytes;
+                installed = true;
+                break;
+            }
+        if (!installed) {
+            entries_.push_back(std::move(updated));
+            bytes_ += new_bytes;
+        }
+        for (size_t i = entries_.size(); i-- > 0;) {
+            if (entries_[i].id == new_id || entries_[i].tokens >= new_tokens) continue;
+            if (chain_prefix(entries_[i], images)) {
+                remove_locked(i, true);
+                ++superseded;
+            }
+        }
         ++stats_.written;
-        stats_.bytes_written += b;
+        stats_.bytes_written += bin_bytes;
         stats_.write_ms += ms;
         on_disk = entries_.size();
         disk_bytes = bytes_;
     }
-    log(fmt("wrote %zu tokens: %.0f MiB in %zu file%s, %.0f ms (%.0f MB/s); on disk %zu, %.0f MiB; %zu removed for "
-            "the budget", tokens, mib(b), nfiles, nfiles == 1 ? "" : "s", ms, mbps(b, ms), on_disk,
-            mib(disk_bytes), made_room));
+    images.clear();
+    log(fmt("wrote %zu tokens%s: %.0f MiB in %zu blocks, %zu file%s, %.0f ms (%.0f MB/s); on disk %zu, %.0f MiB; "
+            "%zu removed for the budget, %zu superseded", tokens, target ? " (appended)" : "", mib(bin_bytes),
+            blocks_written, nstages, nstages == 1 ? "" : "s", ms, mbps(bin_bytes, ms), on_disk, mib(disk_bytes),
+            made_room, superseded));
+    (void) index_bytes;
 }
+
 
 bool ConversationDiskTier::take(uint64_t id, int64_t tokens, SavedConversation& out, std::string& error,
                                 const std::function<bool(uint64_t, std::string&)>& admit) {
@@ -669,28 +1393,36 @@ bool ConversationDiskTier::take(uint64_t id, int64_t tokens, SavedConversation& 
         return false;
     }
     const Entry want = entries_[index];
-    const std::vector<std::string>& files = want.files;
     remove_locked(index, false);   // the entry goes now; its files are deleted after the read, whatever it gives
     lock.unlock();
-    const SessionFileIdentity fid = file_identity();
-    SessionReadLimits limits;
-    limits.admit = admit;
     uint64_t bytes = 0;
     bool ok = true;
-    for (size_t k = 0; ok && k < files.size(); ++k) {
-        SavedConversation part;
-        size_t n = 0;
-        ok = session_file_read(files[k], fid, part, n, error, limits);
-        bytes += n;
-        if (!ok) break;
-        if (k == 0) out = std::move(part);
-        else out.stage_images.push_back(std::move(part));
+    size_t nfiles = 0;
+    if (!want.stages.empty()) {
+        // a v2 entry: the blocks the index names, read back into the image they describe
+        nfiles = want.stages.size();
+        ok = read_entry_image(want, out, bytes, admit, error);
+    } else {
+        const std::vector<std::string>& files = want.files;
+        nfiles = files.size();
+        const SessionFileIdentity fid = file_identity();
+        SessionReadLimits limits;
+        limits.admit = admit;
+        for (size_t k = 0; ok && k < files.size(); ++k) {
+            SavedConversation part;
+            size_t n = 0;
+            ok = session_file_read(files[k], fid, part, n, error, limits);
+            bytes += n;
+            if (!ok) break;
+            if (k == 0) out = std::move(part);
+            else out.stage_images.push_back(std::move(part));
+        }
+        if (ok && !holds(out, want.live, want.checkpoints, want.cvec)) {
+            ok = false;
+            error = "the files hold another conversation than their index";
+        }
     }
-    if (ok && !holds(out, want.live, want.checkpoints, want.cvec)) {
-        ok = false;
-        error = "the files hold another conversation than their index";
-    }
-    for (const auto& f : files) remove_file(f);
+    for (const auto& f : files_of(want)) remove_file(f);
     const double ms = ms_since(t0);
     lock.lock();
     if (!ok) {
@@ -706,7 +1438,7 @@ bool ConversationDiskTier::take(uint64_t id, int64_t tokens, SavedConversation& 
     stats_.tokens_back += (uint64_t) std::max<int64_t>(tokens, 0);
     lock.unlock();
     log(fmt("disk hit: %lld tokens, %.0f MiB in %zu file%s, %.0f ms (%.0f MB/s)%s", (long long) tokens, mib(bytes),
-            files.size(), files.size() == 1 ? "" : "s", ms - waited, mbps(bytes, ms - waited),
+            nfiles, nfiles == 1 ? "" : "s", ms - waited, mbps(bytes, ms - waited),
             waited > 0 ? fmt(", after %.0f ms waiting for its write", waited).c_str() : ""));
     log(summary());
     return true;

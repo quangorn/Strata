@@ -80,9 +80,12 @@ struct ConversationDiskBlock {
     bool pinned = false;                   ///< `state` only: the shared-prefix pin, out of the payload
 };
 
-/// One stage's `.bin` of an entry: the file and the blocks it holds, in write order (append order).
+/// One stage's `.bin` of an entry: the file, its layer carve and the blocks it holds, in write order (append order).
+/// A layer split gives each stage its own range and layer count, so they are here and not on the entry.
 struct ConversationDiskStage {
     std::string file;   ///< the `.bin`: the index holds its file name, a read resolves it against the tier's folder
+    int64_t layer_lo = 0, layer_hi = 0;   ///< the stage image's layer carve
+    uint32_t layers = 0;                  ///< its K/V layers (one per QSA layer of the carve, plus the draft)
     std::vector<ConversationDiskBlock> blocks;
 };
 
@@ -92,10 +95,9 @@ struct ConversationDiskEntry {
     uint64_t id = 0;                                ///< in the files' names
     std::vector<ConversationDiskStage> stages;      ///< the first stage's image, then one per later stage
     std::vector<std::string> files;                 ///< v1 only: one session file per stage (the v1 read path)
-    ConversationCheckpoint live;                    ///< keys only
+    ConversationCheckpoint live;                    ///< keys only: the deepest state
     std::vector<ConversationCheckpoint> checkpoints;   ///< keys only, deepest first
     std::array<int64_t, 18> geometry{};             ///< v2: the image's geometry (the restore checks the runtime's)
-    int64_t layer_lo = 0, layer_hi = 0;             ///< v2: the image's layer range
     int64_t tokens = 0;                             ///< v2: the deepest `state` block's position: what `best()` claims
     bool cvec = true;
     uint64_t bytes = 0;                             ///< the entry's files
@@ -200,7 +202,7 @@ private:
     void remove_locked(size_t index, bool delete_files);     // m_ held
     void log(const std::string& line) const;
     SessionFileIdentity file_identity() const;
-    bool write_index(Entry& e, std::string& error) const;    // v1 (until the write path moves over)
+    bool write_index_v2(Entry& e, std::string& error) const; // v2: the block store's index
     bool read_index(const std::string& path, Entry& e) const;   // v1 and v2
     std::string scan_folder(size_t& stale, std::error_code& ec);   // open(): take in or remove; its log part
 

@@ -46,14 +46,18 @@ ConversationCheckpoint checkpoint(size_t tokens, uint8_t seed, int32_t first = 1
     c.gdn = bytes_of(4099, seed);
     c.ple = bytes_of(77, seed + 1);
     c.tails = bytes_of(301, seed + 2);
-    c.dead = bytes_of(64, seed + 3);
+    c.dead = bytes_of(2 * 128 * 4, seed + 3);   // the moving indexer row, one per layer
     c.block_pos = bytes_of(8, seed + 4);
     c.used = 42 + seed;
     return c;
 }
 
-// one stage's image: `tokens` live tokens from `first`, checkpoints at a half and a quarter of them, two K/V layers
-SavedConversation image(size_t tokens, uint8_t seed, int32_t first = 1000, int64_t lo = 0, int64_t hi = 48) {
+// one stage's image: `tokens` live tokens from `first`, checkpoints at a half and a quarter of them, two K/V layers.
+// The K/V follows the engine's layout (conversation_snapshot.cpp): cells rounded up to the page, one indexer row per
+// page plus the moving spare row, and that spare row is the live state's `dead` (the store takes it from the state
+// block, so a capture keeps it there, byte for byte).
+SavedConversation image(size_t tokens, uint8_t seed, int32_t first = 1000, int64_t lo = 0, int64_t hi = 48,
+                        int64_t heads = 8) {
     SavedConversation s;
     for (size_t i = 0; i < s.geometry.size(); ++i) s.geometry[i] = int64_t(100 + i);
     s.layer_lo = lo; s.layer_hi = hi;
@@ -61,15 +65,25 @@ SavedConversation image(size_t tokens, uint8_t seed, int32_t first = 1000, int64
     s.live = checkpoint(tokens, seed, first);
     s.checkpoints.push_back(checkpoint(tokens / 2, uint8_t(seed + 9), first));    // the deepest first
     s.checkpoints.push_back(checkpoint(tokens / 4, uint8_t(seed + 19), first));
+    const int64_t page = 4;   // the kernels' page, and the indexer's block
+    const int64_t cells = int64_t((tokens + page - 1) / page) * page;
     for (int layer = 0; layer < 2; ++layer) {
         ConversationKv kv;
-        kv.format = 2; kv.cells = 1024; kv.heads = 2; kv.head_dim = 256; kv.page_size = 64; kv.pooled_rows = 9;
+        kv.format = 2; kv.cells = cells; kv.heads = heads; kv.head_dim = 256; kv.page_size = page;
+        kv.pooled_rows = int64_t(tokens) / page + 1;
         kv.idx_dim = 128;
-        kv.k = pattern(layer == 0 ? (17u << 20) + 5 : 4096, uint8_t(seed + layer));   // > 16 MiB: several segments
-        kv.v = pattern(4096, uint8_t(seed + 10));
-        kv.k_scale = pattern(512, uint8_t(seed + 20));
-        kv.v_scale = pattern(512, uint8_t(seed + 30));
-        kv.pooled = pattern(9 * 128 * 4, uint8_t(seed + 40));
+        kv.k = pattern(size_t(cells) * size_t(heads) * 256 * 2, uint8_t(seed + layer));
+        kv.v = pattern(size_t(cells) * size_t(heads) * 256 * 2, uint8_t(seed + 10));
+        kv.k_scale = pattern(size_t(cells) * size_t(heads) * 4 * 2, uint8_t(seed + 20));
+        kv.v_scale = pattern(size_t(cells) * size_t(heads) * 4 * 2, uint8_t(seed + 30));
+        kv.pooled = pattern(size_t(kv.pooled_rows) * 128 * 4, uint8_t(seed + 40));
+        const size_t row = size_t(kv.idx_dim) * sizeof(float);
+        size_t done = 0;
+        kv.pooled.visit(size_t(kv.pooled_rows - 1) * row, row, [&](uint8_t* p, size_t n, size_t) {
+            std::memcpy(p, s.live.dead.data() + size_t(layer) * row + done, n);
+            done += n;
+            return true;
+        });
         s.kv.push_back(std::move(kv));
     }
     return s;
@@ -87,6 +101,12 @@ bool same_checkpoint(const ConversationCheckpoint& a, const ConversationCheckpoi
            a.dead == b.dead && a.block_pos == b.block_pos && a.used == b.used;
 }
 
+bool same_kv(const ConversationKv& x, const ConversationKv& y) {
+    return x.format == y.format && x.cells == y.cells && x.heads == y.heads && x.head_dim == y.head_dim &&
+           x.page_size == y.page_size && x.pooled_rows == y.pooled_rows && x.idx_dim == y.idx_dim &&
+           x.k == y.k && x.v == y.v && x.k_scale == y.k_scale && x.v_scale == y.v_scale && x.pooled == y.pooled;
+}
+
 bool same(const SavedConversation& a, const SavedConversation& b) {
     if (a.geometry != b.geometry || a.layer_lo != b.layer_lo || a.layer_hi != b.layer_hi || a.cvec != b.cvec ||
         !same_checkpoint(a.live, b.live) || a.checkpoints.size() != b.checkpoints.size() || a.kv.size() != b.kv.size() ||
@@ -94,13 +114,8 @@ bool same(const SavedConversation& a, const SavedConversation& b) {
         return false;
     for (size_t i = 0; i < a.checkpoints.size(); ++i)
         if (!same_checkpoint(a.checkpoints[i], b.checkpoints[i])) return false;
-    for (size_t i = 0; i < a.kv.size(); ++i) {
-        const auto& x = a.kv[i]; const auto& y = b.kv[i];
-        if (x.format != y.format || x.cells != y.cells || x.heads != y.heads || x.head_dim != y.head_dim ||
-            x.page_size != y.page_size || x.pooled_rows != y.pooled_rows || x.idx_dim != y.idx_dim ||
-            !(x.k == y.k) || !(x.v == y.v) || !(x.k_scale == y.k_scale) || !(x.v_scale == y.v_scale) ||
-            !(x.pooled == y.pooled)) return false;
-    }
+    for (size_t i = 0; i < a.kv.size(); ++i)
+        if (!same_kv(a.kv[i], b.kv[i])) return false;
     for (size_t i = 0; i < a.stage_images.size(); ++i)
         if (!same(a.stage_images[i], b.stage_images[i])) return false;
     return true;
@@ -113,16 +128,17 @@ bool same_entry(const ConversationDiskEntry& a, const ConversationDiskEntry& b) 
         return x.ids == y.ids && x.imgs == y.imgs;
     };
     if (a.cvec != b.cvec || a.bytes != b.bytes || a.geometry != b.geometry ||
-        a.layer_lo != b.layer_lo || a.layer_hi != b.layer_hi || a.tokens != b.tokens ||
-        a.written_s != b.written_s || a.last_used_s != b.last_used_s || !same_key(a.live, b.live) ||
-        a.checkpoints.size() != b.checkpoints.size() || a.stages.size() != b.stages.size() || !b.files.empty())
+        a.tokens != b.tokens || a.written_s != b.written_s || a.last_used_s != b.last_used_s ||
+        !same_key(a.live, b.live) || a.checkpoints.size() != b.checkpoints.size() ||
+        a.stages.size() != b.stages.size() || !b.files.empty())
         return false;
     for (size_t i = 0; i < a.checkpoints.size(); ++i)
         if (!same_key(a.checkpoints[i], b.checkpoints[i])) return false;
     for (size_t s = 0; s < a.stages.size(); ++s) {
         const auto& x = a.stages[s];
         const auto& y = b.stages[s];
-        if (x.file != y.file || x.blocks.size() != y.blocks.size()) return false;
+        if (x.file != y.file || x.blocks.size() != y.blocks.size() || x.layer_lo != y.layer_lo ||
+            x.layer_hi != y.layer_hi || x.layers != y.layers) return false;
         for (size_t k = 0; k < x.blocks.size(); ++k) {
             const auto& p = x.blocks[k];
             const auto& q = y.blocks[k];
@@ -210,8 +226,6 @@ int main() {
         entry.cvec = false;
         entry.bytes = 4096;
         for (size_t i = 0; i < entry.geometry.size(); ++i) entry.geometry[i] = int64_t(100 + i);
-        entry.layer_lo = 0;
-        entry.layer_hi = 48;
         entry.tokens = 256;
         entry.live = key_of(256, 0);
         entry.checkpoints.push_back(key_of(128, 1));
@@ -219,6 +233,9 @@ int main() {
         for (uint32_t stage = 0; stage < 2; ++stage) {
             ConversationDiskStage s;
             s.file = "strata-conv-0123-7-" + std::to_string(stage) + ".bin";
+            s.layer_lo = int64_t(stage) * 24;
+            s.layer_hi = s.layer_lo + 24;
+            s.layers = 2;
             uint64_t at = kConversationDiskBinHeader;
             for (uint32_t b = 0; b < 2; ++b) {   // a kv block, then the state block at 256
                 ConversationDiskBlock block;
@@ -290,14 +307,14 @@ int main() {
         fs::remove(dir / "keep.bin");
     }
 
-    {   // background write, match, read back exactly (a layer split: two files; every checkpoint)
+    {   // background write, match, read back exactly (a layer split: two .bin and one index; every checkpoint)
         ConversationDiskTier tier(opts(dir, GiB));
         check(tier.open(e), "open 2");
         const SavedConversation expect = split_image(600, 1);
         check(tier.put(split_image(600, 1)), "put a split image");
         tier.wait_idle();
-        check(tier.size() == 1 && tier_files(dir) == 2 && !tier.pending(), "written: one file per stage");
-        check(logged("wrote 600 tokens") && logged("in 2 files"), "the write is logged");
+        check(tier.size() == 1 && tier_files(dir) == 3 && !tier.pending(), "written: one .bin per stage, one index");
+        check(logged("wrote 600 tokens") && logged("2 files"), "the write is logged");
         const auto live = tier.best(prompt_of(700), {}, false);
         check(live.tokens == 600 && live.live && live.id != 0, "best: the live state as a prefix");
         check(!live.queued && live.bytes == tier.bytes() && live.bytes > 0, "best: a written entry, its files' bytes");
@@ -315,7 +332,7 @@ int main() {
         check(tier.size() == 0 && tier.bytes() == 0 && tier_files(dir) == 0, "take removes the entry and its files");
         const auto st = tier.stats();
         check(st.queued == 1 && st.written == 1 && st.disk_hits == 1 && st.ram_hits == 0 && st.tokens_back == 600 &&
-              st.bytes_read == st.bytes_written && st.bytes_written > (34u << 20), "counters");
+              st.bytes_read == st.bytes_written && st.bytes_written > (8u << 20), "counters");
         check(logged("disk hit: 600 tokens") && logged("totals:"), "the hit and the totals are logged");
     }
 
@@ -336,7 +353,7 @@ int main() {
         check(tier.stats().ram_hits == 1 && logged("RAM hit: 400 tokens"), "a RAM hit, logged");
         release.set_value();
         tier.wait_idle();
-        check(!tier.pending() && tier.size() == 1 && tier_files(dir) == 1, "a written after the release");
+        check(!tier.pending() && tier.size() == 1 && tier_files(dir) == 2, "a written after the release");
         check(tier.best(prompt_of(450, 5000), {}, false).tokens == 0, "b is gone from the tier");
     }
 
@@ -344,14 +361,14 @@ int main() {
         ConversationDiskTier tier(opts(dir, GiB));
         check(tier.open(e) && tier.put(image(400, 40)), "clear: put a");
         tier.wait_idle();
-        check(tier.size() == 1 && tier_files(dir) == 1, "clear: a on the disk");
+        check(tier.size() == 1 && tier_files(dir) == 2, "clear: a on the disk");
         check(tier.clear() == 1 && tier.size() == 0 && tier_files(dir) == 0 && logged("removed all 1 conversations"),
               "clear: a and its file gone");
         check(tier.best(prompt_of(450), {}, false).tokens == 0, "clear: nothing matches");
     }
 
     {   // the budget: the oldest goes for a new one; an image above the budget is refused
-        ConversationDiskTier tier(opts(dir, 25ull << 20));   // one ~17 MiB image, not two
+        ConversationDiskTier tier(opts(dir, 10ull << 20));   // one ~7 MiB image, not two
         check(tier.open(e), "open 4");
         check(tier.put(image(400, 4)), "first queued");
         tier.wait_idle();
@@ -389,6 +406,134 @@ int main() {
         check(cache.size() == 1 && cache.evictions() == 1 && tier.size() == 1, "a is on the disk");
         check(tier.best(prompt_of(450), {}, false).tokens == 400, "a matches on the disk");
         check(cache.best(prompt_of(450, 8000), {}, false).tokens == 400, "b stays in RAM");
+    }
+
+    {   // the block store's write path: append (across runs), page-aligned kv blocks, a torn tail cut back
+        const fs::path sdir = dir / "store";
+        fs::create_directories(sdir);
+        const SessionFileIdentity sid{9, 9};
+        auto store = [&] {
+            auto o = opts(sdir, GiB);
+            o.persist = true;
+            o.identity = sid;
+            return o;
+        };
+        auto only_index = [&](ConversationDiskEntry& idx) {
+            for (const auto& f : fs::directory_iterator(sdir))
+                if (f.path().extension() == ".idx") return conversation_disk_index_read(f.path().string(), sid, idx);
+            return false;
+        };
+        auto bin_size = [&] {
+            for (const auto& f : fs::directory_iterator(sdir))
+                if (f.path().extension() == ".bin") return uint64_t(fs::file_size(f.path()));
+            return uint64_t(0);
+        };
+        {
+            ConversationDiskTier tier(store());
+            check(tier.open(e) && tier.put(image(600, 30, 1000, 0, 48, 1)), "store: put 600 tokens");
+            tier.wait_idle();
+        }
+        ConversationDiskEntry first;
+        check(only_index(first) && first.stages.size() == 1 && first.tokens == 600, "store: one stage, 600 tokens");
+        check(first.stages[0].layers == 2 && first.stages[0].layer_lo == 0 && first.stages[0].layer_hi == 48,
+              "store: the stage's carve is in the index");
+        uint64_t block_bytes = 0;
+        for (const auto& b : first.stages[0].blocks) block_bytes += b.size;
+        check(first.stages[0].blocks.size() == 4 && first.stages[0].blocks.front().kind == ConversationDiskBlock::kv &&
+              first.stages[0].blocks.front().tokens_start == 0 && first.stages[0].blocks.front().tokens_end == 600,
+              "store: the first block is the K/V of [0,600), then the three states");
+        check(bin_size() == kConversationDiskBinHeader + block_bytes, "store: the .bin is its header and its blocks");
+        for (const auto& f : fs::directory_iterator(sdir))
+            if (f.path().extension() == ".bin") {   // a torn tail: bytes a crash left past the last indexed block
+                std::ofstream out(f.path(), std::ios::binary | std::ios::app);
+                out << std::string(1000, 'x');
+            }
+        const uint64_t torn = bin_size();
+        check(torn == kConversationDiskBinHeader + block_bytes + 1000, "store: the tail is there before the append");
+        {
+            ConversationDiskTier tier(store());
+            check(tier.open(e) && tier.size() == 1, "store: the entry is taken in with its tail");
+            check(tier.put(image(4200, 30, 1000, 0, 48, 1)), "store: put the longer image");
+            tier.wait_idle();
+            check(tier.size() == 1 && logged(" (appended)"), "store: it appended to the entry of the earlier run");
+        }
+        ConversationDiskEntry second;
+        check(only_index(second) && second.tokens == 4200 && second.live.ids.size() == 4200,
+              "store: the index names the longer state");
+        uint64_t total = 0, kv_bytes = 0;
+        int64_t kv_at = 0, kv_blocks = 0;
+        bool aligned = true, tiled = true;
+        size_t states = 0;
+        for (const auto& b : second.stages[0].blocks) {
+            total += b.size;
+            if (b.kind == ConversationDiskBlock::state) {
+                ++states;
+                continue;
+            }
+            ++kv_blocks;
+            kv_bytes += b.size;
+            if (b.tokens_start != kv_at || b.tokens_end - b.tokens_start > 2048) tiled = false;
+            if (b.tokens_start % 4 || b.tokens_end % 4) aligned = false;
+            kv_at = b.tokens_end;
+        }
+        check(kv_at == 4200 && tiled && aligned && kv_blocks == 3,
+              "store: the kv blocks tile [0,4200) in page-aligned pieces of at most 2048 tokens");
+        check(states == 6 && second.stages[0].blocks.size() == 9,
+              "store: six states (three per image), appended and not rewritten");
+        check(bin_size() == kConversationDiskBinHeader + total,
+              "store: the .bin is its header and its blocks, and the torn tail was cut back");
+        check(kv_bytes < total && total - block_bytes < kv_bytes,
+              "store: the append wrote only the new blocks, not the whole image again");
+        {
+            ConversationDiskTier tier(store());
+            check(tier.open(e) && tier.size() == 1, "store: open to read back");
+            const auto m = tier.best(prompt_of(4300), {}, false);
+            check(m.tokens == 4200 && m.restore_tokens == 4200, "store: best claims the deepest state");
+            SavedConversation back;
+            check(tier.take(m.id, m.tokens, back, e), "store: read the appended entry");
+            const SavedConversation expect = image(4200, 30, 1000, 0, 48, 1);
+            check(same_checkpoint(back.live, expect.live) && back.kv.size() == expect.kv.size() &&
+                  same_kv(back.kv[0], expect.kv[0]) && same_kv(back.kv[1], expect.kv[1]),
+                  "store: the K/V of both writes came back byte for byte");
+            check(back.checkpoints.size() == 5 && same_checkpoint(back.checkpoints[0], expect.checkpoints[0]) &&
+                  same_checkpoint(back.checkpoints[1], expect.checkpoints[1]),
+                  "store: the two images' checkpoints are there, deepest first");
+            check(tier.size() == 0 && tier_files(sdir) == 0,
+                  "store: the read removed the entry (step 4 keeps it)");
+        }
+
+        // a stale shorter copy of the same conversation: the write appends to the longest and removes the shorter one
+        ConversationDiskEntry stale;
+        std::string ierr;
+        {
+            ConversationDiskTier tier(store());
+            check(tier.open(e) && tier.put(image(600, 41, 1000, 0, 48, 1)), "supersede: put 600 tokens");
+            tier.wait_idle();
+        }
+        check(only_index(stale) && stale.tokens == 600, "supersede: the 600-token index");
+        const fs::path stale_bin = sdir / stale.stages[0].file;   // the index holds the name
+        {
+            ConversationDiskTier tier(store());
+            check(tier.open(e) && tier.put(image(1200, 41, 1000, 0, 48, 1)), "supersede: put 1200 tokens");
+            tier.wait_idle();
+            check(tier.size() == 1 && logged(" (appended)"), "supersede: appended");
+        }
+        stale.stages[0].file = (sdir / "strata-conv-0000-stale-0.bin").string();
+        fs::copy_file(stale_bin, stale.stages[0].file);
+        check(conversation_disk_index_write((sdir / "strata-conv-0000-stale.idx").string(), stale, sid, ierr),
+              "supersede: a copy of the shorter index and its .bin, under their own names");
+        {
+            ConversationDiskTier tier(store());
+            check(tier.open(e) && tier.size() == 2, "supersede: both entries taken in");
+            check(tier.put(image(1600, 41, 1000, 0, 48, 1)), "supersede: put 1600 tokens");
+            tier.wait_idle();
+            check(tier.size() == 1 && logged("1 superseded"),
+                  "supersede: the write removed the shorter copy of the same conversation");
+            check(!fs::exists(stale.stages[0].file) && !fs::exists(sdir / "strata-conv-0000-stale.idx"),
+                  "supersede: its .bin and index are gone");
+            check(tier.best(prompt_of(1700), {}, false).tokens == 1600, "supersede: the longer entry is the one left");
+        }
+        fs::remove_all(sdir);
     }
 
     {   // persist: the files outlive the tier, and the next tier with the same identity takes them in
@@ -452,7 +597,7 @@ int main() {
             const auto m = tier.best(prompt_of(450, 6000), {}, false);
             check(m.tokens == 400, "persist: b matches by its index");
             SavedConversation back;
-            check(!tier.take(m.id, m.tokens, back, e) && back.kv.empty() && logged("hold another conversation"),
+            check(!tier.take(m.id, m.tokens, back, e) && back.kv.empty() && logged("fails its hash"),
                   "persist: a's image under b's index is refused, never restored as b");
             check(tier.best(prompt_of(450), {}, false).tokens == 400, "persist: a is still there");
         }

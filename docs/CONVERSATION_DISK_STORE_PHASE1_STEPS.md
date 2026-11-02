@@ -44,9 +44,9 @@ tests 2-7 run on what steps 3 and 4 give.
 
 ## Where each step stands
 
-2026-11-02. **Steps 1 and 2 are done and green**; step 1 touched only the gate's test, step 2 only the
-tier's own files. The engine's behaviour is unchanged: no entry is written in v2 yet, and the v1 write
-and read paths still run.
+2026-11-02. **Steps 1, 2 and 3 are done and green.** Step 1 touched only the gate's test; steps 2 and 3
+the tier's own files. A park now writes the block store, and a read still removes the entry (step 4
+changes that). The default path (no `--conversation-disk-dir`) is untouched.
 
 **Step 1, the gate: passes.** Measured on this PC (RTX 4080, sm_89, CUDA 13.4, MSVC 14.44.35207,
 build folder `build-c13-gate`, Release):
@@ -158,10 +158,64 @@ Measured:
 - the engine: `--target strata` built, exit 0 (warnings from the tree's own templates, none from the
   touched files).
 
-**Next: step 3, the write path** - find the entry to append to (or start one), `kv` blocks by
-page-aligned pieces, `state` blocks, publish the index, remove the entries the new image supersedes.
-Steps 2 and 3 may share a branch but land as separate commits (the store cannot be exercised without
-the writer).
+**Step 3, the write path: done.** A park now appends the blocks it does not have instead of writing the
+image again, and publishes a v2 index. What landed:
+
+- `write()` (`src/core/conversation_disk.cpp`) plans the delta before touching the disk: per stage, the
+  `kv` ranges the entry does not cover yet (page-aligned, at most `kBlockTokens = 2048` tokens each) and
+  the states it does not hold (the image's live state and its checkpoints), with their exact byte sizes,
+  so the budget can remove whole conversations first - never the entry being extended.
+- the append target is the longest entry whose chain is a prefix of this image: same stages, layer
+  carves and layer counts; every stored state's tokens and images equal to the image's at that length;
+  every stored `prefix_digest` recomputed from the image. No target: a new entry and its own files.
+  Then the entries this image supersedes (whole chains that are prefixes and shorter) are removed with
+  their files after the index is published.
+- the index the entry already has is rewritten in place (an entry taken in from an earlier run keeps its
+  file names); a `.bin` is appended from the end of the last indexed block, its header is checked
+  (model, config, stage), and a torn tail past that point is cut back when the write ends.
+- block payloads: a `kv` block is, per layer of the stage, the layer's K/V header (format, heads,
+  head_dim, page, indexer width, indexer row bytes) and the five parts of the range - the indexer's
+  completed rows only, sliced on the page boundary, which is the indexer's block in this engine; a
+  `state` block is the checkpoint's five running-state arrays. The state's ids and images are the
+  index's key, `used`/`pinned` are the record's, and the moving spare indexer row is the checkpoint's
+  `dead`, which is byte-identical to a capture at that position (agreed decision 2).
+- `take()` reads a v2 entry back: every block verified against its 128 bits, the stages, live state and
+  checkpoints rebuilt, the spare row put back from the state block. It still removes the entry after
+  the read: keeping it is step 4's change, and so are reading only the blocks a request needs and the
+  fallback to an earlier state when a block is damaged.
+- the v1 index writer is gone (every write is v2 now); the v1 read path stays for a folder an older
+  build wrote.
+
+Two corrections to step 2's format, which no code had written yet: the stage record carries its own
+`layer_lo`/`layer_hi`/`layers` (a layer split gives each stage its own carve, which one entry-level pair
+could not express), and the `.bin` header's id is not compared when appending, because the start-up scan
+renumbers the entries it takes in exactly as it does for the v1 index.
+
+The test fixture now builds K/V the way `conversation_snapshot.cpp` does (cells rounded up to the page,
+one indexer row per page plus the spare row, and that spare row also as the live state's `dead`). The old
+fixture's `cells = 1024` with 9 pooled rows at page 64 is not a layout the engine can produce, and the
+store refuses it instead of slicing it wrongly.
+
+Measured on this PC (same build folder, Release):
+
+- `conversation_disk_test`: **116 checks, exit 0** (86 before; the store's own block adds 30: two
+  page-aligned `kv` blocks in one append, blocks tiling `[0,4200)`, the `.bin` equal to its header and
+  its blocks with a 1000-byte torn tail cut back, the append writing less than the whole K/V again, the
+  read back byte for byte across two writes and two runs, and a stale shorter copy of the same
+  conversation removed with its files).
+- `ctest -C Release -R "conversation_|session_save"`: 11 of 11 passed in one run. In a later run
+  `conversation_snapshot_test_ckpt_vram_slots` failed ("six more restores allocate nothing on the card")
+  while the serving model held 15.6 GB of the card's 16 GB (`nvidia-smi`); three reruns in that state
+  failed the same way, and that test does not include `conversation_disk.hpp`.
+- the engine: `--target strata` built, exit 0; no warning from the touched files.
+
+Open point, static analysis and unconfirmed: the writer reads the image's host K/V buffers, and with
+`STRATA_PARK_ASYNC` a background copy may still be filling them (`conversation_park_join_for` is the
+documented reader call, and a CPU-only tier cannot make it). The v1 writer read the same buffers without
+that join, so this is not new here; it needs its own change at the caller.
+
+**Next: step 4, the read path** - `take()` keeps the entry, reads only the blocks it needs, verifies the
+chain and falls back to the previous state block on damage.
 
 ## What each step must not touch
 
