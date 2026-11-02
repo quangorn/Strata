@@ -111,6 +111,7 @@ struct Fixture {
             for (size_t j=0;j<data.size();++j) data[j]=(uint8_t)(salt+i*31+j*7+j/257);
             if (!data.empty()) cuda_check(cudaMemcpy(sources[i],data.data(),data.size(),cudaMemcpyDefault));
         }
+        cuda_check(cudaDeviceSynchronize());   // the capture reads the pools: the fills must be visible first
     }
     void fill_after(uint8_t salt, int64_t first_dirty) {
         for (size_t i=0;i<sources.size();++i) {
@@ -124,6 +125,79 @@ struct Fixture {
 };
 bool equal(const ConversationKv& a,const ConversationKv& b) {
     return a.k==b.k && a.v==b.v && a.k_scale==b.k_scale && a.v_scale==b.v_scale && a.pooled==b.pooled;
+}
+
+// The gate of the disk tier's phase 1 (docs/CONVERSATION_DISK_STORE_PHASE1.md): a kv block stores the cells of one
+// page-aligned token range, recorded at the flush that last covered them, and a later full write must reproduce
+// those bytes bit for bit. So for every K/V format the engine produces (the QSA layers' F16/INT8/Q4_0/hybrid, the
+// Hadamard-rotated INT8, and the pooled indexer rows), a capture at a page-aligned extent of a state that grew past
+// it must hold the same bytes below that extent as a capture at a longer page-aligned extent of the grown state.
+// The indexer's COMPLETED rows are compared row by row; the moving spare row is extent-dependent by design (it holds
+// the block being filled) and will belong to the disk tier's state block at a restore, not to a kv block.
+// If any check here fails, the page-aligned kv block is not the boundary and phase 1 stops at this gate.
+void golden_pagesafe() {
+    const auto shapes = qsa_real_shapes();
+    const int64_t page = shapes.page_size, ibk = shapes.idx_block;
+    const int64_t B = 20 * page;                 // the full write's extent (fixture max_cells: 24 pages of 4)
+    const int64_t last = 12 * page;              // the state grows here: bytes at or past these cells change
+    std::string err;
+    for (int fmt : std::array<int,4>{kKvF16,kKvInt8,kKvQ4,3})
+        for (int mode : {0,1,2}) {
+            if (fmt==3 && mode!=0) continue;     // hybrid is a device-pooled format only
+            for (bool rotated : {false, true}) { // #293: STRATA_KV_ROT turns INT8 into another format
+                if (rotated && fmt!=kKvInt8) continue;
+                for (bool index : {true, false}) {   // the draft layer keeps no indexer rows (index = false)
+                    // A ring state (mode 2) is the drafter: layer.cpp's kv_plan gives it pooled rows = 2 (the rolling
+                    // window) and no indexer history, and valid() refuses a capture with index=true. The gate tests
+                    // the ring's K/V with index=false, as every real capture of a drafter does.
+                    if (index && mode==2) continue;
+                    Fixture f(fmt,mode);
+                    f.state.kv_rot = rotated && !index;
+                    const std::string tag = "golden(" + std::to_string(fmt) + "," + std::to_string(mode) + "," +
+                        std::to_string(rotated) + "," + std::to_string(index) + ")";
+                    f.fill(13);
+                    // the flushes of an appending conversation: page-aligned extents that only grow
+                    const std::array<int64_t,3> flushes = {page, 5 * page, 9 * page};
+                    std::vector<ConversationKv> blocks;
+                    for (int64_t b : flushes) {
+                        ConversationKv one;
+                        std::array<uint64_t,5> sizes{};
+                        check(conversation_kv_save(one,f.state,f.g,b,index,err),
+                              (tag + ": capture a flush extent: " + err).c_str());
+                        check(conversation_kv_part_sizes(f.state,f.g,b,index,sizes,err),
+                              (tag + ": flush part sizes").c_str());
+                        const size_t per = fmt==kKvQ4 ? size_t(kv_q4_bytes_per_head((int)f.g.head_dim))
+                                                      : size_t(f.g.head_dim) * ((fmt==kKvInt8 || fmt==3) ? 1 : 2);
+                        check(sizes[0] == size_t(b) * size_t(f.g.n_head_kv) * per && sizes[4] <= (uint64_t) one.pooled.size(),
+                              (tag + ": the stored layout is the engine's layout").c_str());
+                        blocks.push_back(std::move(one));
+                    }
+                    f.fill_after(177, last);   // everything at and past the last flush's cells is rewritten
+                    ConversationKv full;
+                    check(conversation_kv_save(full,f.state,f.g,B,index,err),
+                          (tag + ": capture at the full write's extent").c_str());
+                    for (size_t r=0;r<blocks.size();++r) {
+                        const int64_t b = flushes[r];
+                        const std::array<const ConversationBuffer*,5> bp = {&blocks[r].k,&blocks[r].v,&blocks[r].k_scale,
+                                                                            &blocks[r].v_scale,&blocks[r].pooled};
+                        const std::array<const ConversationBuffer*,5> fp = {&full.k,&full.v,&full.k_scale,
+                                                                            &full.v_scale,&full.pooled};
+                        for (size_t part=0;part<5;++part) {
+                            if (!bp[part]->size() && !fp[part]->size()) continue;
+                            size_t n = 0;   // the bytes a kv block at this flush holds
+                            if (part!=4) n = bp[part]->size();          // all the cells below b, cell-major
+                            else n = (size_t)((b / ibk) * f.g.idx_key_dim * 4);   // completed indexer rows only
+                            if (n > fp[part]->size())
+                                check(false,(tag+": the full write's part is shorter than the flush's").c_str());
+                            std::vector<uint8_t> x(n), y(n);
+                            check(bp[part]->read(x.data(),0,n) && fp[part]->read(y.data(),0,n),
+                                  (tag + ": part reads").c_str());
+                            check(x==y,(tag+": the flush's bytes are the full write's bytes").c_str());
+                        }
+                    }
+                }
+            }
+        }
 }
 
 void full_session(int fmt, int mode, int experts) {
@@ -337,6 +411,7 @@ void full_session(int fmt, int mode, int experts) {
 int main() {
     int devices=0;
     if (cudaGetDeviceCount(&devices)!=cudaSuccess || !devices) return 77;
+    golden_pagesafe();   // the disk tier's phase 1 gate: kv blocks live or die with this
     for (int fmt : std::array<int,4>{kKvF16,kKvInt8,kKvQ4,3}) for (int mode : {0,1,2}) {
         if (fmt==3 && mode!=0) continue;
         Fixture f(fmt,mode);
