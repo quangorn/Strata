@@ -87,6 +87,10 @@ class ImportGraphTests(unittest.TestCase):
         loaded = set(got["names"])
         self.assertEqual(sorted(loaded & INSTALLER_MODULES), [])
         for name, rel in got["mods"].items():
+            # a source checkout set up by SETUP.bat keeps its interpreter's packages under `.venv` at the root, and the scan
+            # sees them as files under the root: they are the interpreter's own, not code loaded by starting or serving
+            if rel.startswith(".venv/") or "/site-packages/" in rel:
+                continue
             top = rel.split("/")[0]
             self.assertIn(top, ("serve", "strata_cli", "strata_control"),
                           f"{name} ({rel}) is loaded by starting/serving but is not part of it")

@@ -177,11 +177,15 @@ class Result:
     reused: bool = False                   # the same choices were already serving: nothing was stopped or started
 
 
-NO_ENGINE_NEXT = ("Update Strata (`strata update`) and run `strata launch` again. Nothing was downloaded, and any model files you already have are kept.")
-
 STAGES = ("engine", "model", "config", "tune", "start", "access")
 
-NO_ENGINE_STEP = ("run `strata update` to get the newest engines and start again; if this stays, your graphics card is not one Strata supports yet, "
+#: the one next step when the engine in the component folder is older than this model needs. Nothing is fetched: this fork's engine
+#: is built in the checkout, and `packaging/build_engine_win_local.py` writes the package into the component folder.
+ENGINE_BUILD_STEP = ("Build a newer one here: `python packaging/build_engine_win_local.py` (it packages the engine, the picture reader and "
+                     "the libraries it loads), then start again.")
+
+NO_ENGINE_STEP = ("build the engine for this computer with `python packaging/build_engine_win_local.py`, which puts its package in the "
+                  "component folder, and start again; if this stays, your graphics card is not one Strata supports yet, "
                   "and the model files stay on this computer for when it is")
 
 #: no graphics card Strata can use at all (an Intel UHD/Iris only, an AMD APU-only laptop, a virtual machine, Windows on ARM)
@@ -716,6 +720,10 @@ class Runner:
 
     # ---- 1. the engine
     def ensure_engine(self) -> None:
+        """The engine of this computer, as it is installed. Nothing is downloaded here, and nothing is fetched from an update feed:
+        this fork's engine is the package built in the checkout (`packaging/build_engine_win_local.py`), so a start uses what is in the
+        component folder and says in plain words when it is old, or when there is none. A warning, never a refusal (the owner rule):
+        the model is downloaded and started with the engine that is here, and the final message names what to build."""
         self.warn_wsl_amd()
         if self.multi_file():                                # DeepSeek: its own engine package (setup fetches it); the Strata engine is not used
             self.emit("engine", "DeepSeek runs on its own engine package, so the Strata engine is not downloaded for it.", 100)
@@ -724,83 +732,19 @@ class Runner:
         from strata_control import engine_component as ec
         root = Path(self.components_dir) if self.components_dir else None
         report = ec.status(root)
-        stale = None
         if report.get("usable"):
             eng = report["engine"]
             stale = self.stale_engine(eng.get("version"))
             if not stale:
                 self.emit("engine", f"Engine {eng['version']} ({eng['backend']}) is installed.", 100)
                 return
-        feed = self.feed or os.environ.get("STRATA_UPDATE_FEED")
-        if stale:
-            self.emit("engine", stale + " Looking for a newer one…", 0, level="warn")
-        else:
-            self.emit("engine", "No engine is installed yet. Getting the one for your graphics card…", 0)
-        argv = self._cli("update", "--no-control", "--output", "jsonl")
-        if feed:
-            argv += ["--feed", feed]
-        if self.components_dir:
-            argv += ["--components-dir", self.components_dir]
-        env = self._env()
-        for key, value in self.s.extra.items():              # the engine's own environment settings (device selectors, ...) apply to its test start too
-            if not key.startswith("--") and value.lower() not in ("off", "unset", "none"):
-                env[key] = value
-        p = self._spawn(argv, env=env)
-        last = None
-        tail: list[str] = []
-        for line in p.stdout:                                # type: ignore[union-attr]
-            self.check_cancel()
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                ev = json.loads(line)
-            except ValueError:
-                tail.append(line)
-                continue
-            if ev.get("event") == "progress":
-                self.emit("engine", f"Downloading the engine… {ev.get('percent', 0)}%", float(ev.get("percent", 0)))
-            elif ev.get("event") in ("phase", "waiting"):
-                if ev.get("phase") == "warn":
-                    self.emit("engine", str(ev.get("message") or ""), level="warn")
-                else:
-                    self.emit("engine", str(ev.get("message") or ""))
-            last = ev
-        code = p.wait()
-        if stale:
-            # an engine is there and was too old: warn, never refuse (round 8, M: 0.1.45.3 was reused although 0.1.47 existed, and Gyro-S failed
-            # on kernels only the newer engine has). Whatever the update did, say where it stands.
-            after = ec.status(root)
-            now = (after.get("engine") or {}).get("version") if after.get("usable") else None
-            still = self.stale_engine(now) if now else stale
-            if still:
-                self.notices.append(still + " Run `strata update`, then start it again.")
-                self.emit("engine", still + (" The update did not bring a newer one." if code == 0 else " The update did not finish.") +
-                          " Run `strata update`, then start it again.", 100, level="warn")
-            else:
-                self.emit("engine", f"Engine {now} is installed.", 100)
+            # an engine is there and is older than this model needs: warn, never refuse (round 8, M: 0.1.45.3 was reused although
+            # 0.1.47 existed, and Gyro-S failed on kernels only the newer engine has). Nothing is fetched: build the newer one here.
+            line = stale + " " + ENGINE_BUILD_STEP
+            self.notices.append(line)
+            self.emit("engine", line, 100, level="warn")
             return
-        if code == 0:
-            # `strata update` exits 0 when the feed simply has no engine for this PC (or only one for another card family). That is not an
-            # engine: refuse here, before the model (tens of GB) is touched.
-            after = ec.status(root)
-            if not after.get("usable"):
-                self.no_engine(self._no_engine_words(last, after))
-                return
-        if code != 0:
-            why = ""
-            if isinstance(last, dict):
-                why = str((last.get("error") or {}).get("message") or last.get("message") or "")
-                if not why:
-                    for res in last.get("results") or []:
-                        if isinstance(res, dict) and res.get("status") == "failed" and res.get("error"):
-                            why = str(res["error"])
-                            break
-            why = why or (tail[-1] if tail else "")
-            why = capital(why)                         # (joined after a sentence: "the update feed could not be read ..." starts a new one)
-            raise LaunchError("The engine could not be installed." + (f" {why}" if why else ""),
-                              "Check your internet connection, or point Strata at an update source with --feed, then try again.", 6)
-        self.emit("engine", "The engine is installed.", 100)
+        self.no_engine(self._no_engine_words(report))
 
     def needed_engine(self) -> tuple[int, ...] | None:
         """The oldest engine this model runs on, from setup.py's own tables (MIN_ENGINE for everything, GYRO_ENGINE for Gyro), or None."""
@@ -842,17 +786,11 @@ class Runner:
             raise LaunchError("Stopped. Nothing was downloaded.", "Install the engine first, or run this again and answer yes.", 130)
 
     @staticmethod
-    def _no_engine_words(last: object, report: dict) -> str:
-        """The one plain sentence for "no usable engine for this PC": the update's own note (the wrong-card-family line, or "the feed has no
-        engine package for this PC"), else the engine report's plain notice. Never the raw list of reasons."""
-        note = ""
-        if isinstance(last, dict):
-            for res in last.get("results") or []:
-                if isinstance(res, dict) and res.get("component") == "engine":
-                    note = str(res.get("note") or "").strip()
-        if not note:
-            note = str(report.get("notice") or "").strip()
-        if "backend" in report and report["backend"] is None:                    # not even a graphics card Strata knows: say that, not "the feed has nothing"
+    def _no_engine_words(report: dict) -> str:
+        """The one plain sentence for "no usable engine for this PC": the engine report's plain notice (the wrong-card-family line, the driver
+        line, the missing-package line). Never the raw list of reasons. Nothing is fetched here, so there is no update note to read."""
+        note = str(report.get("notice") or "").strip()
+        if "backend" in report and report["backend"] is None:                    # not even a graphics card Strata knows: say that, not "nothing to get"
             names = []
             try:
                 from strata_control import engine_component as ec
@@ -861,7 +799,7 @@ class Runner:
                 pass
             return no_gpu_words(names)
         if not note or note.startswith("No engine for this PC was found"):
-            note = "There is no engine for this computer's graphics card in the update source."
+            note = "There is no engine for this computer's graphics card in the component folder."
         return note
 
     # ---- 2. the model
@@ -2037,7 +1975,7 @@ class Runner:
 
     def preflight_words(self) -> list[str]:
         """Plain warnings for `--plan` that the run itself would meet: an engine older than the model needs, an earlier install taking the
-        place of a clean one, files that are not the model that was named. Nothing is changed."""
+        place of a clean one, files that are not the model that was named. Nothing is changed and nothing is downloaded."""
         out: list[str] = list(self.identity_notes)
         try:
             from strata_control import engine_component as ec
@@ -2045,7 +1983,7 @@ class Runner:
             if report.get("usable"):
                 stale = self.stale_engine(report["engine"].get("version"))
                 if stale:
-                    out.append(stale + " Starting will look for a newer one first; `strata update` does the same.")
+                    out.append(stale + " Starting uses this engine as it is; " + ENGINE_BUILD_STEP)
         except Exception:                                    # noqa: BLE001
             pass
         try:

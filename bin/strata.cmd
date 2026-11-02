@@ -5,14 +5,21 @@ rem   1. %STRATA_PYTHON%                       an explicit override, always wins
 rem   2. <root>\python\python.exe              the private runtime shipped in the terminal archive
 rem   3. <root>\.venv\Scripts\python.exe       a source checkout set up by SETUP.bat
 rem   4. py -3 / python on PATH, 3.10 or newer a developer convenience, never a requirement
+rem A symlinked copy of this launcher (a fork keeps its launcher in its own checkout and links it into the terminal's bin)
+rem reads `strata-root.txt` from this folder: one line naming the root whose strata.py to run. cmd looks for strata.py next
+rem to the link, not next to what the link points at, so the marker has to be read first.
 setlocal
 rem UTF-8 text in Python, not the Windows code page: folders with Cyrillic or other letters stay intact (#3202)
 set "PYTHONUTF8=1"
 set "HERE=%~dp0"
+set "ROOT="
+if exist "%HERE%strata-root.txt" set /p ROOT= < "%HERE%strata-root.txt"
+if defined ROOT if exist "%ROOT%\strata.py" goto search
 for %%I in ("%HERE%..") do set "ROOT=%%~fI"
 if exist "%HERE%strata.py" set "ROOT=%HERE%"
 if not exist "%ROOT%\strata.py" goto incomplete
 
+:search
 set "PY="
 if defined STRATA_PYTHON goto envpy
 if exist "%ROOT%\python\python.exe" goto bundled

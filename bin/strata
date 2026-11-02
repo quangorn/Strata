@@ -48,6 +48,17 @@ pick_python() {
     if [ -x "$candidate" ]; then printf '%s\n' "$candidate"; return 0; fi
   done
 
+  # Cygwin needs a Windows interpreter: `platform.system()` answers CYGWIN_NT-10.0-19045 there, and the control library's
+  # host_platform() refuses that system, so `strata components engine` dies with "unsupported operating system" under the cygwin
+  # Python. A source checkout set up by SETUP.bat has its venv beside this script, and a Windows Python is what runs it.
+  case $(uname -s) in
+    CYGWIN*)
+      for candidate in "$HERE/../.venv/Scripts/python.exe" "$HERE/.venv/Scripts/python.exe"; do
+        if [ -x "$candidate" ]; then printf '%s\n' "$candidate"; return 0; fi
+      done
+      ;;
+  esac
+
   # Anything on PATH that is new enough, then the usual places an interpreter lives on macOS
   # without being on a non-interactive PATH (Homebrew, python.org, and the interpreter a DeepSeek
   # Harness installation already ships, which is a legitimate Python 3.12 to reuse rather than
@@ -128,6 +139,11 @@ esac
 # The private runtime must not see the user's site-packages, PYTHONHOME or PYTHONPATH.
 case $PY in
   "$HERE"/../python/*|"$HERE"/python/*) PYTHONNOUSERSITE=1; export PYTHONNOUSERSITE; unset PYTHONHOME PYTHONPATH ;;
+esac
+
+# A Windows interpreter cannot open `/cygdrive/c/...`, so the script path goes to it in the form Windows reads.
+case "$PY" in
+  *python.exe) APP=$(cygpath -w "$APP") ;;
 esac
 
 exec "$PY" "$APP/strata.py" "$@"

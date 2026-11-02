@@ -669,7 +669,10 @@ class Cli(UpdaterCase):
         super().setUp()
         self.pub = self.root / "feed-key.pub.json"
         self.pub.write_text(json.dumps({"keys": [signing.public_part(self.key)]}))
-        patch = mock.patch.dict(os.environ, {"STRATA_UPDATE_TRUSTED_KEYS": str(self.pub)})
+        # this checkout takes the engine from the feed only when asked (`--engine`, or STRATA_ENGINE_FROM_FEED=1), so the engine
+        # steps these tests read about are asked for here. `test_the_engine_step_is_skipped_by_default` covers the default path.
+        patch = mock.patch.dict(os.environ, {"STRATA_UPDATE_TRUSTED_KEYS": str(self.pub),
+                                             "STRATA_ENGINE_FROM_FEED": "1"})
         patch.start()
         self.addCleanup(patch.stop)
         patch = mock.patch.object(updater, "detect_hardware", return_value=dict(self.hardware))
@@ -780,6 +783,42 @@ class Cli(UpdaterCase):
             self.assertIn("STRATA_NO_ACQUIRE", err)
         self.assertEqual(self.resolved(), "0.1.45")
         self.assertEqual(self.archive_requests(), [])
+
+    def test_the_engine_step_is_skipped_by_default(self):
+        """This fork builds its engine in the checkout, so `strata update` takes Control only: the engine line says the step is
+        skipped, no archive is fetched, and an engine the feed cannot read (`0.1.45-local`, the suffix a build here adds) never
+        reaches the feed's version rules. `--engine` asks for one for a run."""
+        self.install_current("0.1.45-local")
+        self.publish(("0.1.46", fx.GOOD_ENGINE))
+        env = {k: v for k, v in os.environ.items() if k != "STRATA_ENGINE_FROM_FEED"}
+        with mock.patch.dict(os.environ, env, clear=True):
+            code, text, err = self.cli("update", "--check", *self.common())
+            self.assertEqual(code, 0, text + err)      # the local version is never parsed by the feed
+            self.assertIn("the engine is not taken from the feed", text)
+            code, out, _ = self.cli("update", "--check", "--json", *self.common())
+            self.assertEqual((code, json.loads(out)["engine"]["status"]), (0, "skipped"))
+            self.assertIsNone(ec.cached_notice(self.components))     # no engine notice is made
+            code, text, _ = self.cli("update", *self.common())
+            self.assertEqual(code, 0, text)
+            self.assertIn("not taken from the feed", text)
+        self.assertEqual(self.resolved(), "0.1.45-local")
+        self.assertEqual(self.archive_requests(), [])
+        # the feed's version rules read digits only, so asking for an engine with a local package installed is refused
+        with mock.patch.dict(os.environ, {"STRATA_ENGINE_FROM_FEED": "1"}):
+            code, text, err = self.cli("update", *self.common())
+            self.assertEqual(code, 5, text + err)
+
+    def test_the_engine_flag_fetches_an_engine_when_the_installed_version_is_plain(self):
+        """`--engine` says the same for one run as STRATA_ENGINE_FROM_FEED=1. The feed's version rules read digits only, so this
+        is the case where an engine can be taken: a package built in the checkout names itself 0.1.45-local and is refused."""
+        self.install_current()
+        self.publish(("0.1.46", fx.GOOD_ENGINE))
+        env = {k: v for k, v in os.environ.items() if k != "STRATA_ENGINE_FROM_FEED"}
+        with mock.patch.dict(os.environ, env, clear=True):
+            code, text, _ = self.cli("update", "--engine", *self.common())
+            self.assertEqual(code, 0, text)
+            self.assertIn("0.1.45 -> 0.1.46", text)
+        self.assertEqual(self.resolved(), "0.1.46")
 
 
 class AnotherCardFamilyNote(unittest.TestCase):
