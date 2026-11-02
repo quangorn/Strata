@@ -628,14 +628,28 @@ def _serving_or_empty(ctx: Context) -> list[dict]:
         return []
 
 
-def check(ctx: Context) -> dict:
-    """Read the signed feed and say what an update would do for the engine, Control and the app. Downloads nothing but the feed."""
+def engine_skipped(ctx: Context) -> dict:
+    """The engine section when the engine is not this install's to get: this fork builds its engine in the checkout
+    (`packaging/build_engine_win_local.py`), so no engine package is read from the feed and none is downloaded. It also keeps
+    a local package out of the feed's version rules, which read only digits (a package built here names itself 0.1.45-local)."""
+    return {"installed": None, "offered": None, "reasons": [], "status": "skipped",
+            "note": "the engine is not taken from the feed on this PC: it is built in the checkout "
+                    "(packaging/build_engine_win_local.py writes its package into the component folder). "
+                    "Run with STRATA_ENGINE_FROM_FEED=1 to fetch one from the feed.",
+            "download_bytes": 0, "previous": State(ctx.components).section("engine").get("previous"),
+            "pinned": State(ctx.components).section("engine").get("pinned"), "problem": None}
+
+
+def check(ctx: Context, *, engine: bool = True) -> dict:
+    """Read the signed feed and say what an update would do for the engine, Control and the app. Downloads nothing but the feed.
+    `engine=False`: nothing is decided for the engine (see `engine_skipped`), so a local package's version is never read by the feed."""
     with update_lock(ctx.components):
         state = State(ctx.components)
         feed = open_feed(ctx, state)
         report = {"feed": {"source": ctx.source, "sequence": feed.sequence, "channel": feed.channel, "key_id": feed.key_id,
                            "generated_at": feed.generated_at, "trusted_by": "test key file" if signing.extra_keys_in_effect(ctx.environ) else "built-in keys"},
-                  "engine": decide_engine(feed, ctx, state), "control": decide_control(feed, ctx, state),
+                  "engine": decide_engine(feed, ctx, state) if engine else engine_skipped(ctx),
+                  "control": decide_control(feed, ctx, state),
                   "app": decide_app(feed, ctx), "serving": _serving_or_empty(ctx), "hardware": ctx.hardware}
         state.data["last_check"] = {
             "at": (ctx.now or dt.datetime.now(dt.timezone.utc)).isoformat(),

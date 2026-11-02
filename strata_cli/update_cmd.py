@@ -1,12 +1,15 @@
 """`strata update`, `strata components update|rollback`: the one explicit step that downloads and installs.
 
-    strata update                 the engine for this PC and Control, from the signed feed; switches only after a test start
+    strata update                 Control from the signed feed; NOT the engine, which this fork builds in the checkout
+    strata update --engine        fetch an engine package for this PC as upstream does (the same as STRATA_ENGINE_FROM_FEED=1)
     strata update --check         read the feed and say what would change; downloads nothing else
     strata update --app           also download and verify the desktop app's installer
-    strata components update      the same as `strata update` (engine + Control)
+    strata components update      the same as `strata update` (Control; the engine is off by default here)
     strata components rollback    return to the previous engine version the last update kept
 
-Starting and serving never come here. A process that has forbidden acquiring (STRATA_NO_ACQUIRE) is refused with exit 5.
+Starting and serving never come here, and `strata launch` never comes here for an engine: the engine that runs is the package
+built in this checkout (`packaging/build_engine_win_local.py`). A process that has forbidden acquiring (STRATA_NO_ACQUIRE)
+is refused with exit 5.
 Exit codes: 0 done or nothing to do, 2 usage, 5 refused (signature, hash, downgrade, no key, acquiring forbidden),
 6 failed and the old version is still in use (network, test start), 7 an engine is serving, 130 stopped.
 """
@@ -26,6 +29,17 @@ DEFAULT_FEED = "https://github.com/Niko1221/Strata/releases/latest/download/stra
 ENV_FEED = "STRATA_UPDATE_FEED"
 
 ENV_APP_VERSION = "STRATA_APP_VERSION"
+
+#: This fork builds its own engine in the checkout (`packaging/build_engine_win_local.py`), so `strata update` does not fetch
+#: an engine package: the one in the component folder is the one that runs. Set this to 1 (or true/yes/on) to get engines from
+#: the feed as upstream does. `--no-engine` and `--engine` say the same for one run.
+ENV_ENGINE_FEED = "STRATA_ENGINE_FROM_FEED"
+
+
+def engine_from_feed(environ=None) -> bool:
+    """Whether `strata update` may take an engine package from the feed: off by default on this PC, on with ENV_ENGINE_FEED=1."""
+    environ = os.environ if environ is None else environ
+    return environ.get(ENV_ENGINE_FEED, "").strip().lower() in ("1", "true", "yes", "on")
 
 
 def default_feed() -> str:
@@ -53,6 +67,8 @@ def add_parsers(sp, components_sp) -> list:
     update.add_argument("--app", action="store_true", help="also download and verify the desktop app's installer")
     update.add_argument("--app-version", default=None, help=f"the installed app's version (default: ${ENV_APP_VERSION})")
     update.add_argument("--no-engine", action="store_true")
+    update.add_argument("--engine", action="store_true", help=f"take an engine package from the feed for this run (off by default on this PC; "
+                                                              f"default: ${ENV_ENGINE_FEED}=1)")
     update.add_argument("--no-control", action="store_true")
     comp_update = components_sp.add_parser("update", help="the same as `strata update` (engine and Control)")
     _common(comp_update)
@@ -60,6 +76,7 @@ def add_parsers(sp, components_sp) -> list:
     comp_update.add_argument("--app", action="store_true")
     comp_update.add_argument("--app-version", default=None)
     comp_update.add_argument("--no-engine", action="store_true")
+    comp_update.add_argument("--engine", action="store_true")
     comp_update.add_argument("--no-control", action="store_true")
     rollback = components_sp.add_parser("rollback", help="return to the previous engine version the last update kept")
     _common(rollback)
@@ -232,8 +249,9 @@ def run(a) -> int:
         ctx.source = _feed_source(a, root)
         if signing.extra_keys_in_effect() and not machine:
             print(f"note: trusting the extra keys in {os.environ.get(signing.ENV_EXTRA_KEYS)} (a test setup)", file=sys.stderr)
+        engine = (getattr(a, "engine", False) or engine_from_feed()) and not a.no_engine
         if a.check:
-            report = updater.check(ctx)
+            report = updater.check(ctx, engine=engine)
             if machine:
                 print(json.dumps({"schema_version": 1, "ok": True, **report}, ensure_ascii=False))
             else:
@@ -242,11 +260,13 @@ def run(a) -> int:
         _maybe_wait(a, ctx, machine)
         if not machine:
             print(f"Strata update ({ctx.source})")
-        out = updater.run_update(ctx, engine=not a.no_engine, control=not a.no_control, app=a.app)
+        out = updater.run_update(ctx, engine=engine, control=not a.no_control, app=a.app)
         if machine:
             print(json.dumps({"schema_version": 1, "ok": out["exit_code"] == 0, **out}, ensure_ascii=False))
         else:
             print(f"Feed sequence {out['feed']['sequence']}, signed by {out['feed']['key_id']}")
+            if not engine and not a.no_engine:
+                print(f"{'Engine':<8}   {updater.engine_skipped(ctx)['note']}")
             for result in out["results"]:
                 print(_line(result["component"].capitalize(), result))
             if any(r.get("presets_marked") for r in out["results"]):

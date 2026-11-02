@@ -5,9 +5,19 @@
 #   3. <root>\.venv\Scripts\python.exe     a source checkout set up by SETUP.bat
 #   4. py -3 / python on PATH, 3.10+       a developer convenience, never a requirement
 # If scripts are blocked on this PC, use bin\strata.cmd, or:  powershell -ExecutionPolicy Bypass -File bin\strata.ps1 ...
+# A symlinked copy of this launcher (a fork keeps its launcher in its checkout and links it into the terminal's bin) reads
+# `strata-root.txt` from this folder: one line naming the root whose strata.py to run, because PowerShell looks for strata.py
+# next to the link, not next to what the link points at.
 $ErrorActionPreference = 'Stop'
 $here = Split-Path -Parent $MyInvocation.MyCommand.Path
-$root = if (Test-Path -LiteralPath (Join-Path $here 'strata.py')) { $here } else { Split-Path -Parent $here }
+$root = $null
+$marker = Join-Path $here 'strata-root.txt'
+if (Test-Path -LiteralPath $marker) {
+    $root = (Get-Content -LiteralPath $marker -TotalCount 1).Trim()
+}
+if (-not ($root -and (Test-Path -LiteralPath (Join-Path $root 'strata.py')))) {
+    $root = if (Test-Path -LiteralPath (Join-Path $here 'strata.py')) { $here } else { Split-Path -Parent $here }
+}
 $app = Join-Path $root 'strata.py'
 if (-not (Test-Path -LiteralPath $app)) {
     [Console]::Error.WriteLine("strata: cannot find strata.py next to $here or its parent; the installation looks incomplete")

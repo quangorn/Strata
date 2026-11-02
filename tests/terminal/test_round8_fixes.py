@@ -243,7 +243,9 @@ class EngineIsFreshEnough(unittest.TestCase):
                 q = Runner(S.LaunchSettings(family="qwen", model="IQ3_XXS", context=32768, vision="off"), catalog=catalog(HW_12))
                 self.assertLess(q.needed_engine(), (0, 1, 47))              # only Gyro is held to it
 
-    def test_a_stale_engine_is_updated_or_said_never_ignored(self):
+    def test_a_stale_engine_is_warned_about_and_used_as_it_is(self):
+        """A model that needs a newer engine than the package in the component folder gets a plain warning naming the step that
+        builds one in this checkout; `strata launch` never spawns `strata update`, and the start goes on with the engine there."""
         with Home():
             r = runner_for()
             events = []
@@ -256,7 +258,8 @@ class EngineIsFreshEnough(unittest.TestCase):
             with mock.patch.object(ec, "status", return_value=before), mock.patch.object(Runner, "_spawn", return_value=proc):
                 r.ensure_engine()
             self.assertTrue(any(level == "warn" and "older than this model needs" in text for level, text in events), events)
-            self.assertTrue(any("strata update" in n for n in r.notices), r.notices)
+            self.assertTrue(any("packaging/build_engine_win_local.py" in n for n in r.notices), r.notices)
+            self.assertFalse(any("strata update" in n for n in r.notices), r.notices)
 
 
 class InstallIsNotHijacked(unittest.TestCase):
