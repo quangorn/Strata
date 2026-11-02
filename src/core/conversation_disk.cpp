@@ -63,9 +63,21 @@ void remove_file(const std::string& path) {
     fs::remove(fs::path(path), ec);
 }
 
+// The files an entry on the disk owns: v1's session files, or a v2 container's `.bin` per stage.
+std::vector<std::string> files_of(const ConversationDiskEntry& e) {
+    std::vector<std::string> out = e.files;
+    for (const auto& stage : e.stages) out.push_back(stage.file);
+    return out;
+}
+
 // The index file of a persistent entry: native-endian fields (the session files refuse a big-endian build too),
 // counts before arrays.
-constexpr uint64_t kIndexMagic = 0x3158444943525453ull;   // "STRCIDX1"
+constexpr uint64_t kIndexMagic = 0x3158444943525453ull;     // "STRCIDX1"
+constexpr uint64_t kIndexMagicV2 = 0x3258444943525453ull;   // "STRCIDX2"
+
+// The v2 container's `.bin`: magic "STRACNV2", version 2, a 64-byte header (conversation_disk.hpp).
+constexpr uint64_t kBinMagic = 0x32564E4341525453ull;   // "STRACNV2"
+constexpr uint32_t kBinVersion = 2;
 
 struct IndexWriter {
     std::string b;
@@ -110,6 +122,110 @@ struct IndexReader {
     }
 };
 
+// The v2 index's bytes: identity, the LRU stamps, the keys, then one block table per stage (entry level, then a
+// count and the records: offset, size, hash_lo, hash_hi, kind, tokens_start, tokens_end, prefix_digest, used, pinned).
+void put_block(IndexWriter& out, const ConversationDiskBlock& b) {
+    out.put<uint64_t>(b.offset);
+    out.put<uint64_t>(b.size);
+    out.put<uint64_t>(b.hash_lo);
+    out.put<uint64_t>(b.hash_hi);
+    out.put<uint32_t>(b.kind);
+    out.put<int64_t>(b.tokens_start);
+    out.put<int64_t>(b.tokens_end);
+    out.put<uint64_t>(b.prefix_digest);
+    out.put<uint64_t>(b.used);
+    out.put<uint8_t>(b.pinned ? 1 : 0);
+}
+
+void index_v2_bytes(IndexWriter& out, const ConversationDiskEntry& e, const SessionFileIdentity& id) {
+    out.put(kIndexMagicV2);
+    out.put(id.model);
+    out.put(id.config);
+    out.put<int64_t>(e.written_s);
+    out.put<int64_t>(e.last_used_s);
+    out.put<uint8_t>(e.cvec ? 1 : 0);
+    out.put<uint64_t>(e.bytes);
+    for (int64_t g : e.geometry) out.put<int64_t>(g);
+    out.put<int64_t>(e.layer_lo);
+    out.put<int64_t>(e.layer_hi);
+    out.put<int64_t>(e.tokens);
+    out.key(e.live);
+    out.put<uint32_t>((uint32_t) e.checkpoints.size());
+    for (const auto& c : e.checkpoints) out.key(c);
+    out.put<uint32_t>((uint32_t) e.stages.size());
+    for (const auto& s : e.stages) {
+        out.str(fs::path(s.file).filename().string());   // the name: a read resolves it against the folder
+        out.put<uint32_t>((uint32_t) s.blocks.size());
+        for (const auto& b : s.blocks) put_block(out, b);
+    }
+}
+
+// Every check the shape allows without the `.bin`s: an unknown kind, an empty or overlapping block, a position that
+// is not the block's token range's.  Offsets start at the end of the 64-byte header and only grow.
+bool read_index_v2(const std::string& b, const SessionFileIdentity& id, ConversationDiskEntry& e) {
+    IndexReader in{b};
+    if (in.get<uint64_t>() != kIndexMagicV2 || in.get<uint64_t>() != id.model || in.get<uint64_t>() != id.config)
+        return false;
+    e.written_s = in.get<int64_t>();
+    e.last_used_s = in.get<int64_t>();
+    e.cvec = in.get<uint8_t>() != 0;
+    e.bytes = in.get<uint64_t>();
+    for (auto& g : e.geometry) g = in.get<int64_t>();
+    e.layer_lo = in.get<int64_t>();
+    e.layer_hi = in.get<int64_t>();
+    e.tokens = in.get<int64_t>();
+    if (!in.key(e.live)) return false;
+    const uint32_t nck = in.get<uint32_t>();
+    if (!in.ok || nck > in.left() / 8) return false;   // a key is at least its two counts
+    for (uint32_t i = 0; in.ok && i < nck; ++i) {
+        ConversationCheckpoint c;
+        if (in.key(c)) e.checkpoints.push_back(std::move(c));
+    }
+    const uint32_t nstages = in.get<uint32_t>();
+    if (!in.ok || nstages == 0 || nstages > in.left() / 8) return false;
+    for (uint32_t s = 0; in.ok && s < nstages; ++s) {
+        ConversationDiskStage stage;
+        stage.file = in.str();
+        const uint32_t nblocks = in.get<uint32_t>();
+        if (!in.ok || stage.file.empty() || nblocks > in.left() / 64) return false;
+        uint64_t end = kConversationDiskBinHeader;   // the first block starts after the header, and they only grow
+        for (uint32_t k = 0; in.ok && k < nblocks; ++k) {
+            ConversationDiskBlock block;
+            block.offset = in.get<uint64_t>();
+            block.size = in.get<uint64_t>();
+            block.hash_lo = in.get<uint64_t>();
+            block.hash_hi = in.get<uint64_t>();
+            block.kind = in.get<uint32_t>();
+            block.tokens_start = in.get<int64_t>();
+            block.tokens_end = in.get<int64_t>();
+            block.prefix_digest = in.get<uint64_t>();
+            block.used = in.get<uint64_t>();
+            const uint8_t pinned = in.get<uint8_t>();
+            if (!in.ok || (block.kind != ConversationDiskBlock::kv && block.kind != ConversationDiskBlock::state))
+                return false;
+            if (block.size == 0 || block.offset < end || block.offset > UINT64_MAX - block.size) return false;
+            const bool range = block.kind == ConversationDiskBlock::kv ? block.tokens_end > block.tokens_start
+                                                                       : block.tokens_end == block.tokens_start;
+            if (!range || pinned > 1) return false;
+            block.pinned = pinned != 0;
+            end = block.offset + block.size;
+            stage.blocks.push_back(std::move(block));
+        }
+        e.stages.push_back(std::move(stage));
+    }
+    if (!in.ok || in.left() != 0) return false;
+    // `tokens` is what best() may claim: the deepest state block's position
+    bool have_state = false;
+    int64_t deepest = 0;
+    for (const auto& stage : e.stages)
+        for (const auto& block : stage.blocks)
+            if (block.kind == ConversationDiskBlock::state && (!have_state || block.tokens_end > deepest)) {
+                deepest = block.tokens_end;
+                have_state = true;
+            }
+    return !have_state || e.tokens == deepest;
+}
+
 double mib(uint64_t bytes) { return double(bytes) / (1024.0 * 1024.0); }
 double mbps(uint64_t bytes, double ms) { return ms > 0 ? double(bytes) / 1e6 / (ms / 1000.0) : 0.0; }
 double ms_since(std::chrono::steady_clock::time_point t0) {
@@ -129,6 +245,74 @@ std::string fmt(const char* f, ...) {
 }
 
 }  // namespace
+
+// ---- container v2 (conversation_disk.hpp): the `.bin` header, the index's writer and reader.
+
+void conversation_disk_bin_header_write(uint8_t* out, const ConversationDiskBinHeader& header) {
+    std::memset(out, 0, kConversationDiskBinHeader);
+    const uint32_t version = kBinVersion, size = (uint32_t) kConversationDiskBinHeader;
+    std::memcpy(out, &kBinMagic, 8);
+    std::memcpy(out + 8, &version, 4);
+    std::memcpy(out + 12, &size, 4);
+    std::memcpy(out + 16, &header.model, 8);
+    std::memcpy(out + 24, &header.config, 8);
+    std::memcpy(out + 32, &header.id, 8);
+    std::memcpy(out + 40, &header.stage, 4);   // bytes 44..63 stay zero (reserved)
+}
+
+bool conversation_disk_bin_header_read(const uint8_t* bytes, size_t n, ConversationDiskBinHeader& header) {
+    if (!bytes || n < kConversationDiskBinHeader) return false;
+    uint64_t magic = 0;
+    uint32_t version = 0, size = 0;
+    std::memcpy(&magic, bytes, 8);
+    std::memcpy(&version, bytes + 8, 4);
+    std::memcpy(&size, bytes + 12, 4);
+    if (magic != kBinMagic || version != kBinVersion || size != kConversationDiskBinHeader) return false;
+    std::memcpy(&header.model, bytes + 16, 8);
+    std::memcpy(&header.config, bytes + 24, 8);
+    std::memcpy(&header.id, bytes + 32, 8);
+    std::memcpy(&header.stage, bytes + 40, 4);
+    return true;
+}
+
+bool conversation_disk_index_write(const std::string& path, const ConversationDiskEntry& entry,
+                                   const SessionFileIdentity& identity, std::string& error) {
+    const fs::path target(path);
+    const fs::path temp = target.parent_path() / ("." + target.filename().string() + ".tmp");
+    IndexWriter out;
+    index_v2_bytes(out, entry, identity);
+    {
+        std::ofstream f(temp, std::ios::binary | std::ios::trunc);
+        f.write(out.b.data(), (std::streamsize) out.b.size());
+        if (!f) {
+            error = "cannot write the index " + temp.string();
+            remove_file(temp.string());
+            return false;
+        }
+    }
+    std::error_code ec;
+    fs::rename(temp, target, ec);   // a reader sees the whole index or none
+    if (ec) {
+        error = "cannot publish the index: " + ec.message();
+        remove_file(temp.string());
+        return false;
+    }
+    return true;
+}
+
+bool conversation_disk_index_read(const std::string& path, const SessionFileIdentity& identity,
+                                  ConversationDiskEntry& entry) {
+    std::ifstream f(fs::path(path), std::ios::binary);
+    const std::string b((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    if (b.size() < 8 || std::memcmp(b.data(), &kIndexMagicV2, 8) != 0) return false;   // not a v2 index (v1: the tier)
+    entry = ConversationDiskEntry{};
+    if (!read_index_v2(b, identity, entry)) {
+        entry = ConversationDiskEntry{};
+        return false;
+    }
+    entry.index = path;
+    return true;
+}
 
 ConversationDiskTier::ConversationDiskTier(ConversationDiskOptions options) : options_(std::move(options)) {
     std::random_device rd;
@@ -205,8 +389,19 @@ bool ConversationDiskTier::write_index(Entry& e, std::string& error) const {
 bool ConversationDiskTier::read_index(const std::string& path, Entry& e) const {
     std::ifstream f(fs::path(path), std::ios::binary);
     const std::string b((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
-    IndexReader in{b};
     const SessionFileIdentity id = file_identity();
+    uint64_t magic = 0;
+    if (b.size() >= sizeof magic) std::memcpy(&magic, b.data(), sizeof magic);
+    if (magic == kIndexMagicV2) {   // the container the write path publishes (phase 1, steps 3-4)
+        if (!read_index_v2(b, id, e)) return false;
+        std::error_code ec;
+        for (auto& stage : e.stages) stage.file = (fs::path(options_.dir) / fs::path(stage.file).filename()).string();
+        for (const auto& stage : e.stages)
+            if (!fs::is_regular_file(fs::path(stage.file), ec)) return false;
+        e.index = path;
+        return true;
+    }
+    IndexReader in{b};
     if (in.get<uint64_t>() != kIndexMagic || in.get<uint64_t>() != id.model || in.get<uint64_t>() != id.config)
         return false;
     e.written_s = in.get<int64_t>();
@@ -243,7 +438,10 @@ std::string ConversationDiskTier::scan_folder(size_t& stale, std::error_code& ec
     }
     // the files of the entries taken in stay; the rest goes (refused indexes and their files, interrupted writes)
     std::set<std::string> kept;
-    for (const auto& e : found) kept.insert(e.files.begin(), e.files.end());
+    for (const auto& e : found) {
+        const std::vector<std::string> owned = files_of(e);
+        kept.insert(owned.begin(), owned.end());
+    }
     for (const auto& p : others)
         if (!kept.count(p)) { remove_file(p); ++stale; }
     std::sort(found.begin(), found.end(), [](const Entry& a, const Entry& b) { return a.written_s < b.written_s; });
@@ -298,7 +496,7 @@ void ConversationDiskTier::remove_locked(size_t index, bool delete_files) {
     Entry& e = entries_.at(index);
     if (!e.index.empty()) remove_file(e.index);   // first, always: an entry gone from the list is not taken in again
     if (delete_files)
-        for (const auto& f : e.files) remove_file(f);
+        for (const auto& f : files_of(e)) remove_file(f);
     bytes_ -= e.bytes;
     entries_.erase(entries_.begin() + (std::ptrdiff_t) index);
 }

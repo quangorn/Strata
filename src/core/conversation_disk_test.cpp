@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <future>
@@ -105,6 +106,34 @@ bool same(const SavedConversation& a, const SavedConversation& b) {
     return true;
 }
 
+// Every field of a v2 entry's index, block table included (the keys carry token ids and images only).  The id is not
+// in the index: it is the file's name, and the start-up scan renumbers the entries it takes in.
+bool same_entry(const ConversationDiskEntry& a, const ConversationDiskEntry& b) {
+    auto same_key = [](const ConversationCheckpoint& x, const ConversationCheckpoint& y) {
+        return x.ids == y.ids && x.imgs == y.imgs;
+    };
+    if (a.cvec != b.cvec || a.bytes != b.bytes || a.geometry != b.geometry ||
+        a.layer_lo != b.layer_lo || a.layer_hi != b.layer_hi || a.tokens != b.tokens ||
+        a.written_s != b.written_s || a.last_used_s != b.last_used_s || !same_key(a.live, b.live) ||
+        a.checkpoints.size() != b.checkpoints.size() || a.stages.size() != b.stages.size() || !b.files.empty())
+        return false;
+    for (size_t i = 0; i < a.checkpoints.size(); ++i)
+        if (!same_key(a.checkpoints[i], b.checkpoints[i])) return false;
+    for (size_t s = 0; s < a.stages.size(); ++s) {
+        const auto& x = a.stages[s];
+        const auto& y = b.stages[s];
+        if (x.file != y.file || x.blocks.size() != y.blocks.size()) return false;
+        for (size_t k = 0; k < x.blocks.size(); ++k) {
+            const auto& p = x.blocks[k];
+            const auto& q = y.blocks[k];
+            if (p.kind != q.kind || p.offset != q.offset || p.size != q.size || p.hash_lo != q.hash_lo ||
+                p.hash_hi != q.hash_hi || p.tokens_start != q.tokens_start || p.tokens_end != q.tokens_end ||
+                p.prefix_digest != q.prefix_digest || p.used != q.used || p.pinned != q.pinned) return false;
+        }
+    }
+    return true;
+}
+
 std::vector<int32_t> prompt_of(size_t tokens, int32_t first = 1000) {
     std::vector<int32_t> p;
     for (size_t i = 0; i < tokens; ++i) p.push_back(first + int32_t(i));
@@ -147,6 +176,106 @@ int main() {
         check(off.open(e) && !off.enabled() && !off.put(image(10, 1)), "no folder: off, not an error");
         ConversationDiskTier off2(opts(dir, 0));
         check(off2.open(e) && !off2.enabled(), "no budget: off");
+    }
+
+    {   // container v2: the .bin header and the index's writer/reader (phase 1 step 2; the write path is step 3)
+        const fs::path cdir = dir / "container";
+        fs::create_directories(cdir);
+        uint8_t h[64];
+        const ConversationDiskBinHeader head{11, 22, 33, 2};
+        conversation_disk_bin_header_write(h, head);
+        ConversationDiskBinHeader hback;
+        check(conversation_disk_bin_header_read(h, sizeof h, hback), "bin header: reads back");
+        check(hback.model == 11 && hback.config == 22 && hback.id == 33 && hback.stage == 2,
+              "bin header: every field");
+        check(!conversation_disk_bin_header_read(h, 63, hback), "bin header: a short buffer is refused");
+        uint8_t wrong[64];
+        std::memcpy(wrong, h, sizeof h);
+        wrong[0] = 'X';
+        check(!conversation_disk_bin_header_read(wrong, sizeof wrong, hback), "bin header: another magic is refused");
+        std::memcpy(wrong, h, sizeof h);
+        wrong[8] = 1;   // version 3
+        check(!conversation_disk_bin_header_read(wrong, sizeof wrong, hback), "bin header: another version is refused");
+
+        auto key_of = [](size_t tokens, uint8_t seed) {
+            ConversationCheckpoint c;
+            for (size_t i = 0; i < tokens; ++i) c.ids.push_back(1000 + int32_t(i));
+            c.imgs.push_back({int64_t(tokens) / 2, 0x1234ull + seed});
+            return c;
+        };
+        ConversationDiskEntry entry;
+        entry.id = 7;
+        entry.written_s = 1000;
+        entry.last_used_s = 2000;
+        entry.cvec = false;
+        entry.bytes = 4096;
+        for (size_t i = 0; i < entry.geometry.size(); ++i) entry.geometry[i] = int64_t(100 + i);
+        entry.layer_lo = 0;
+        entry.layer_hi = 48;
+        entry.tokens = 256;
+        entry.live = key_of(256, 0);
+        entry.checkpoints.push_back(key_of(128, 1));
+        entry.checkpoints.push_back(key_of(64, 2));
+        for (uint32_t stage = 0; stage < 2; ++stage) {
+            ConversationDiskStage s;
+            s.file = "strata-conv-0123-7-" + std::to_string(stage) + ".bin";
+            uint64_t at = kConversationDiskBinHeader;
+            for (uint32_t b = 0; b < 2; ++b) {   // a kv block, then the state block at 256
+                ConversationDiskBlock block;
+                block.kind = b == 0 ? ConversationDiskBlock::kv : ConversationDiskBlock::state;
+                block.offset = at;
+                block.size = 1024 + 8ull * b;
+                block.hash_lo = 0x1111ull + b;
+                block.hash_hi = 0x2222ull + b;
+                block.tokens_start = b == 0 ? 0 : 256;
+                block.tokens_end = 256;
+                block.prefix_digest = 0x3333ull + b;
+                block.used = b == 1 ? 77 : 0;
+                block.pinned = b == 1;
+                at += block.size;
+                s.blocks.push_back(block);
+            }
+            entry.stages.push_back(std::move(s));
+        }
+        const SessionFileIdentity ident{11, 22};
+        const fs::path ipath = cdir / "strata-conv-0123-7.idx";
+        std::string ierr;
+        check(conversation_disk_index_write(ipath.string(), entry, ident, ierr), "index v2: written");
+        ConversationDiskEntry back_entry;
+        check(conversation_disk_index_read(ipath.string(), ident, back_entry), "index v2: read back");
+        check(same_entry(entry, back_entry), "index v2: every field, block record and key comes back");
+        check(back_entry.index == ipath.string(), "index v2: the reader names its file");
+        ConversationDiskEntry other;
+        check(!conversation_disk_index_read(ipath.string(), SessionFileIdentity{11, 23}, other),
+              "index v2: another identity is refused");
+        const auto full = fs::file_size(ipath);
+        fs::resize_file(ipath, full - 8);
+        check(!conversation_disk_index_read(ipath.string(), ident, other), "index v2: a truncated index is refused");
+
+        const fs::path bpath = cdir / "broken.idx";
+        auto refused = [&](const ConversationDiskEntry& bad, const char* label) {
+            other = ConversationDiskEntry{};
+            check(conversation_disk_index_write(bpath.string(), bad, ident, ierr) &&
+                  !conversation_disk_index_read(bpath.string(), ident, other), label);
+        };
+        ConversationDiskEntry bad = entry;
+        bad.stages[0].blocks[0].kind = 3;
+        refused(bad, "index v2: an unknown block kind is refused");
+        bad = entry;
+        bad.stages[0].blocks[1].tokens_end = 128;   // a state block at one position only
+        refused(bad, "index v2: a state block with a range is refused");
+        bad = entry;
+        bad.stages[0].blocks[1].offset = 100;        // before the header, inside the block before it
+        refused(bad, "index v2: an out-of-order block is refused");
+        bad = entry;
+        bad.stages[0].blocks[0].size = 0;
+        refused(bad, "index v2: an empty block is refused");
+        bad = entry;
+        bad.tokens = 128;                            // not the deepest state block's position
+        refused(bad, "index v2: tokens must be the deepest state block's position");
+        bad = entry;
+        bad.stages.clear();
+        refused(bad, "index v2: an entry without a stage is refused");
     }
 
     {   // start: this tier's leftovers (and their temporary files) go, other files stay

@@ -44,8 +44,9 @@ tests 2-7 run on what steps 3 and 4 give.
 
 ## Where each step stands
 
-2026-11-02, stopped here. **Step 1 is done and green**; nothing else of phase 1 is written yet, and the
-engine's own code is untouched (`git diff` touches only `conversation_snapshot_test.cpp`).
+2026-11-02. **Steps 1 and 2 are done and green**; step 1 touched only the gate's test, step 2 only the
+tier's own files. The engine's behaviour is unchanged: no entry is written in v2 yet, and the v1 write
+and read paths still run.
 
 **Step 1, the gate: passes.** Measured on this PC (RTX 4080, sm_89, CUDA 13.4, MSVC 14.44.35207,
 build folder `build-c13-gate`, Release):
@@ -118,12 +119,49 @@ removed a stray `C:/Projects/build-c13-win`; `build-c13-gate` is the only build 
 top of this file (GPU golden test; spare pooled row into the state block; v1 files of a persistent
 folder stay, nothing of a v1 entry is deleted).
 
-**Next, now that the gate passes:** step 2, container v2 - `.bin` header magic `"STRACNV2"`,
-v2 index magic `"STRCIDX2"`, the block record (offset/size/hash/kind/token-range/prefix-digest,
-`used` and `pinned` on state blocks), `Entry` with its block table instead of the whole-payload
-files pair. File by file: `include/strata/core/conversation_disk.hpp` (Entry, Match +
-`restore_tokens`), then `src/core/conversation_disk.cpp` (index writer/reader, scan rules), keeping
-the v1 read path alive until the tests move over.
+**Step 2, container v2: done, and the format is fixed.**
+
+What landed (measured on this PC, the build recipe below, Release):
+
+- `include/strata/core/conversation_disk.hpp`: `ConversationDiskBinHeader` with
+  `conversation_disk_bin_header_write`/`_read` (magic `"STRACNV2"`, version 2, 64 bytes, model, config,
+  entry id, stage); `ConversationDiskBlock` (offset, size, `hash_lo`/`hash_hi`, kind 1 = `kv` / 2 =
+  `state`, `tokens_start`/`tokens_end`, `prefix_digest`, and `used`/`pinned` for a state block);
+  `ConversationDiskStage` (one `.bin` and its blocks); `ConversationDiskEntry` (the block table plus the
+  keys `best()` matches, the geometry and layer range, `tokens`, `last_used_s`, and `files` for the v1
+  read path until step 4); `conversation_disk_index_write`/`_read` for v2 magic `"STRCIDX2"`.
+  `Match` gains `restore_tokens` (assigned `tokens` by `best()` today; step 4 lowers it for a v2 entry).
+- `src/core/conversation_disk.cpp`: the index's v2 writer (temp file + rename, blocks first) and reader
+  (identity, then shape: a block kind of 1 or 2, a non-empty block, offsets that start after the header
+  and only grow, a `state` block whose start equals its end, a `kv` block whose end is past its start,
+  a `pinned` byte of 0 or 1, `tokens` equal to the deepest `state` block's position), and the v2 branch
+  of the start-up scan (`read_index` recognises v2 by magic and resolves the stage names against the
+  folder; `remove_locked` and `scan_folder` delete and keep a v2 entry's `.bin` files through
+  `files_of()`). The v1 index writer and reader are unchanged.
+- `src/core/conversation_disk_test.cpp`: a "container v2" block that round-trips the `.bin` header and a
+  two-stage index (every field, block record, `used`/`pinned`, key), and refuses a short header, another
+  magic or version, another identity, a truncated index, an unknown block kind, a state block with a
+  range, an out-of-order block, an empty block, `tokens` that is not the deepest state, and an entry
+  without a stage.
+
+`conversation_file.{hpp,cpp}` are untouched: the block payloads reuse the encodings that already exist
+there (`put_checkpoint`/`get_checkpoint`, `SessionHasher` for `hash_lo`/`hash_hi`), and lifting `used`
+out of `put_checkpoint` is step 6's change, not this one.
+
+Measured:
+
+- `conversation_disk_test`: 86 checks, exit 0 (17 of them the container v2 block above).
+- `ctest -C Release -R "conversation_|session_save"`: 10 of 11 pass. The one failure,
+  `conversation_snapshot_test_ckpt_vram_slots` ("six more restores allocate nothing on the card"), is a
+  GPU test that does not include `conversation_disk.hpp`; it passed on three reruns of the same entry,
+  and the same three entries passed on step 1's run.
+- the engine: `--target strata` built, exit 0 (warnings from the tree's own templates, none from the
+  touched files).
+
+**Next: step 3, the write path** - find the entry to append to (or start one), `kv` blocks by
+page-aligned pieces, `state` blocks, publish the index, remove the entries the new image supersedes.
+Steps 2 and 3 may share a branch but land as separate commits (the store cannot be exercised without
+the writer).
 
 ## What each step must not touch
 

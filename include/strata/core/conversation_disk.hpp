@@ -9,6 +9,7 @@
 #include "strata/core/conversation_cache.hpp"
 #include "strata/core/conversation_file.hpp"
 
+#include <array>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
@@ -43,6 +44,77 @@ struct ConversationDiskStats {
     double write_ms = 0, read_ms = 0, wait_ms = 0;
 };
 
+// ---- container v2: a `.bin` per stage - a header, then immutable blocks - and one `.idx` naming every block.
+// The index, not the file, says where the bytes are and what they hold: a `.bin` has no length and no trailer.
+// Native-endian fields, counts before arrays, as the v1 index.  The format is this phase's one new thing
+// (docs/CONVERSATION_DISK_STORE_PHASE1.md, "Container v2"); the write path and the read path fill and consume it.
+
+/// The `.bin`'s header (64 bytes).
+constexpr size_t kConversationDiskBinHeader = 64;
+
+/// What a `.bin` is bound to.  A file whose header names another model, setting, entry or stage is not read.
+struct ConversationDiskBinHeader {
+    uint64_t model = 0, config = 0;   ///< the session files' identity
+    uint64_t id = 0;                  ///< the entry's id (it is in the file's name too)
+    uint32_t stage = 0;               ///< which stage's image the blocks hold
+};
+/// The 64 header bytes: magic "STRACNV2", version 2, the header's size, then the fields above, zero reserved.
+void conversation_disk_bin_header_write(uint8_t* out, const ConversationDiskBinHeader& header);
+/// False when `bytes` is not a v2 header (too short, another magic or version, another header size).
+bool conversation_disk_bin_header_read(const uint8_t* bytes, size_t n, ConversationDiskBinHeader& header);
+
+/// One record of an index's block table: an immutable byte range of one stage's `.bin`.  `offset` and `size` locate
+/// it; `hash_lo`/`hash_hi` are `session_hash64` of those bytes with two seeds; `prefix_digest` chains the block to
+/// its place in the conversation (every token and image below `tokens_start`), so a block of another conversation,
+/// or of another position in this one, never fits.  Phase 3 turns that digest into the store's key.
+struct ConversationDiskBlock {
+    static constexpr uint32_t kv = 1;      ///< the K/V of one page-aligned token range, for every layer of the stage
+    static constexpr uint32_t state = 2;   ///< one checkpoint's state (gdn, ple, tails, dead, block_pos)
+    uint32_t kind = 0;
+    uint64_t offset = 0, size = 0;         ///< the block's bytes in the stage's `.bin`
+    uint64_t hash_lo = 0, hash_hi = 0;
+    int64_t tokens_start = 0;              ///< `kv`: the range's first token; `state`: its position
+    int64_t tokens_end = 0;                ///< `kv`: the range's end; `state`: the same position
+    uint64_t prefix_digest = 0;
+    uint64_t used = 0;                     ///< `state` only: the LRU stamp, out of the payload
+    bool pinned = false;                   ///< `state` only: the shared-prefix pin, out of the payload
+};
+
+/// One stage's `.bin` of an entry: the file and the blocks it holds, in write order (append order).
+struct ConversationDiskStage {
+    std::string file;   ///< the `.bin`: the index holds its file name, a read resolves it against the tier's folder
+    std::vector<ConversationDiskBlock> blocks;
+};
+
+/// One conversation as its index holds it.  `live` and `checkpoints` are keys only (token ids and images: what
+/// `best()` matches); their bytes are blocks.
+struct ConversationDiskEntry {
+    uint64_t id = 0;                                ///< in the files' names
+    std::vector<ConversationDiskStage> stages;      ///< the first stage's image, then one per later stage
+    std::vector<std::string> files;                 ///< v1 only: one session file per stage (the v1 read path)
+    ConversationCheckpoint live;                    ///< keys only
+    std::vector<ConversationCheckpoint> checkpoints;   ///< keys only, deepest first
+    std::array<int64_t, 18> geometry{};             ///< v2: the image's geometry (the restore checks the runtime's)
+    int64_t layer_lo = 0, layer_hi = 0;             ///< v2: the image's layer range
+    int64_t tokens = 0;                             ///< v2: the deepest `state` block's position: what `best()` claims
+    bool cvec = true;
+    uint64_t bytes = 0;                             ///< the entry's files
+    std::string index;                              ///< the index file (set by a read)
+    int64_t written_s = 0;                          ///< when the index was published (seconds since the epoch)
+    int64_t last_used_s = 0;                        ///< v2: the LRU stamp, written with the next publish
+};
+
+/// Writes the v2 index of `entry` to `path`: a temporary file beside it, then a rename, so a reader sees the whole
+/// index or none.  Called only after the blocks it names are on disk.  `entry.written_s` is the caller's to stamp;
+/// this does not change `entry`.
+bool conversation_disk_index_write(const std::string& path, const ConversationDiskEntry& entry,
+                                   const SessionFileIdentity& identity, std::string& error);
+/// Reads a v2 index.  False when it is not one, its identity differs, or its shape is inconsistent (an unknown block
+/// kind, an empty or overlapping block, `tokens` that is not the deepest state block's).  No `.bin` is touched: the
+/// caller checks the table against its files.  `entry.index` becomes `path`.
+bool conversation_disk_index_read(const std::string& path, const SessionFileIdentity& identity,
+                                  ConversationDiskEntry& entry);
+
 class ConversationDiskTier {
 public:
     explicit ConversationDiskTier(ConversationDiskOptions options);
@@ -68,6 +140,10 @@ public:
         bool live = false;
         uint64_t bytes = 0;     ///< the entry's files (queued: the image's estimate)
         bool queued = false;    ///< still in RAM: take() hands it back without reading a file
+        /// The tokens a read of this match lands on: a v1 file holds exactly the matched state, while a v2 entry
+        /// reports the position of the `state` block its table can rebuild (at most one checkpoint interval behind
+        /// `tokens`).  The "read the file or read the tokens" estimate uses this one.
+        int64_t restore_tokens = 0;
     };
     /// The longest prefix of `prompt` an entry holds (its live state or its checkpoint), queued or on the disk, as
     /// ConversationCache::best; ties prefer the newest entry.
@@ -87,6 +163,7 @@ public:
         for (const auto& e : entries_) scan(e, false);
         for (const auto& j : queue_) scan(j.entry, true);
         if (writing_) scan(writing_entry_, false);   // its file appears when the write ends: take() waits for it
+        best.restore_tokens = best.tokens;   // a v1 file holds the matched state whole; the v2 read path lowers this
         return best;
     }
 
@@ -113,16 +190,7 @@ public:
     static const char* file_prefix() { return "strata-conv-"; }
 
 private:
-    struct Entry {
-        uint64_t id = 0;
-        std::vector<std::string> files;          ///< the first stage's image, then one per later stage
-        ConversationCheckpoint live;             ///< ids and images only: what best() matches
-        std::vector<ConversationCheckpoint> checkpoints;
-        bool cvec = true;
-        uint64_t bytes = 0;                      ///< the files' bytes (queued: the image's estimate)
-        std::string index;                       ///< persist: the index file
-        int64_t written_s = 0;                   ///< persist: when it was written (seconds since the epoch)
-    };
+    using Entry = ConversationDiskEntry;   ///< the v1 keys and files, or the v2 block table (container v2 above)
     struct Job {
         Entry entry;
         SavedConversation image;
@@ -132,8 +200,8 @@ private:
     void remove_locked(size_t index, bool delete_files);     // m_ held
     void log(const std::string& line) const;
     SessionFileIdentity file_identity() const;
-    bool write_index(Entry& e, std::string& error) const;
-    bool read_index(const std::string& path, Entry& e) const;
+    bool write_index(Entry& e, std::string& error) const;    // v1 (until the write path moves over)
+    bool read_index(const std::string& path, Entry& e) const;   // v1 and v2
     std::string scan_folder(size_t& stale, std::error_code& ec);   // open(): take in or remove; its log part
 
     ConversationDiskOptions options_;
