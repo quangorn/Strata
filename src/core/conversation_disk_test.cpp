@@ -920,6 +920,12 @@ int main() {
             check(took > 0 && took < all, "read path: an earlier state reads only the blocks below it");
             check(part.live.ids.size() == 600 && part.checkpoints.size() == 2,
                   "read path: its own states come back, not the deeper ones");
+            // the launch mounts a checkpoint at `resume` only when it does not land on the live state, and every key
+            // a read lands on comes back as `live`: so a disk restore always resumes the session as live, and the
+            // match's `live` flag (entry's deepest key vs prompt) must not drive the mount's search.
+            check(std::none_of(part.checkpoints.begin(), part.checkpoints.end(),
+                               [](const ConversationCheckpoint& c) { return c.ids.size() == 600; }),
+                  "read path: the state a read lands on is `live`, and no checkpoint of its length is in the image");
         }
         // one damaged byte in the middle kv block: the states at 1050 and above need it, 600 and below do not
         uint64_t broken = 0;

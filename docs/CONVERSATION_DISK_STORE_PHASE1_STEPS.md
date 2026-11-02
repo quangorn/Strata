@@ -455,9 +455,52 @@ rest of the suite is unchanged: `conversation_file_test` 183 checks with the gol
 `0x70f812b350360d09`), `conversation_snapshot_test` 4865, `conversation_validation_test` 972,
 `session_save_reclaim_test` 119, `conversation_cache_test` 4854. The engine: `--target strata` built, exit 0.
 
-**Not yet measured**: the serving model runs the reader that fails, so the live disk read has not passed on hardware.
-The fixed engine has to be packaged and served, and then the same traffic must give a `disk hit` line. The plan's
-own comparison (a day of agent sessions against a run without the change) is still not run.
+**The live disk read now passes on this PC** (`0.1.55.4-windows-x86_64-cuda-cuda13`, `build_id 419434549fd8` = the
+fix's commit, its own string `strata 0.1.55-local`). The start took the folder in whole:
+`23 conversations from earlier runs (17592 MiB), 0 refused (a v1 index, another model, engine version or settings,
+a missing state block, a file the table outgrew)`. Reads: `disk hit: 167790 tokens, 2232 MiB in 1 file, 2774 ms
+(844 MB/s)` and `disk hit: 24649 tokens, 454 MiB in 1 file, 692 ms (688 MB/s)`, and the prompt line names where the
+read landed - `prompt 176559 tokens = 167790 reused + 8769 read in 8099 ms (1082.7 tok/s), ... reused from the disk
+in 3.0 s`. No read failures, no fallbacks. One read was refused by the tier's own economics and said so:
+`not read: its 1058 more tokens read in ~0.6 s, its file (2232 MiB) in ~2.8 s`. The plan's own comparison (a day of
+agent sessions against a run without the change) is still not run, and nothing here claims a saving.
+
+**A serve-loop finding from the same traffic, not of the disk tier**: a request whose assistant turn carries a `null`
+content makes the restore fail and the engine ends with code 1 (`generate.cpp:14823`:
+`std::printf("ERR restoring a conversation checkpoint failed"); return 1;`); the server turns it into
+`400 invalid request: restoring a conversation checkpoint failed` and starts the engine again on the next request, so
+a conversation is lost and the process reloads (~15 minutes). The disk store survived that exit: the restart took all
+23 entries in with `0 refused`. A `null`-content request should be answered with a 400 before the restore is
+attempted. Read from the code, not investigated further - marked here as unconfirmed reading of the source.
+
+**2026-11-03, the crash under a large conversation, found and fixed.** The engine ended 4 times in 13 minutes
+(`engine started:` lines at 23:42:54, 23:43:16, 23:44:05, 23:46:00), each time on the same traffic: the server logged
+`the engine reported an error: restoring a conversation checkpoint failed`, then `the engine stopped unexpectedly
+(exit code 1)`. The engine log before each restart ends the same way: `conversation disk: disk hit: 205749 tokens,
+2673 MiB in 1 file` , `conversation cache: restored 205749 tokens (checkpoint)`, and immediately
+`conversation disk: end: 28 conversations kept on the disk for the next start` - the request restored the image and
+the process ended, before any prompt line. The conversation the user moved to `E:\_bad` is the entry the reads land
+on: its index has `tokens 205923` (the live key), `checkpoints 8`, and the prompt shares only up to the checkpoint at
+205749.
+
+The path is in `generate.cpp`, not in the store. `read_entry_image` returns the state a read lands on as the image's
+`live` and the states below it as its checkpoints (`conversation_disk.cpp:871-872`). The serve loop took the match's
+`live` flag - "the prompt matched the entry's deepest key to its end" - and used it as `from_live` (line 14412). When
+the prompt diverges inside the entry's live key, the match is a checkpoint, `from_live` is false, and the mount
+(line 14789) searches `checks` for a checkpoint whose length is `resume`; in a disk image the landing key lives in
+`live`, not in the checkpoints, so the search finds none: `std::printf("ERR restoring a conversation checkpoint
+failed"); return 1;` (line 14823). The image itself restored fine - `conversation_snapshot_restore` writes the
+landing state as the session's live state, which is what the request needs. The fix sets `parked.live = true` after a
+disk take: a disk read always lands on the state it gives back as `live`, so the session resumes as live from it.
+The store test now states the invariant the launch leans on: the read of the state at 600 tokens gives
+`part.live.ids.size() == 600`, no checkpoint of 600 tokens in `part.checkpoints`. `conversation_disk_test`:
+**230 checks passed** (229 before, 1 added). The rest of the offline suite: `conversation_file_test` 183,
+`conversation_snapshot_test` 4865, `conversation_validation_test` 972, `conversation_cache_test` 4854,
+`session_save_reclaim` 119. The engine (`--target strata`) built, exit 0.
+
+**Not yet measured on hardware**: the fix is in `0.1.55.5-windows-x86_64-cuda-cuda13` (manifest sha256
+`a7e01099a40ea8c32e2922aea92014dc987f463fd5896909c7d8a6a78dfd4e3e`), and its restart under the same traffic is not
+run. The `null`-content case above ends in the same line 14823, so one branch covers both exits.
 
 **The version rule held**: `project(strata VERSION 0.1.55)` is unchanged, the engine names itself `0.1.55-local`,
 and the build number lives only in the package folder and manifest (`0.1.55.3-...`). The index identity hash is

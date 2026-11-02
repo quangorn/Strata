@@ -14409,7 +14409,13 @@ int main(int argc, char** argv) {
                         // prompt then starts again there (the estimate above is no promise, only a guess)
                         parked.tokens = (int64_t) image.live.ids.size();
                         incoming.emplace(std::move(image));
-                        parked.live = on_disk.live;
+                        // The image's `live` is the state the read lands on, checkpoint or not: a read restores the
+                        // session with it, so this request resumes at its length as a live state.  The match's own
+                        // `live` flag says only whether the entry's deepest key matched the prompt, and when the
+                        // prompt diverges inside that key the read lands on a lower checkpoint.  The mount below
+                        // needs a checkpoint at `resume`; for a disk image the landing state is `live`, and its
+                        // checkpoints are the states strictly below it, so only `live` fits here.
+                        parked.live = true;
                     } else {
                         std::fprintf(stderr, "strata serve: conversation disk: %lld tokens not restored (%s); reading "
                                              "the prompt\n", (long long) on_disk.restore_tokens, disk_err.c_str());
