@@ -63,14 +63,25 @@ std::vector<std::string> files_of(const ConversationDiskEntry& e) {
 // index holds them; a tie falls to the older id, the order entries are created in.
 int64_t lru_s(const ConversationDiskEntry& e) { return std::max(e.last_used_s, e.written_s); }
 
+// A conversation holding a pinned shared prefix (ConversationCheckpoint::pinned): a `state` block of it is pinned.
+// The budget leaves such a conversation, as the RAM cache does (conversation_cache.hpp, `pinned()`; conv_cache.hpp,
+// the policy): the queries that branch from the prefix keep coming back to it, while the disk holds no other copy.
+bool pinned_entry(const ConversationDiskEntry& e) {
+    for (const auto& stage : e.stages)
+        for (const auto& block : stage.blocks)
+            if (block.kind == ConversationDiskBlock::state && block.pinned) return true;
+    return false;
+}
+
 // The whole conversation the budget removes next: the least recently used one that is neither the entry a write is
-// extending nor one a read holds.  `entries.size()` when nothing may go (the write then goes over the budget, which
-// the RAM cache does too: an entry is never split and never left half-written).
+// extending, nor one a read holds, nor one holding a pinned prefix.  `entries.size()` when nothing may go (the write
+// then goes over the budget, which the RAM cache does too: an entry is never split and never left half-written, and a
+// pin is never traded for room).
 size_t lru_victim(const std::deque<ConversationDiskEntry>& entries, uint64_t except) {
     size_t victim = entries.size();
     for (size_t i = 0; i < entries.size(); ++i) {
         const auto& e = entries[i];
-        if (e.id == except || e.readers > 0) continue;
+        if (e.id == except || e.readers > 0 || pinned_entry(e)) continue;
         if (victim == entries.size() || lru_s(e) < lru_s(entries[victim]) ||
             (lru_s(e) == lru_s(entries[victim]) && e.id < entries[victim].id))
             victim = i;
@@ -1353,14 +1364,18 @@ void ConversationDiskTier::write(Job& job) {
     }
     need += index_estimate(updated) + 72 * new_blocks;   // the v2 index, rewritten whole on every publish
 
-    // 3. the budget: whole conversations, the least recently used first, never the entry being extended or one a read
-    // holds
-    size_t made_room = 0;
+    // 3. the budget: whole conversations, the least recently used first, never the entry being extended, one a read
+    // holds, or one holding a pinned shared prefix
+    size_t made_room = 0, pins = 0;
     if (error.empty()) {
         std::lock_guard<std::mutex> lock(m_);
         while (bytes_ + need > options_.budget_bytes) {
             const size_t victim = lru_victim(entries_, target);
-            if (victim == entries_.size()) break;   // nothing removable is left (the target, or a read holds it)
+            if (victim == entries_.size()) {
+                for (const auto& e : entries_)
+                    if (e.id != target && e.readers == 0 && pinned_entry(e)) ++pins;
+                break;   // nothing removable is left (the target, a read holds it, or the rest are pinned)
+            }
             remove_locked(victim, true);
             ++made_room;
         }
@@ -1508,6 +1523,9 @@ void ConversationDiskTier::write(Job& job) {
             "%zu removed for the budget, %zu superseded", tokens, target ? " (appended)" : "", mib(bin_bytes),
             blocks_written, nstages, nstages == 1 ? "" : "s", ms, mbps(bin_bytes, ms), on_disk, mib(disk_bytes),
             made_room, superseded));
+    if (pins)
+        log(fmt("on disk %.0f MiB is over the budget of %.0f MiB: %zu pinned conversation%s kept, a pin is never "
+                "traded for room", mib(disk_bytes), mib(options_.budget_bytes), pins, pins == 1 ? "" : "s"));
     (void) index_bytes;
 }
 

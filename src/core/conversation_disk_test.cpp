@@ -101,7 +101,7 @@ SavedConversation split_image(size_t tokens, uint8_t seed, int32_t first = 1000)
 
 bool same_checkpoint(const ConversationCheckpoint& a, const ConversationCheckpoint& b) {
     return a.ids == b.ids && a.imgs == b.imgs && a.gdn == b.gdn && a.ple == b.ple && a.tails == b.tails &&
-           a.dead == b.dead && a.block_pos == b.block_pos && a.used == b.used;
+           a.dead == b.dead && a.block_pos == b.block_pos && a.used == b.used && a.pinned == b.pinned;
 }
 
 bool same_kv(const ConversationKv& x, const ConversationKv& y) {
@@ -972,6 +972,54 @@ int main() {
             check(tier.size() == 1 && tier_files(sdir) == 2, "start-up: the entry and its files stay");
         }
         fs::remove_all(sdir);
+    }
+
+    {   // the LRU stamp and the pin in the index (step 6): both survive a stop and a start, and the budget leaves a
+        // pinned conversation while an unpinned one can go
+        const fs::path pdir = dir / "pin";
+        fs::remove_all(pdir);
+        fs::create_directories(pdir);
+        const SessionFileIdentity pid{6, 6};
+        auto store_p = [&](uint64_t budget) {
+            auto o = opts(pdir, budget);
+            o.persist = true;
+            o.identity = pid;
+            return o;
+        };
+        SavedConversation pinned_image = image(600, 120, 1000, 0, 48, 1);
+        pinned_image.live.used = 555;
+        pinned_image.checkpoints[0].pinned = true;   // the shared prefix at 300: the budget never trades it for room
+        pinned_image.checkpoints[0].used = 777;
+        pinned_image.checkpoints[1].used = 111;
+        {
+            ConversationDiskTier tier(store_p(GiB));
+            check(tier.open(e) && tier.put(std::move(pinned_image)), "pin: put the pinned conversation");
+            tier.wait_idle();
+            check(tier.put(image(600, 121, 5000, 0, 48, 1)), "pin: put an unpinned one");
+            tier.wait_idle();
+            check(tier.size() == 2, "pin: two conversations on the disk");
+        }
+        {
+            ConversationDiskTier tier(store_p(2ull << 20));   // one ~1.4 MiB conversation, not two
+            check(tier.open(e) && tier.size() == 1, "pin: the start trims to the budget");
+            check(tier.best(prompt_of(650, 5000), {}, false).tokens == 0,
+                  "pin: the unpinned conversation went at start");
+            const auto m = tier.best(prompt_of(650, 1000), {}, false);
+            SavedConversation back;
+            check(m.tokens == 600 && tier.take(m.id, m.tokens, back, e), "pin: the pinned one stayed and reads back");
+            check(back.live.used == 555 && back.checkpoints[0].used == 777 && back.checkpoints[0].pinned &&
+                      back.checkpoints[1].used == 111 && !back.checkpoints[1].pinned,
+                  "pin: used and pinned came back through the index, across the restart");
+            check(tier.put(image(600, 122, 9000, 0, 48, 1)), "pin: put another unpinned conversation");
+            tier.wait_idle();
+            check(tier.size() == 2 && tier.bytes() > (2ull << 20),
+                  "pin: the budget goes over rather than evicting the pinned conversation");
+            check(tier.best(prompt_of(650, 1000), {}, false).tokens == 600 &&
+                      tier.best(prompt_of(650, 9000), {}, false).tokens == 600,
+                  "pin: the pinned and the new conversation are both there");
+            check(logged("pinned conversation"), "pin: the line says why the budget is over");
+        }
+        fs::remove_all(pdir);
     }
 
     fs::remove_all(dir);

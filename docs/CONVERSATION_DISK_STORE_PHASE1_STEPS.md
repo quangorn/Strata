@@ -52,11 +52,12 @@ tests 2-7 run on what steps 3 and 4 give.
 
 ## Where each step stands
 
-2026-11-02. **Steps 1, 2, 3, 4 and 5 are done and green.** Step 1 touched only the gate's test; steps 2-5
+2026-11-02. **Steps 1, 2, 3, 4, 5 and 6 are done and green.** Step 1 touched only the gate's test; steps 2-6
 the tier's own files. A park now writes the block store, a read keeps the entry and reads only the blocks its
-state needs, the budget evicts whole conversations by use, and a folder of the previous build is refused and
-removed at start (decision 3). The default path (no `--conversation-disk-dir`) is untouched, and every test run
-uses its own temporary folder - never the serving model's storage (decision 4).
+state needs, the budget evicts whole conversations by use and leaves a pinned one, `used` and `pinned` survive a
+restart through the index, and a folder of the previous build is refused and removed at start (decision 3). The
+default path (no `--conversation-disk-dir`) is untouched, and every test run uses its own temporary folder - never
+the serving model's storage (decision 4).
 
 **Step 1, the gate: passes.** Measured on this PC (RTX 4080, sm_89, CUDA 13.4, MSVC 14.44.35207,
 build folder `build-c13-gate`, Release):
@@ -297,9 +298,35 @@ Measured on this PC (same build folder, Release):
   does not include `conversation_disk.hpp`).
 - the engine: `--target strata` built, exit 0; no warning from the touched files.
 
-**Next: step 6, `used` and `pinned` in the index** - the LRU stamp and the shared-prefix pin move out of the
-checkpoint payload into the `state` block record, so both survive a restart, while the slot-save format stays v1 and
-byte-identical.
+**Step 6, `used` and `pinned` in the index: done.** The LRU stamp and the shared-prefix pin belong to the index now, so
+both survive a restart, and the slot-save format is byte for byte what it was. What landed:
+
+- `put_checkpoint`/`get_checkpoint` (`src/core/conversation_file.cpp`) no longer carry `used`: the checkpoint encoder
+  is the ids, the images and the five arrays, and `put_payload`/`get_payload` write and read the stamp right after
+  each checkpoint - the same position in the same order, so neither the bytes nor the format's version change. The
+  stamp belongs to whoever stores the checkpoint: the session payload keeps it where v1 always had it, and the disk
+  tier's `state` block record carries it (container v2's `used`, step 2) with `pinned` beside it.
+  `conversation_file.hpp` needed nothing: the helpers are internal to the `.cpp`, because step 3 gave the store its
+  own state payload rather than reusing this encoder.
+- the disk budget honours the pin (`lru_victim()` in `src/core/conversation_disk.cpp`): a conversation that holds a
+  pinned `state` block is skipped while another one can go - the rule the RAM cache already applies
+  (`conversation_cache.hpp`, `pinned()`), and the reason `pinned` had to survive a restart. With only pinned
+  conversations left the budget goes over rather than trading the pin for room, and one line says so.
+
+Measured on this PC (same build folder, Release):
+
+- `conversation_disk_test`: **198 checks, exit 0** (187 before; 11 new: a stop and a start keep each checkpoint's
+  `used` and its `pinned`, the start's trim evicts the unpinned conversation and keeps the pinned one, a later write
+  goes over the budget rather than evicting the pin, and the line says why).
+- `conversation_file_test`: **183 checks, exit 0**, the golden included: the fixed sample's file is still 17 878 535
+  bytes with hash `0x70f812b350360d09` - lifting `used` out of the checkpoint encoder leaves the session file's bytes
+  untouched.
+- `ctest -C Release -R "conversation_|session_"`: 11 of 11 passed (all three snapshot entries in one run this time).
+- the engine: `--target strata` built, exit 0; the only warnings from the touched files are the tree's own `strerror`
+  C4996 lines in `conversation_file.cpp`.
+
+**Next: step 7, `Match::restore_tokens` in the caller** - the "read the file or read the tokens" estimate in
+`generate.cpp` uses `restore_tokens`, so it no longer claims a longer prefix than the file can give.
 
 ## What each step must not touch
 

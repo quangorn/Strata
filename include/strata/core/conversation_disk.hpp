@@ -3,7 +3,8 @@
 // stage, appended to, and one `.idx` naming its blocks - and read back when a request continues them, within a byte
 // budget and (unless `persist`) this run only.  A read keeps the entry: the next eviction of the same conversation
 // appends only its delta.  The budget evicts whole conversations, the least recently used first (`last_used_s`, which a
-// read stamps; `written_s` for one never read).  `persist`: the files are bound to the session files' identity (model
+// read stamps; `written_s` for one never read); a conversation holding a pinned shared prefix is left while another can
+// go.  `persist`: the files are bound to the session files' identity (model
 // and settings), and the next start picks them up (the budget only).  A folder written by an older build (the v1
 // session files one per stage) is removed at start: its entries are not read.
 #pragma once

@@ -678,20 +678,26 @@ void put_kv_header(Out& o, int format, int64_t cells, int64_t heads, int64_t hea
     for (int64_t v : {int64_t(format), cells, heads, head_dim, page_size, pooled_rows, idx_dim}) o.i64(v);
 }
 
+// The parts of a checkpoint a session file's payload holds; its LRU stamp is written by put_payload right after it (v1
+// keeps it there, byte for byte).  The disk tier's index carries the stamp itself (ConversationDiskBlock::used), which
+// is why the shared encoder does not.
 void put_checkpoint(Out& o, const ConversationCheckpoint& c) {
     o.vec(c.ids);
     o.u64(c.imgs.size());
     for (const auto& k : c.imgs) { o.i64(k.start); o.u64(k.hash); }
     o.vec(c.gdn); o.vec(c.ple); o.vec(c.tails); o.vec(c.dead); o.vec(c.block_pos);
-    o.u64(c.used);
 }
 
 void put_payload(Out& o, const SavedConversation& s, const std::vector<SessionKvSource>* sources = nullptr) {
     for (int64_t g : s.geometry) o.i64(g);
     o.i64(s.layer_lo); o.i64(s.layer_hi); o.u64(s.cvec ? 1 : 0);
     put_checkpoint(o, s.live);
+    o.u64(s.live.used);   // v1: the stamp of a checkpoint follows its arrays
     o.u64(s.checkpoints.size());
-    for (const auto& c : s.checkpoints) put_checkpoint(o, c);
+    for (const auto& c : s.checkpoints) {
+        put_checkpoint(o, c);
+        o.u64(c.used);
+    }
     if (sources) {
         o.u64(sources->size());
         for (const auto& k : *sources) {
@@ -759,7 +765,7 @@ bool get_checkpoint(In& in, ConversationCheckpoint& c) {
     for (auto& k : c.imgs) if (!in.i64(k.start) || !in.u64(k.hash)) return false;
     const auto& m = in.limits.max_state_bytes;   // byte arrays: element and byte counts are the same
     return in.vec(c.gdn, m[0]) && in.vec(c.ple, m[1]) && in.vec(c.tails, m[2]) && in.vec(c.dead, m[3]) &&
-           in.vec(c.block_pos, m[4]) && in.u64(c.used);
+           in.vec(c.block_pos, m[4]);
 }
 
 bool get_payload(In& in, SavedConversation& s) {
@@ -774,12 +780,12 @@ bool get_payload(In& in, SavedConversation& s) {
         return in.fail("saved with another layer range than this runtime's");
     if (cvec > 1) return in.fail("invalid cvec flag");
     s.cvec = cvec == 1;
-    if (!get_checkpoint(in, s.live)) return false;
+    if (!get_checkpoint(in, s.live) || !in.u64(s.live.used)) return false;   // v1: the stamp follows its arrays
     uint64_t n = 0;
-    // a checkpoint is at least 8 counts + used = 72 bytes; a K/V layer at least 7 + 5 = 96
+    // a checkpoint with its stamp is at least 8 counts + 8 = 72 bytes; a K/V layer at least 7 + 5 = 96
     if (!in.count(n, 72, in.limits.max_checkpoints)) return false;
     s.checkpoints.resize((size_t) n);
-    for (auto& c : s.checkpoints) if (!get_checkpoint(in, c)) return false;
+    for (auto& c : s.checkpoints) if (!get_checkpoint(in, c) || !in.u64(c.used)) return false;
     if (!in.count(n, 96, in.limits.max_kv_layers)) return false;
     s.kv.resize((size_t) n);
     for (auto& k : s.kv) {
