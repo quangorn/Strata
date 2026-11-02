@@ -14373,7 +14373,10 @@ int main(int argc, char** argv) {
             if (conv_disk.enabled()) {
                 const auto on_disk = conv_disk.best(ids, req_imgs, want_cvec);
                 const int64_t reused_without_disk = std::max({resume, slot_tokens, parked.tokens});
-                const int64_t added = on_disk.tokens - reused_without_disk;
+                // What a read lands on, not what the index claims: a file gives back the tokens up to its deepest
+                // `state` block, and one that already fell back on damage gives back less.  Counting `tokens` here
+                // would claim a prefix the file cannot give and read it for nothing.
+                const int64_t added = on_disk.restore_tokens - reused_without_disk;
                 // a whole file for the tokens it adds (16,384 of a 6 GB file: a conversation sharing only the system
                 // prompt) only when reading it is faster than reading those tokens; until both speeds are measured, read
                 bool from_disk = added > 0;
@@ -14400,7 +14403,7 @@ int main(int argc, char** argv) {
                     strata::core::SavedConversation image;
                     std::string disk_err;
                     const auto d0 = Clock::now();
-                    if (conv_disk.take(on_disk.id, on_disk.tokens, image, disk_err, admit)) {
+                    if (conv_disk.take(on_disk.id, on_disk.restore_tokens, image, disk_err, admit)) {
                         disk_read_ms = std::chrono::duration<double, std::milli>(Clock::now() - d0).count();
                         // what the read actually rebuilt: a damaged block falls back to an earlier state, and the
                         // prompt then starts again there (the estimate above is no promise, only a guess)
@@ -14409,7 +14412,7 @@ int main(int argc, char** argv) {
                         parked.live = on_disk.live;
                     } else {
                         std::fprintf(stderr, "strata serve: conversation disk: %lld tokens not restored (%s); reading "
-                                             "the prompt\n", (long long) on_disk.tokens, disk_err.c_str());
+                                             "the prompt\n", (long long) on_disk.restore_tokens, disk_err.c_str());
                     }
                     if (evicted && !incoming) parked = conversations.best(ids, req_imgs, want_cvec);   // indices moved
                 }

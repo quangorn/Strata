@@ -52,10 +52,12 @@ tests 2-7 run on what steps 3 and 4 give.
 
 ## Where each step stands
 
-2026-11-02. **Steps 1, 2, 3, 4, 5 and 6 are done and green.** Step 1 touched only the gate's test; steps 2-6
-the tier's own files. A park now writes the block store, a read keeps the entry and reads only the blocks its
+2026-11-02. **Steps 1, 2, 3, 4, 5, 6 and 7 are done and green.** Step 1 touched only the gate's test; steps 2-6
+the tier's own files; step 7 the serve loop's restore estimate. A park now writes the block store, a read keeps the
+entry and reads only the blocks its
 state needs, the budget evicts whole conversations by use and leaves a pinned one, `used` and `pinned` survive a
-restart through the index, and a folder of the previous build is refused and removed at start (decision 3). The
+restart through the index, a folder of the previous build is refused and removed at start (decision 3), and the
+"read the file or read the tokens" estimate counts what a read lands on rather than what the index claims. The
 default path (no `--conversation-disk-dir`) is untouched, and every test run uses its own temporary folder - never
 the serving model's storage (decision 4).
 
@@ -325,8 +327,30 @@ Measured on this PC (same build folder, Release):
 - the engine: `--target strata` built, exit 0; the only warnings from the touched files are the tree's own `strerror`
   C4996 lines in `conversation_file.cpp`.
 
-**Next: step 7, `Match::restore_tokens` in the caller** - the "read the file or read the tokens" estimate in
-`generate.cpp` uses `restore_tokens`, so it no longer claims a longer prefix than the file can give.
+**Step 7, `Match::restore_tokens` in the caller: done.** The serve loop's "read the file or read the tokens"
+estimate no longer claims a prefix the file cannot give. What landed, in `src/program/generate.cpp` only:
+
+- the estimate counts `on_disk.restore_tokens` instead of `on_disk.tokens` (`added = restore_tokens -
+  reused_without_disk`), so a file of a conversation whose deepest state sits one checkpoint interval behind the
+  index's key is weighed for the tokens a read lands on, not for a prefix it does not hold;
+- a read that already fell back on damage (step 4 lowered the entry's `verified` position) lowers the estimate to its
+  own outcome on the next request too, so the "read the file or read the tokens" line and the "not restored" line
+  speak of the same number;
+- `conv_disk.take()` is asked for exactly that number, so a repeat read does not re-try a state whose block is
+  already known damaged; the call's `tokens` argument is diagnostics (the read still clamps it to its own deepest
+  state), which is why nothing else in `take()` moved.
+
+Measured on this PC (same build folder, Release):
+
+- the engine: `--target strata` built, exit 0; the only warnings from `generate.cpp` are the tree's own template
+  and C4996 lines.
+- `ctest -C Release -R "conversation_|session_"`: 11 of 11 passed in one run (`conversation_disk_test` 4.84 s, all
+  three snapshot entries included, 20.95 s total). Step 7 has no test of its own: the estimate is a branch in the
+  serve loop, and step 8's tests are the store's.
+
+**Next: step 8, the tests of the plan, 2-11** (`conversation_disk_test.cpp`): append, keep-on-read, budget by use,
+torn tail, one bad block, `used`/`pinned` across a restart, append across runs, history rewrite, a v1 folder removed
+at start.
 
 ## What each step must not touch
 
