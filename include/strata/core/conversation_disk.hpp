@@ -1,7 +1,8 @@
 // The disk tier of --serve's parked conversations (--conversation-disk-dir): the RAM cache's evictions
 // (ConversationCache::set_on_evict) are written by a background thread to a block store - one `.bin` per layer-split
 // stage, appended to, and one `.idx` naming its blocks - and read back when a request continues them, within a byte
-// budget and (unless `persist`) this run only.  `persist`: the files are bound to the session files' identity (model
+// budget and (unless `persist`) this run only.  A read keeps the entry: the next eviction of the same conversation
+// appends only its delta.  `persist`: the files are bound to the session files' identity (model
 // and settings), and the next start picks them up (the budget only).  A folder written by an older build (the v1
 // session files one per stage) is removed at start: its entries are not read.
 #pragma once
@@ -9,6 +10,7 @@
 #include "strata/core/conversation_cache.hpp"
 #include "strata/core/conversation_file.hpp"
 
+#include <algorithm>
 #include <array>
 #include <condition_variable>
 #include <cstddef>
@@ -33,12 +35,16 @@ struct ConversationDiskOptions {
     std::function<void(const std::string&)> log;
     /// Tests: called on the writer thread before each write starts.
     std::function<void()> before_write;
+    /// Called on the writer thread for every image of a job before its K/V is read: STRATA_PARK_ASYNC's background
+    /// copy may still be filling the park's host buffers, and the request thread cannot wait for it there without
+    /// undoing the asynchronous park.  `generate.cpp` sets it to `conversation_park_join_for`; unset: nothing waits.
+    std::function<void(const SavedConversation&)> join;
 };
 
 /// What the tier did since it started (diagnostics).
 struct ConversationDiskStats {
     size_t queued = 0, written = 0, write_failed = 0, ram_hits = 0, disk_hits = 0, read_failed = 0;
-    size_t evicted = 0, waits = 0;
+    size_t evicted = 0, waits = 0, fallbacks = 0;   ///< fallbacks: reads that landed on an earlier state (damage)
     uint64_t bytes_written = 0, bytes_read = 0;
     uint64_t tokens_back = 0;                 ///< prompt tokens given back (not read again) by ram or disk hits
     double write_ms = 0, read_ms = 0, wait_ms = 0;
@@ -103,6 +109,9 @@ struct ConversationDiskEntry {
     std::string index;                              ///< the index file (set by a read)
     int64_t written_s = 0;                          ///< when the index was published (seconds since the epoch)
     int64_t last_used_s = 0;                        ///< v2: the LRU stamp, written with the next publish
+    // Not in the index (the format is fixed): a read's own bookkeeping.
+    int64_t verified = 0;                           ///< a read fell back on damage: the deepest state that verified
+    size_t readers = 0;                             ///< a read is using its files: the writer removes it later
 };
 
 /// Writes the v2 index of `entry` to `path`: a temporary file beside it, then a rename, so a reader sees the whole
@@ -141,8 +150,8 @@ public:
         bool live = false;
         uint64_t bytes = 0;     ///< the entry's files (queued: the image's estimate)
         bool queued = false;    ///< still in RAM: take() hands it back without reading a file
-        /// The tokens a read of this match lands on: the position of the `state` block the read can rebuild (at most
-        /// one checkpoint interval behind `tokens`).  The "read the file or read the tokens" estimate uses this one.
+        /// The tokens a read of this match lands on: the deepest `state` block a read can rebuild (a read that fell
+        /// back on damage lowers it).  The "read the file or read the tokens" estimate uses this one.
         int64_t restore_tokens = 0;
     };
     /// The longest prefix of `prompt` an entry holds (its live state or its checkpoint), queued or on the disk, as
@@ -155,7 +164,9 @@ public:
             if (e.cvec != cvec) return;
             auto consider = [&](const ConversationCheckpoint& c, bool live) {
                 const int64_t n = conversation_prefix(c, prompt, images);
-                if (n > best.tokens || (n == best.tokens && n > 0 && e.id > best.id)) best = {e.id, n, live, e.bytes, queued};
+                const int64_t at = e.verified > 0 ? std::min(n, e.verified) : n;   // the deepest state a read got
+                if (n > best.tokens || (n == best.tokens && n > 0 && e.id > best.id))
+                    best = {e.id, n, live, e.bytes, queued, at};
             };
             consider(e.live, true);
             for (const auto& c : e.checkpoints) consider(c, false);
@@ -163,14 +174,15 @@ public:
         for (const auto& e : entries_) scan(e, false);
         for (const auto& j : queue_) scan(j.entry, true);
         if (writing_) scan(writing_entry_, false);   // its file appears when the write ends: take() waits for it
-        best.restore_tokens = best.tokens;   // a whole read lands on the matched state; step 4 lowers this on damage
         return best;
     }
 
-    /// Hands entry `id` back in `out` (its stage images included) and removes it from the tier either way: from RAM
-    /// when it is still queued, else from the disk (waiting for its write when it is being written).  `admit(need,
-    /// why)` is asked before each file's payload is allocated (session_file_read's RAM preflight).  `tokens` is what
-    /// the request reuses (diagnostics).  On failure `out` is empty and `error` says why.
+    /// Hands entry `id` back in `out` (its stage images included); the entry stays in the tier either way: a queued
+    /// image leaves RAM for the caller, a written one is read and kept on the disk (its next eviction appends to it).
+    /// Only the blocks the deepest state a read can rebuild needs are read, and a damaged chain falls back to an
+    /// earlier state.  `admit(need, why)` is asked before the blocks' payloads are allocated (session_file_read's RAM
+    /// preflight).  `tokens` is the prefix the request matched (diagnostics).  On failure `out` is empty and `error`
+    /// says why (the entry stays: its files are a cache).
     bool take(uint64_t id, int64_t tokens, SavedConversation& out, std::string& error,
               const std::function<bool(uint64_t need_bytes, std::string& why)>& admit = {});
 

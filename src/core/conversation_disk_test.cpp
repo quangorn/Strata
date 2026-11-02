@@ -3,6 +3,7 @@
 #include "strata/core/conversation_disk.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -356,10 +357,15 @@ int main() {
         SavedConversation back;
         check(tier.take(live.id, live.tokens, back, e), "take");
         check(same(back, expect), "read back exactly: both stages, the live state and every checkpoint");
-        check(tier.size() == 0 && tier.bytes() == 0 && tier_files(dir) == 0, "take removes the entry and its files");
+        check(tier.size() == 1 && tier.bytes() > 0 && tier_files(dir) == 3,
+              "take keeps the entry and its files (step 4: reads no longer delete)");
+        SavedConversation twice;
+        check(tier.take(live.id, live.tokens, twice, e) && same(twice, expect), "a second read is the same image");
+        check(tier.size() == 1 && tier_files(dir) == 3, "the second read keeps them too");
         const auto st = tier.stats();
-        check(st.queued == 1 && st.written == 1 && st.disk_hits == 1 && st.ram_hits == 0 && st.tokens_back == 600 &&
-              st.bytes_read == st.bytes_written && st.bytes_written > (8u << 20), "counters");
+        check(st.queued == 1 && st.written == 1 && st.disk_hits == 2 && st.ram_hits == 0 && st.fallbacks == 0 &&
+              st.tokens_back == 1200 && st.bytes_read == 2 * st.bytes_written && st.bytes_written > (8u << 20),
+              "counters");
         check(logged("disk hit: 600 tokens") && logged("totals:"), "the hit and the totals are logged");
     }
 
@@ -417,8 +423,8 @@ int main() {
         const auto m = tier.best(prompt_of(450), {}, false);
         SavedConversation back;
         const bool ok = tier.take(m.id, m.tokens, back, e, [](uint64_t, std::string& why) { why = "no RAM"; return false; });
-        check(!ok && back.kv.empty() && back.stage_images.empty() && tier.size() == 0 && tier_files(dir) == 0,
-              "refused read: empty image, entry and files gone");
+        check(!ok && back.kv.empty() && back.stage_images.empty() && tier.size() == 1 && tier_files(dir) == 3,
+              "refused read: empty image, the entry and its files stay");
         check(tier.stats().read_failed == 1, "a failed read is counted");
     }
 
@@ -525,13 +531,15 @@ int main() {
             check(back.checkpoints.size() == 5 && same_checkpoint(back.checkpoints[0], expect.checkpoints[0]) &&
                   same_checkpoint(back.checkpoints[1], expect.checkpoints[1]),
                   "store: the two images' checkpoints are there, deepest first");
-            check(tier.size() == 0 && tier_files(sdir) == 0,
-                  "store: the read removed the entry (step 4 keeps it)");
+            check(tier.size() == 1 && tier_files(sdir) == 2,
+                  "store: the read keeps the entry and its files (step 4)");
         }
 
         // a stale shorter copy of the same conversation: the write appends to the longest and removes the shorter one
         ConversationDiskEntry stale;
         std::string ierr;
+        fs::remove_all(sdir);   // the read above kept its entry; this part starts from an empty folder
+        fs::create_directories(sdir);
         {
             ConversationDiskTier tier(store());
             check(tier.open(e) && tier.put(image(600, 41, 1000, 0, 48, 1)), "supersede: put 600 tokens");
@@ -624,7 +632,7 @@ int main() {
             if (!read) std::fprintf(stderr, "take: %s\n", e.c_str());
             check(read, "persist: read back after a restart");
             check(same(back, split_image(500, 20)), "persist: the image is exactly the one written");
-            check(tier_files(dir) == 2, "persist: its images and index are gone");
+            check(tier_files(dir) == 5 && tier.size() == 2, "persist: the read keeps its files (step 4)");
         }
         {
             ConversationDiskTier other(persistent(2));   // another model, engine version or settings
@@ -662,6 +670,125 @@ int main() {
                   "persist: a's image under b's index is refused, never restored as b");
             check(tier.best(prompt_of(450), {}, false).tokens == 400, "persist: a is still there");
         }
+    }
+
+    {   // the writer waits for the park's background copy on its own thread, before it reads an image (PARK_ASYNC)
+        std::atomic<int> joined{0}, before{0}, saw_image{0};
+        auto o = opts(dir, GiB);
+        o.before_write = [&] { ++before; };
+        o.join = [&](const SavedConversation& img) {
+            ++joined;
+            if (img.live.ids.size() == 400) ++saw_image;   // the image itself, not one of its stage parts
+        };
+        ConversationDiskTier tier(std::move(o));
+        check(tier.open(e) && tier.put(image(400, 70)), "join: put");
+        tier.wait_idle();
+        check(joined == 1 && before == 1 && saw_image == 1,
+              "join: called once per image, on the writer thread, before the write");
+        check(tier.size() == 1 && logged("wrote 400 tokens"), "join: and the write went on");
+    }
+
+    {   // the read path: only the blocks the state needs, and a damaged block costs the states above it
+        const fs::path rdir = dir / "read";
+        fs::create_directories(rdir);
+        const SessionFileIdentity rid{4, 4};
+        auto store_r = [&] {
+            auto o = opts(rdir, GiB);
+            o.persist = true;
+            o.identity = rid;
+            return o;
+        };
+        {
+            ConversationDiskTier tier(store_r());
+            check(tier.open(e) && tier.put(image(600, 60, 1000, 0, 48, 1)), "read path: put 600 tokens");
+            tier.wait_idle();
+            check(tier.put(image(4200, 60, 1000, 0, 48, 1)), "read path: put 4200 tokens (an append)");
+            tier.wait_idle();
+        }
+        ConversationDiskEntry idx;
+        for (const auto& f : fs::directory_iterator(rdir))
+            if (f.path().extension() == ".idx") conversation_disk_index_read(f.path().string(), rid, idx);
+        check(idx.tokens == 4200 && idx.stages.size() == 1, "read path: one entry of 4200 tokens");
+        const fs::path rbin = rdir / fs::path(idx.stages[0].file).filename();
+        {
+            ConversationDiskTier tier(store_r());
+            check(tier.open(e) && tier.size() == 1, "read path: open");
+            const auto m = tier.best(prompt_of(4300), {}, false);
+            check(m.tokens == 4200 && m.restore_tokens == 4200, "read path: the deepest state is claimed");
+            SavedConversation back;
+            check(tier.take(m.id, m.tokens, back, e), "read path: read");
+            const SavedConversation expect = image(4200, 60, 1000, 0, 48, 1);
+            check(back.live.ids.size() == 4200 && same_checkpoint(back.live, expect.live) &&
+                  back.kv.size() == 2 && same_kv(back.kv[0], expect.kv[0]) && same_kv(back.kv[1], expect.kv[1]),
+                  "read path: the K/V of both writes, byte for byte");
+            check(back.checkpoints.size() == 5 && back.checkpoints[0].ids.size() == 2100 &&
+                  back.checkpoints[4].ids.size() == 150,
+                  "read path: the six states, deepest first");
+            uint64_t all = 0;
+            for (const auto& b : idx.stages[0].blocks) all += b.size;
+            const auto st = tier.stats();
+            check(tier.size() == 1 && tier_files(rdir) == 2 && st.fallbacks == 0,
+                  "read path: the entry and its files stay, nothing fell back");
+            check(st.bytes_read == all + kConversationDiskBinHeader,
+                  "read path: the deepest state's read takes every block");
+            const auto shorter = tier.best(prompt_of(700), {}, false);
+            check(shorter.tokens == 600 && !shorter.live, "read path: an earlier state matches a shorter prompt");
+            SavedConversation part;
+            const uint64_t was = st.bytes_read;
+            check(tier.take(shorter.id, shorter.tokens, part, e), "read path: read the earlier state");
+            const uint64_t took = tier.stats().bytes_read - was;
+            check(took > 0 && took < all, "read path: an earlier state reads only the blocks below it");
+            check(part.live.ids.size() == 600 && part.checkpoints.size() == 2,
+                  "read path: its own states come back, not the deeper ones");
+        }
+        // one damaged byte in the middle kv block: the states at 1050 and above need it, 600 and below do not
+        uint64_t broken = 0;
+        for (const auto& b : idx.stages[0].blocks)
+            if (b.kind == ConversationDiskBlock::kv && b.tokens_start == 600) broken = b.offset + b.size / 2;
+        check(broken > 0, "damage: the middle kv block is in the index");
+        {
+            std::fstream f(rbin, std::ios::binary | std::ios::in | std::ios::out);
+            char c = 0;
+            f.seekg((std::streamoff) broken);
+            f.read(&c, 1);
+            c = char(c ^ 0x5a);
+            f.seekp((std::streamoff) broken);
+            f.write(&c, 1);
+        }
+        {
+            ConversationDiskTier tier(store_r());
+            check(tier.open(e) && tier.size() == 1, "damage: the entry is still taken in");
+            const auto m = tier.best(prompt_of(4300), {}, false);
+            check(m.tokens == 4200 && m.restore_tokens == 4200, "damage: the index still claims 4200 before a read");
+            SavedConversation back;
+            check(tier.take(m.id, m.tokens, back, e), "damage: the read falls back instead of failing");
+            check(back.live.ids.size() == 600, "damage: it lands on the state at 600, the deepest that verifies");
+            check(back.checkpoints.size() == 2 && back.checkpoints[0].ids.size() == 300 &&
+                  back.checkpoints[1].ids.size() == 150, "damage: the states below it come back, deepest first");
+            const SavedConversation expect = image(600, 60, 1000, 0, 48, 1);
+            check(same_checkpoint(back.live, expect.live) && same_kv(back.kv[0], expect.kv[0]),
+                  "damage: the fallback's state and K/V are the ones written first");
+            check(logged("fails its hash"), "damage: the error line names the block");
+            check(logged("from the state at 600"), "damage: the hit line says where it landed");
+            const auto after = tier.best(prompt_of(4300), {}, false);
+            check(after.tokens == 4200 && after.restore_tokens == 600,
+                  "damage: best() lowers restore_tokens to what a read can give");
+            check(tier.stats().fallbacks == 1 && tier.stats().disk_hits == 1, "damage: counted once");
+            check(tier.size() == 1 && tier_files(rdir) == 2, "damage: the entry and its files stay");
+        }
+        {
+            ConversationDiskTier tier(store_r());   // and a fresh tier falls back the same way, knowing nothing yet
+            check(tier.open(e) && tier.size() == 1 &&
+                      tier.best(prompt_of(4300), {}, false).restore_tokens == 4200,
+                  "damage: a fresh tier's index knows nothing of the damage until it reads");
+            const auto m = tier.best(prompt_of(4300), {}, false);
+            SavedConversation back;
+            check(tier.take(m.id, m.tokens, back, e) && back.live.ids.size() == 600,
+                  "damage: the fresh tier falls back too");
+            check(tier.best(prompt_of(4300), {}, false).restore_tokens == 600,
+                  "damage: and lowers restore_tokens after it");
+        }
+        fs::remove_all(rdir);
     }
 
     fs::remove_all(dir);

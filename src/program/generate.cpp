@@ -10557,6 +10557,11 @@ int main(int argc, char** argv) {
         disk_opts.dir = conversations.enabled() ? o.conversation_disk_dir : std::string();
         disk_opts.budget_bytes = (uint64_t) o.conversation_disk_mib << 20;
         disk_opts.min_free_bytes = (uint64_t) o.session_min_free_mib << 20;
+        // STRATA_PARK_ASYNC: the writer waits on its own thread for the background copy of the park that produced
+        // an image; waiting here, in the request thread, would undo the asynchronous park
+        disk_opts.join = [](const strata::core::SavedConversation& image) {
+            strata::core::conversation_park_join_for(image);
+        };
         if (o.conversation_disk_persist != "off" && !disk_opts.dir.empty()) {
             // the session files' identity: a later start with the same model and settings takes the files in
             std::string id_err;
@@ -14397,8 +14402,10 @@ int main(int argc, char** argv) {
                     const auto d0 = Clock::now();
                     if (conv_disk.take(on_disk.id, on_disk.tokens, image, disk_err, admit)) {
                         disk_read_ms = std::chrono::duration<double, std::milli>(Clock::now() - d0).count();
+                        // what the read actually rebuilt: a damaged block falls back to an earlier state, and the
+                        // prompt then starts again there (the estimate above is no promise, only a guess)
+                        parked.tokens = (int64_t) image.live.ids.size();
                         incoming.emplace(std::move(image));
-                        parked.tokens = on_disk.tokens;
                         parked.live = on_disk.live;
                     } else {
                         std::fprintf(stderr, "strata serve: conversation disk: %lld tokens not restored (%s); reading "

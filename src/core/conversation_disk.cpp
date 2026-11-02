@@ -215,8 +215,8 @@ bool read_index_v2(const std::string& b, const SessionFileIdentity& id, Conversa
     return !have_state || e.tokens == deepest;
 }
 
-// ---- the block store's write path (phase 1, step 3) and the read path take() uses (step 4 adds the selective
-// reading, the chain check and the fallback to an earlier state).
+// ---- the block store's write path (phase 1, step 3) and the read path take() uses (step 4: only the blocks the
+// state a read lands on needs, the chained digest checked, and a damaged chain falls back to an earlier state).
 
 constexpr int64_t kBlockTokens = 2048;   // a kv block holds at most this many tokens, rounded down to the page
 
@@ -546,7 +546,9 @@ bool read_state_payload(Bytes& in, ConversationCheckpoint& c) {
 }
 
 // Fills a stage image's K/V buffers from one kv block.  The first block of a stage sizes every layer (its geometry is
-// in the payload); later blocks only fill the ranges they cover.
+// in the payload); later blocks only fill the ranges they cover.  Only the cells the image needs are copied: the
+// block may be the one the state's position falls inside, and its bytes past `round_up(tokens, page)` belong to a
+// later capture (the image's buffers end there anyway).
 bool read_kv_payload(Bytes& in, const ConversationDiskBlock& rec, int64_t tokens, uint32_t layers,
                      SavedConversation& img, std::string& error) {
     uint64_t nlayers = 0;
@@ -583,6 +585,13 @@ bool read_kv_payload(Bytes& in, const ConversationDiskBlock& rec, int64_t tokens
             error = "the kv blocks of a stage disagree on their layers";
             return false;
         }
+        // the cells of this block that belong to the image: up to the last whole page at or below `tokens`
+        const size_t cells = (size_t) kv.cells;
+        const size_t want = (size_t) std::min<int64_t>((int64_t) range, round_up(tokens, page) - rec.tokens_start);
+        if (want > range || want % (size_t) page || (size_t) rec.tokens_start + want > cells) {
+            error = "a kv block does not fit the image's extent";
+            return false;
+        }
         for (size_t p = 0; p < 4; ++p) {
             const uint8_t* pbytes = nullptr;
             size_t n = 0;
@@ -592,17 +601,18 @@ bool read_kv_payload(Bytes& in, const ConversationDiskBlock& rec, int64_t tokens
             }
             const size_t stride = n / range;
             ConversationBuffer* buf = p == 0 ? &kv.k : p == 1 ? &kv.v : p == 2 ? &kv.k_scale : &kv.v_scale;
-            if (fresh) buf->resize(stride * (size_t) kv.cells);
-            else if (buf->size() != stride * (size_t) kv.cells) {
+            if (fresh) buf->resize(stride * cells);
+            else if (buf->size() != stride * cells) {
                 error = "a K/V slice disagrees with the layer's geometry";
                 return false;
             }
+            const size_t ncopy = stride * want;
             size_t at = 0;
-            if (n && (!buf->visit(stride * (size_t) rec.tokens_start, n, [&](uint8_t* d, size_t c, size_t) {
+            if (ncopy && (!buf->visit(stride * (size_t) rec.tokens_start, ncopy, [&](uint8_t* d, size_t c, size_t) {
                     std::memcpy(d, pbytes + at, c);
                     at += c;
                     return true;
-                }) || at != n)) {
+                }) || at != ncopy)) {
                 error = "a K/V slice does not fit its layer";
                 return false;
             }
@@ -616,17 +626,19 @@ bool read_kv_payload(Bytes& in, const ConversationDiskBlock& rec, int64_t tokens
         if (fresh) kv.pooled.resize((size_t) kv.pooled_rows * row);
         if (nrow) {
             const size_t rowsz = row;
-            if (!rowsz || nrow % rowsz || (size_t) (rec.tokens_end / page) > (size_t) kv.pooled_rows) {
+            const size_t rows = want / (size_t) page;
+            if (!rowsz || nrow % rowsz || (size_t) (rec.tokens_start / page) + rows > (size_t) kv.pooled_rows) {
                 error = "a pooled slice does not fit its layer";
                 return false;
             }
             size_t at = 0;
-            if (!kv.pooled.visit(((size_t) rec.tokens_start / (size_t) page) * rowsz, nrow,
-                                 [&](uint8_t* d, size_t c, size_t) {
-                                     std::memcpy(d, prow + at, c);
-                                     at += c;
-                                     return true;
-                                 })) {
+            const size_t ncopy = rows * rowsz;
+            if (ncopy && !kv.pooled.visit(((size_t) rec.tokens_start / (size_t) page) * rowsz, ncopy,
+                                          [&](uint8_t* d, size_t c, size_t) {
+                                              std::memcpy(d, prow + at, c);
+                                              at += c;
+                                              return true;
+                                          })) {
                 error = "a pooled slice does not fit its layer";
                 return false;
             }
@@ -714,19 +726,75 @@ void merge_keys(ConversationDiskEntry& e, const SavedConversation& img) {
     e.tokens = (int64_t) e.live.ids.size();
 }
 
-// Reads an entry's blocks back into the image they describe: every stage's image, its live state and its
-// checkpoints, and its K/V at the deepest state's extent.  `admit` is asked for the blocks' bytes first.
-bool read_entry_image(const ConversationDiskEntry& e, SavedConversation& out, uint64_t& bytes,
+// The state positions every stage holds a block for, deepest first, at or below `limit`: what a read can rebuild.
+// (A key without a block in every stage cannot be restored: its bytes are not there.)
+std::vector<int64_t> state_positions(const ConversationDiskEntry& e, int64_t limit) {
+    std::vector<int64_t> out;
+    if (e.stages.empty()) return out;
+    std::vector<int64_t> keys;
+    keys.push_back((int64_t) e.live.ids.size());
+    for (const auto& c : e.checkpoints) keys.push_back((int64_t) c.ids.size());
+    for (const int64_t at : keys) {
+        if (at <= 0 || at > limit) continue;
+        bool every_stage = true;
+        for (const auto& stage : e.stages) {
+            bool found = false;
+            for (const auto& b : stage.blocks)
+                if (b.kind == ConversationDiskBlock::state && b.tokens_start == at) found = true;
+            every_stage = every_stage && found;
+            if (!every_stage) break;
+        }
+        if (every_stage) out.push_back(at);
+    }
+    std::sort(out.begin(), out.end(), std::greater<int64_t>());
+    out.erase(std::unique(out.begin(), out.end()), out.end());
+    return out;
+}
+
+// The blocks a read of the state at `position` uses, and the bytes they take: the kv blocks the state's extent needs,
+// then every state block at or below it (the checkpoints it hands back).
+uint64_t read_bytes_of(const ConversationDiskEntry& e, int64_t position) {
+    uint64_t total = 0;
+    for (const auto& stage : e.stages)
+        for (const auto& b : stage.blocks) {
+            const bool needed = b.kind == ConversationDiskBlock::kv ? b.tokens_start < position
+                                                                    : b.tokens_start <= position;
+            if (needed) total += b.size;
+        }
+    return total;
+}
+
+// Reads the entry's blocks back into the image they describe, as of the state at `position`: every stage's image, that
+// state as the image's `live`, the states below it as its checkpoints, and its K/V up to the state's extent.  Every
+// block read is checked against its 128 bits and against its place in the chained prefix digest; a block that fails
+// leaves `error` naming it, and the caller falls back to an earlier state.  `admit` is asked for the blocks' bytes
+// first.
+bool read_entry_image(const ConversationDiskEntry& e, int64_t position, SavedConversation& out, uint64_t& bytes,
                       const std::function<bool(uint64_t, std::string&)>& admit, std::string& error) {
     out = SavedConversation{};
     bytes = 0;
-    uint64_t total = 0;
-    for (const auto& stage : e.stages)
-        for (const auto& b : stage.blocks) total += b.size;
-    if (admit && !admit(total, error)) return false;
     if (e.stages.empty()) {
         error = "the entry holds no image";
         return false;
+    }
+    uint64_t total = read_bytes_of(e, position);
+    if (admit && !admit(total, error)) return false;
+    auto key_at = [&](int64_t at) -> const ConversationCheckpoint* {
+        if ((int64_t) e.live.ids.size() == at) return &e.live;
+        for (const auto& c : e.checkpoints)
+            if ((int64_t) c.ids.size() == at) return &c;
+        return nullptr;
+    };
+    const ConversationCheckpoint* deepest = key_at(position);
+    if (deepest == nullptr) {
+        error = "the entry has no key at the state's position " + std::to_string(position);
+        return false;
+    }
+    // the checkpoints every stage can give back: the states below the one read, deepest first
+    std::vector<const ConversationCheckpoint*> below;
+    for (const int64_t at : state_positions(e, position - 1)) {
+        const ConversationCheckpoint* key = key_at(at);
+        if (key) below.push_back(key);
     }
     for (size_t s = 0; s < e.stages.size(); ++s) {
         const ConversationDiskStage& stage = e.stages[s];
@@ -735,42 +803,58 @@ bool read_entry_image(const ConversationDiskEntry& e, SavedConversation& out, ui
         img.cvec = e.cvec;
         img.layer_lo = stage.layer_lo;
         img.layer_hi = stage.layer_hi;
-        img.live = key_only(e.live);
-        for (const auto& c : e.checkpoints) img.checkpoints.push_back(key_only(c));
-        const int64_t tokens = (int64_t) img.live.ids.size();
+        img.live = key_only(*deepest);
+        for (const auto* c : below) img.checkpoints.push_back(key_only(*c));
+        // the blocks in table (append) order: the chained digest is over that order, and the kv blocks of a stage
+        // build on the first one's layer geometry
+        uint64_t prefix = 0;
         std::vector<uint8_t> block;
         for (const auto& b : stage.blocks) {
-            if (!read_block(stage.file, b, block, error)) return false;
-            Bytes in{block};
-            if (b.kind == ConversationDiskBlock::kv) {
-                if (!read_kv_payload(in, b, tokens, stage.layers, img, error)) return false;
-            } else {
-                ConversationCheckpoint* c = state_at(img, b.tokens_start);
-                if (c == nullptr) {
-                    error = "a state block at " + std::to_string(b.tokens_start) + " tokens has no key";
+            const uint64_t digest = prefix_digest(e.live.ids, e.live.imgs, (size_t) b.tokens_start, prefix);
+            const bool needed = b.kind == ConversationDiskBlock::kv ? b.tokens_start < position
+                                                                    : b.tokens_start <= position;
+            if (needed) {
+                const char* kind = b.kind == ConversationDiskBlock::kv ? "kv" : "state";
+                if (digest != b.prefix_digest) {
+                    error = "the " + std::string(kind) + " block at " + std::to_string(b.tokens_start) + "-" +
+                            std::to_string(b.tokens_end) + " tokens of " + stage.file +
+                            " is not the block this conversation's index names";
                     return false;
                 }
-                c->used = b.used;
-                c->pinned = b.pinned;
-                if (!read_state_payload(in, *c)) {
-                    error = "a state block at " + std::to_string(b.tokens_start) + " tokens is malformed";
-                    return false;
+                if (!read_block(stage.file, b, block, error)) return false;
+                Bytes in{block};
+                if (b.kind == ConversationDiskBlock::kv) {
+                    if (!read_kv_payload(in, b, position, stage.layers, img, error)) return false;
+                } else {
+                    ConversationCheckpoint* c = state_at(img, b.tokens_start);
+                    if (c == nullptr) {
+                        error = "a state block at " + std::to_string(b.tokens_start) + " tokens has no key";
+                        return false;
+                    }
+                    c->used = b.used;
+                    c->pinned = b.pinned;
+                    if (!read_state_payload(in, *c)) {
+                        error = "a state block at " + std::to_string(b.tokens_start) + " tokens is malformed";
+                        return false;
+                    }
                 }
+                bytes += b.size;
             }
-            bytes += b.size;
+            prefix = digest;   // recomputed, not read: a record that is not needed cannot break a longer chain
         }
-        // the moving spare indexer row of the deepest state comes from its state block (the kv blocks hold the
-        // completed rows only), byte-identical to a capture at that position
+        // the moving spare indexer row of the state comes from its state block (the kv blocks hold the completed rows
+        // only), byte-identical to a capture at that position
         if (!img.kv.empty()) {
             const int64_t page = img.kv.front().page_size;
             for (size_t l = 0; l < img.kv.size(); ++l) {
                 if (!img.kv[l].pooled_rows) continue;   // a layer without an indexer (the draft)
                 const size_t row = (size_t) img.kv[l].idx_dim * sizeof(float);
                 if (img.live.dead.size() < (l + 1) * row) {
-                    error = "the deepest state has no spare indexer row for layer " + std::to_string(l);
+                    error = "the state at " + std::to_string(position) + " has no spare indexer row for layer " +
+                            std::to_string(l);
                     return false;
                 }
-                if (!img.kv[l].pooled.visit((size_t) (tokens / page) * row, row, [&](uint8_t* d, size_t n, size_t) {
+                if (!img.kv[l].pooled.visit((size_t) (position / page) * row, row, [&](uint8_t* d, size_t n, size_t) {
                         std::memcpy(d, img.live.dead.data() + l * row, n);
                         return true;
                     })) {
@@ -1084,6 +1168,11 @@ void ConversationDiskTier::write(Job& job) {
     images.push_back(std::move(job.image));
     for (auto& stage : images.front().stage_images) images.push_back(std::move(stage));
     images.front().stage_images.clear();
+    // STRATA_PARK_ASYNC: the park that produced these images may still be copying its K/V into them; the request
+    // thread cannot wait (that would undo the asynchronous park), so the writer does, once per image, before it
+    // reads a buffer below
+    if (options_.join)
+        for (const auto& image : images) options_.join(image);
 
     // 1. the entry to append to: the longest chain that is a prefix of this image (the one a read would pick)
     Entry updated;
@@ -1172,11 +1261,11 @@ void ConversationDiskTier::write(Job& job) {
         while (bytes_ + need > options_.budget_bytes) {
             size_t victim = entries_.size();
             for (size_t i = 0; i < entries_.size(); ++i)
-                if (entries_[i].id != target) {
+                if (entries_[i].id != target && entries_[i].readers == 0) {   // a read holds its files
                     victim = i;
                     break;
                 }
-            if (victim == entries_.size()) break;   // only the entry being extended is left
+            if (victim == entries_.size()) break;   // nothing removable is left (the target, or a read holds it)
             remove_locked(victim, true);
             ++made_room;
         }
@@ -1290,7 +1379,13 @@ void ConversationDiskTier::write(Job& job) {
         for (size_t i = 0; i < entries_.size(); ++i)
             if (entries_[i].id == new_id) {
                 bytes_ -= entries_[i].bytes;
+                const size_t held = entries_[i].readers;          // a read of the older files keeps its protection
+                const int64_t was_damaged = entries_[i].verified;
+                const int64_t now_damaged = updated.verified;
                 entries_[i] = std::move(updated);
+                entries_[i].readers = held;
+                entries_[i].verified = (was_damaged && now_damaged) ? std::min(was_damaged, now_damaged)
+                                                                    : (was_damaged ? was_damaged : now_damaged);
                 bytes_ += new_bytes;
                 installed = true;
                 break;
@@ -1301,6 +1396,7 @@ void ConversationDiskTier::write(Job& job) {
         }
         for (size_t i = entries_.size(); i-- > 0;) {
             if (entries_[i].id == new_id || entries_[i].tokens >= new_tokens) continue;
+            if (entries_[i].readers > 0) continue;   // a read is using it: the next publish removes it
             if (chain_prefix(entries_[i], images)) {
                 remove_locked(i, true);
                 ++superseded;
@@ -1330,8 +1426,8 @@ bool ConversationDiskTier::take(uint64_t id, int64_t tokens, SavedConversation& 
     // still queued: back from RAM, no disk at all
     for (size_t i = 0; i < queue_.size(); ++i)
         if (queue_[i].entry.id == id) {
-            out = std::move(queue_[i].image);
             const uint64_t b = queue_[i].entry.bytes;
+            out = std::move(queue_[i].image);
             queue_.erase(queue_.begin() + (std::ptrdiff_t) i);
             ++stats_.ram_hits;
             stats_.tokens_back += (uint64_t) std::max<int64_t>(tokens, 0);
@@ -1356,30 +1452,70 @@ bool ConversationDiskTier::take(uint64_t id, int64_t tokens, SavedConversation& 
         error = "the entry is gone (its write failed, or the budget removed it)";
         return false;
     }
+    // the entry stays on the disk: its table is copied out (a few hundred bytes), the reader's stamp taken, and its
+    // files kept for this read - the writer leaves an entry a read holds until its next publish
     const Entry want = entries_[index];
-    remove_locked(index, false);   // the entry goes now; its files are deleted after the read, whatever it gives
+    ++entries_[index].readers;
+    entries_[index].last_used_s = std::chrono::duration_cast<std::chrono::seconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
     lock.unlock();
     uint64_t bytes = 0;
-    size_t nfiles = want.stages.size();
-    // the blocks the index names, read back into the image they describe
-    bool ok = read_entry_image(want, out, bytes, admit, error);
-    for (const auto& f : files_of(want)) remove_file(f);
+    const size_t nfiles = want.stages.size();
+    // the deepest state the match can rebuild, then the ones before it when a block is damaged
+    const int64_t claimed = std::min<int64_t>(tokens > 0 ? tokens : want.tokens, want.tokens);
+    const std::vector<int64_t> positions = state_positions(want, claimed);
+    int64_t read_at = 0;
+    if (positions.empty()) {
+        error = "the entry has no restorable state at or below " + std::to_string(claimed) + " tokens";
+    } else {
+        // the RAM preflight once, for the largest attempt (a fallback reads less)
+        uint64_t need = 0;
+        for (const int64_t at : positions) need = std::max(need, read_bytes_of(want, at));
+        if (admit && !admit(need, error)) {
+            error = error.empty() ? "not enough RAM" : error;   // nothing was read; the entry stays
+        } else {
+            for (const int64_t at : positions) {
+                std::string why;
+                if (read_entry_image(want, at, out, bytes, {}, why)) {
+                    read_at = at;
+                    error.clear();
+                    break;
+                }
+                out = SavedConversation{};
+                error = why;   // the last failure is the one reported
+                log(fmt("read of %lld tokens: the state at %lld could not be read (%s)", (long long) claimed,
+                        (long long) at, why.c_str()));
+            }
+        }
+    }
     const double ms = ms_since(t0);
     lock.lock();
-    if (!ok) {
+    for (auto& e : entries_)
+        if (e.id == id) {
+            if (e.readers) --e.readers;
+            if (read_at > 0 && read_at < (int64_t) e.live.ids.size())   // a damaged chain: best() claims only this
+                e.verified = e.verified ? std::min(e.verified, read_at) : read_at;
+            break;
+        }
+    cv_.notify_all();   // clear() waits for the last reader
+    if (read_at <= 0) {
         ++stats_.read_failed;
+        if (error.empty()) error = "the entry could not be read";
         lock.unlock();
         out = SavedConversation{};
-        log(fmt("read of %lld tokens failed after %.0f ms (%s)", (long long) tokens, ms, error.c_str()));
+        log(fmt("read of %lld tokens failed after %.0f ms (%s)", (long long) claimed, ms, error.c_str()));
         return false;
     }
     ++stats_.disk_hits;
+    if (read_at < claimed) ++stats_.fallbacks;
     stats_.bytes_read += bytes;
     stats_.read_ms += ms - waited;
-    stats_.tokens_back += (uint64_t) std::max<int64_t>(tokens, 0);
+    stats_.tokens_back += (uint64_t) std::max<int64_t>(read_at, 0);
     lock.unlock();
-    log(fmt("disk hit: %lld tokens, %.0f MiB in %zu file%s, %.0f ms (%.0f MB/s)%s", (long long) tokens, mib(bytes),
+    log(fmt("disk hit: %lld tokens, %.0f MiB in %zu file%s, %.0f ms (%.0f MB/s)%s%s", (long long) read_at, mib(bytes),
             nfiles, nfiles == 1 ? "" : "s", ms - waited, mbps(bytes, ms - waited),
+            read_at < claimed ? fmt(", from the state at %lld (the deeper one is damaged)", (long long) read_at).c_str()
+                              : "",
             waited > 0 ? fmt(", after %.0f ms waiting for its write", waited).c_str() : ""));
     log(summary());
     return true;
@@ -1423,7 +1559,13 @@ size_t ConversationDiskTier::clear() {
     std::unique_lock<std::mutex> lock(m_);
     const size_t queued = queue_.size();
     queue_.clear();
-    cv_.wait(lock, [&] { return !writing_; });
+    // a read holds its entry's files: it finishes first (its fallback would otherwise read deleted blocks)
+    auto readers = [&] {
+        size_t n = 0;
+        for (const auto& e : entries_) n += e.readers;
+        return n;
+    };
+    cv_.wait(lock, [&] { return !writing_ && readers() == 0; });
     const size_t n = queued + entries_.size();
     while (!entries_.empty()) remove_locked(0, true);
     lock.unlock();
@@ -1436,10 +1578,11 @@ std::string ConversationDiskTier::summary() const {
     const auto& s = stats_;
     return fmt("totals: %zu queued, %zu written (%.0f MiB, %.0f MB/s), %zu RAM hits, %zu disk hits (%.0f MiB, "
                "%.0f MB/s), %llu prompt tokens given back, %zu waits for RAM (%.0f ms), "
-               "%zu removed for the budget, %zu/%zu writes/reads failed; on disk %zu (%.0f MiB), queue %zu",
+               "%zu removed for the budget, %zu/%zu writes/reads failed, %zu reads fell back on damage; "
+               "on disk %zu (%.0f MiB), queue %zu",
                s.queued, s.written, mib(s.bytes_written), mbps(s.bytes_written, s.write_ms), s.ram_hits, s.disk_hits,
                mib(s.bytes_read), mbps(s.bytes_read, s.read_ms), (unsigned long long) s.tokens_back, s.waits,
-               s.wait_ms, s.evicted, s.write_failed, s.read_failed, entries_.size(), mib(bytes_),
+               s.wait_ms, s.evicted, s.write_failed, s.read_failed, s.fallbacks, entries_.size(), mib(bytes_),
                queue_.size() + (writing_ ? 1 : 0));
 }
 

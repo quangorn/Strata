@@ -52,9 +52,9 @@ tests 2-7 run on what steps 3 and 4 give.
 
 ## Where each step stands
 
-2026-11-02. **Steps 1, 2 and 3 are done and green.** Step 1 touched only the gate's test; steps 2 and 3
-the tier's own files. A park now writes the block store, a read still removes the entry (step 4 changes
-that), and a folder of the previous build is refused and removed at start (decision 3). The default path
+2026-11-02. **Steps 1, 2, 3 and 4 are done and green.** Step 1 touched only the gate's test; steps 2-4
+the tier's own files. A park now writes the block store, a read keeps the entry and reads only the blocks its
+state needs, and a folder of the previous build is refused and removed at start (decision 3). The default path
 (no `--conversation-disk-dir`) is untouched, and every test run uses its own temporary folder - never the
 serving model's storage (decision 4).
 
@@ -225,13 +225,52 @@ new ones write a well-formed v1 index (`"STRCIDX1"`, the identity, a payload fil
 entry, and require the v1 pair removed at start with the v2 entry taken in, and `1 refused` in the start line.
 This is the "v1 refusal" test of the plan (test 11) arriving early.
 
-**Next: step 4, the read path** - `take()` keeps the entry, reads only the blocks it needs, verifies the chain and
-falls back to the previous state block on damage. Step 4 also takes over the open point the step 3 notes left: the
-writer reads the image's host K/V buffers, and with `STRATA_PARK_ASYNC` a background copy may still be filling them
-(`conversation_park_join_for` is the documented reader call, and the tier is CPU-only and cannot make it). The fix
-is the tier's own and lands there: a `join` hook in `ConversationDiskOptions` that `write()` calls on its thread
-before it reads an image, which `generate.cpp` sets to `conversation_park_join_for` (in the request thread it would
-undo the asynchronous park). One test drives the hook and counts its calls.
+**Step 4, the read path: done.** A read no longer deletes: the entry stays on the disk and only the blocks it needs
+are read, a damaged chain falls back to an earlier state, and the writer waits for the park's background copy on its
+own thread. What landed:
+
+- `take()` (`src/core/conversation_disk.cpp`) copies the entry's table under the lock (a few hundred bytes), bumps
+  the reader's `last_used_s`, and leaves the entry and its files in place. A queued image still leaves RAM for the
+  caller. The reader's copy is marked with a `readers` count that the writer respects: the budget's eviction and the
+  supersede rule skip an entry a read holds (the next publish removes it), so a concurrent append can never delete
+  the files under a read.
+- the state a read lands on is the deepest one the match can use: `state_positions()` keeps the keys (live and
+  checkpoints) at or below the prefix the request matched and that *every* stage holds a `state` block for. Only the
+  `kv` blocks below it and the `state` blocks at or below it are read; the last `kv` block may straddle the state's
+  position, and only the cells up to `round_up(position, page)` are copied (the golden test of step 1 is what makes
+  that prefix valid). The image's `live` is that state, its checkpoints are the states below it, and the moving spare
+  indexer row still comes from the state's own block.
+- every block read is checked twice: its 128 bits, and its chained `prefix_digest` recomputed from the index's key
+  (the deepest state's ids and images). The digest chain is recomputed for the whole table but compared only for the
+  blocks the read needs, so damage above the state cannot fail a shorter read.
+- damage falls back: the states are tried deepest first, and the first whose chain verifies is the one returned. Each
+  failed attempt logs the state and the block that failed; the hit line says where it landed
+  (`from the state at N (the deeper one is damaged)`). `ConversationDiskStats::fallbacks` counts them.
+- `Match::restore_tokens` is now honest: after a read fell back, the entry's in-memory `verified` position caps it,
+  so `best()` claims only what a read can give (the index itself is not rewritten: the damage is the file's state,
+  not the index's). `take()` also reports the tokens it actually rebuilt: the serve loop sets `parked.tokens` from the
+  image it got (`generate.cpp`), so a fallback can never claim a longer prefix than the state holds.
+- `ConversationDiskOptions::join` is called on the writer thread for every image of a job before its K/V is read;
+  `generate.cpp` sets it to `conversation_park_join_for`. With `STRATA_PARK_ASYNC` the request thread must not wait
+  for the park's background copy (that would undo the asynchronous park), and the writer is the first reader of the
+  host buffers the copy fills.
+
+Measured on this PC (same build folder, Release):
+
+- `conversation_disk_test`: **156 checks, exit 0** (122 before; 34 new: keep-on-read twice with the same image, the
+  counters, the deepest read taking every block, an earlier state reading fewer, a damaged middle `kv` block falling
+  back from 4200 to 600 tokens with its two checkpoints and its state's bytes, `restore_tokens` lowered by the read
+  and by a fresh tier's own read, the entry and files kept, and the join hook called once on the writer thread). The
+  earlier tests now assert keep-on-read: a refused RAM preflight leaves the entry and its files too.
+- `ctest -C Release -R "conversation_|session_save"`: 11 of 11 passed (`conversation_disk_test` 0.33 s; all three
+  snapshot entries included).
+- the engine: `--target strata` built, exit 0; the only warnings from the touched files are the tree's own `getenv`
+  C4996 lines in `generate.cpp`.
+
+**Next: step 5, budget and start-up** - the unit of eviction is the whole conversation chosen by `last_used_s`
+(oldest first), which `take()` now stamps; the start-up scan gains its newest rules (an entry with no `state` block,
+a `.bin` shorter than the table says or with a header of another entry or stage, and a `.bin` longer than the last
+indexed block kept and its excess ignored).
 
 ## What each step must not touch
 
