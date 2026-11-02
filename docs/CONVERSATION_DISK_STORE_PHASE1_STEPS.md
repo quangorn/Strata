@@ -19,10 +19,18 @@ Decisions already agreed (2026-11-02):
    rows of its page-aligned range only. The spare row of a capture at the state's own position `P`
    (which is usually not page-aligned) is not the same bytes at any page boundary of the range; the
    state block holds it, byte-identical to a capture at `P`, and a restore takes it from there.
-3. **v1 files of a persistent folder stay.** v1 passes no v2 magic check and is left in place until
-   removed by hand. The store does not touch what it did not write, so v2 files are recognisable by
-   magic and name without deleting anything of a v1 entry. Interrupted-write temporary files (`.tmp`)
-   and a `.bin` no v1 or v2 index names are still removed - they are never restorable.
+3. **v1 files of a persistent folder are removed at start** (changed 2026-11-02, was "stay"). The store
+   reads only the v2 container: a v1 index passes no v2 magic check, is refused by the start-up scan,
+   and its `.bin` files go with it - the same rule the phase 1 note states ("A v1 file fails the magic
+   check and is removed, which is right: it is a cache, and the worst case is one longer prompt read").
+   A v1 entry is never appended to, never kept for a later read and never hand-removed. Interrupted-write
+   temporary files (`.tmp`) and a `.bin` no v2 index names are removed for the same reason.
+4. **testing runs on its own folder, never on the serving model's storage.** The engine on this PC serves
+   with `--conversation-disk-persist on` and a full folder (measured 13 entries, 21 118 MiB); decision 3
+   deletes every v1 conversation at the first start of a v1-reading build, so tests, validation runs and
+   manual checks use a separate `--conversation-disk-dir` (and a separate `--conversation-cache-mib`) until
+   the phase is done and the owner decides to switch the live folder. Nothing in the work touches the
+   serving profile's files until then.
 
 ## The steps
 
@@ -31,11 +39,11 @@ Decisions already agreed (2026-11-02):
 | 1 | **the gate: the golden test of page-aligned K/V** | `src/core/conversation_snapshot_test.cpp` | proof (or refutation) that a page-aligned range of buffer bytes read from a block equals the same range of a full write, for every format the engine produces. Nothing else of phase 1 may be written before this passes |
 | 2 | **container v2**: the `.bin` header, the v2 `.idx` writer/reader, `Entry` with its block table | `conversation_disk.{hpp,cpp}`, `conversation_file.{hpp,cpp}` | the container's format is fixed; phases 2 and 3 add to it, never rewrite it |
 | 3 | **the write path**: find the entry to append to (or start one), `kv` blocks by page-aligned pieces, `state` blocks, publish the index, remove the entries the new image supersedes | `conversation_disk.cpp` | append instead of rewrite, the largest single win of the plan |
-| 4 | **the read path**: `take()` keeps the entry, reads only the blocks it needs, verifies hashes and the chain, falls back to the previous state block on damage | `conversation_disk.cpp` | reads no longer delete, and one bad block costs a block |
+| 4 | **the read path**: `take()` keeps the entry, reads only the blocks it needs, verifies hashes and the chain, falls back to the previous state block on damage; and the writer waits for a background park copy (`STRATA_PARK_ASYNC`) before it reads an image | `conversation_disk.{hpp,cpp}` | reads no longer delete, one bad block costs a block, and a write never reads K/V that is still landing |
 | 5 | **budget and start-up**: eviction of whole conversations by `last_used_s`, newest scan rules | `conversation_disk.{hpp,cpp}` | the budget matches real use, not write order |
 | 6 | **`used` and `pinned` in the index** | `conversation_file.{hpp,cpp}`, `conversation_disk.cpp` | the LRU stamp and the pin survive a restart; the slot-save format stays v1 and byte-identical |
 | 7 | **`Match::restore_tokens` in the caller** | `src/program/generate.cpp` | the "read the file or read the tokens" estimate no longer claims a longer prefix than the file can give |
-| 8 | **the tests of the plan, 2-11** | `conversation_disk_test.cpp` | append, keep-on-read, budget by use, torn tail, one bad block, `used`/`pinned` across a restart, append across runs, history rewrite, v1 left in place |
+| 8 | **the tests of the plan, 2-11** | `conversation_disk_test.cpp` | append, keep-on-read, budget by use, torn tail, one bad block, `used`/`pinned` across a restart, append across runs, history rewrite, a v1 folder removed at start |
 | 9 | **the docs**: the tier's section in [DETAILS.md](DETAILS.md), per-block log lines | `docs/DETAILS.md`, logs | the log can answer the "new blocks versus a rewrite" question the validation needs |
 
 Steps 2 and 3 may be written together in one branch (the store cannot be exercised without the
@@ -45,8 +53,10 @@ tests 2-7 run on what steps 3 and 4 give.
 ## Where each step stands
 
 2026-11-02. **Steps 1, 2 and 3 are done and green.** Step 1 touched only the gate's test; steps 2 and 3
-the tier's own files. A park now writes the block store, and a read still removes the entry (step 4
-changes that). The default path (no `--conversation-disk-dir`) is untouched.
+the tier's own files. A park now writes the block store, a read still removes the entry (step 4 changes
+that), and a folder of the previous build is refused and removed at start (decision 3). The default path
+(no `--conversation-disk-dir`) is untouched, and every test run uses its own temporary folder - never the
+serving model's storage (decision 4).
 
 **Step 1, the gate: passes.** Measured on this PC (RTX 4080, sm_89, CUDA 13.4, MSVC 14.44.35207,
 build folder `build-c13-gate`, Release):
@@ -115,9 +125,9 @@ not reused; configure of `build-c13-gate` takes ~80 s and its llamacpp `FetchCon
 **Clean-up notice:** one cmake run of the previous session with a wrong working directory created then
 removed a stray `C:/Projects/build-c13-win`; `build-c13-gate` is the only build folder phase 1 uses.
 
-**Decisions that shape the next steps (agreed with the user):** see the three decisions at the
+**Decisions that shape the next steps (agreed with the user):** see the four decisions at the
 top of this file (GPU golden test; spare pooled row into the state block; v1 files of a persistent
-folder stay, nothing of a v1 entry is deleted).
+folder are removed at start; testing on its own folder, never the serving model's storage).
 
 **Step 2, container v2: done, and the format is fixed.**
 
@@ -128,8 +138,8 @@ What landed (measured on this PC, the build recipe below, Release):
   entry id, stage); `ConversationDiskBlock` (offset, size, `hash_lo`/`hash_hi`, kind 1 = `kv` / 2 =
   `state`, `tokens_start`/`tokens_end`, `prefix_digest`, and `used`/`pinned` for a state block);
   `ConversationDiskStage` (one `.bin` and its blocks); `ConversationDiskEntry` (the block table plus the
-  keys `best()` matches, the geometry and layer range, `tokens`, `last_used_s`, and `files` for the v1
-  read path until step 4); `conversation_disk_index_write`/`_read` for v2 magic `"STRCIDX2"`.
+  keys `best()` matches, the geometry, `tokens`, `last_used_s`); `conversation_disk_index_write`/`_read`
+  for v2 magic `"STRCIDX2"`.
   `Match` gains `restore_tokens` (assigned `tokens` by `best()` today; step 4 lowers it for a v2 entry).
 - `src/core/conversation_disk.cpp`: the index's v2 writer (temp file + rename, blocks first) and reader
   (identity, then shape: a block kind of 1 or 2, a non-empty block, offsets that start after the header
@@ -137,7 +147,7 @@ What landed (measured on this PC, the build recipe below, Release):
   a `pinned` byte of 0 or 1, `tokens` equal to the deepest `state` block's position), and the v2 branch
   of the start-up scan (`read_index` recognises v2 by magic and resolves the stage names against the
   folder; `remove_locked` and `scan_folder` delete and keep a v2 entry's `.bin` files through
-  `files_of()`). The v1 index writer and reader are unchanged.
+  `files_of()`).
 - `src/core/conversation_disk_test.cpp`: a "container v2" block that round-trips the `.bin` header and a
   two-stage index (every field, block record, `used`/`pinned`, key), and refuses a short header, another
   magic or version, another identity, a truncated index, an unknown block kind, a state block with a
@@ -183,8 +193,8 @@ image again, and publishes a v2 index. What landed:
   checkpoints rebuilt, the spare row put back from the state block. It still removes the entry after
   the read: keeping it is step 4's change, and so are reading only the blocks a request needs and the
   fallback to an earlier state when a block is damaged.
-- the v1 index writer is gone (every write is v2 now); the v1 read path stays for a folder an older
-  build wrote.
+- the v1 index writer and the v1 read path are gone: every write is v2, and a folder of the previous build
+  is refused and removed at start (decision 3).
 
 Two corrections to step 2's format, which no code had written yet: the stage record carries its own
 `layer_lo`/`layer_hi`/`layers` (a layer split gives each stage its own carve, which one entry-level pair
@@ -209,13 +219,19 @@ Measured on this PC (same build folder, Release):
   failed the same way, and that test does not include `conversation_disk.hpp`.
 - the engine: `--target strata` built, exit 0; no warning from the touched files.
 
-Open point, static analysis and unconfirmed: the writer reads the image's host K/V buffers, and with
-`STRATA_PARK_ASYNC` a background copy may still be filling them (`conversation_park_join_for` is the
-documented reader call, and a CPU-only tier cannot make it). The v1 writer read the same buffers without
-that join, so this is not new here; it needs its own change at the caller.
+Follow-up the same day (decision 3 changed): the v1 read path is removed, so the v1 index parser, `Entry::files`,
+`take()`'s v1 branch and its `holds()` check are gone. `conversation_disk_test`: **122 checks, exit 0** - the six
+new ones write a well-formed v1 index (`"STRCIDX1"`, the identity, a payload file name) and its `.bin` beside a v2
+entry, and require the v1 pair removed at start with the v2 entry taken in, and `1 refused` in the start line.
+This is the "v1 refusal" test of the plan (test 11) arriving early.
 
-**Next: step 4, the read path** - `take()` keeps the entry, reads only the blocks it needs, verifies the
-chain and falls back to the previous state block on damage.
+**Next: step 4, the read path** - `take()` keeps the entry, reads only the blocks it needs, verifies the chain and
+falls back to the previous state block on damage. Step 4 also takes over the open point the step 3 notes left: the
+writer reads the image's host K/V buffers, and with `STRATA_PARK_ASYNC` a background copy may still be filling them
+(`conversation_park_join_for` is the documented reader call, and the tier is CPU-only and cannot make it). The fix
+is the tier's own and lands there: a `join` hook in `ConversationDiskOptions` that `write()` calls on its thread
+before it reads an image, which `generate.cpp` sets to `conversation_park_join_for` (in the request thread it would
+undo the asynchronous park). One test drives the hook and counts its calls.
 
 ## What each step must not touch
 

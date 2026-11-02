@@ -39,20 +39,6 @@ ConversationCheckpoint key_of(const ConversationCheckpoint& c) {
     return k;
 }
 
-// The payload is the conversation its index names: the same keys and control-vector state, in every stage.
-bool holds(const SavedConversation& s, const ConversationCheckpoint& live,
-           const std::vector<ConversationCheckpoint>& checkpoints, bool cvec) {
-    auto same = [](const ConversationCheckpoint& x, const ConversationCheckpoint& y) {
-        return x.ids == y.ids && x.imgs == y.imgs;
-    };
-    if (s.cvec != cvec || !same(s.live, live) || s.checkpoints.size() != checkpoints.size()) return false;
-    for (size_t i = 0; i < checkpoints.size(); ++i)
-        if (!same(s.checkpoints[i], checkpoints[i])) return false;
-    for (const auto& stage : s.stage_images)
-        if (!holds(stage, live, checkpoints, cvec)) return false;
-    return true;
-}
-
 // a file of this tier (also a temporary one session_file_write left behind: ".<name>.<hex>.tmp")
 bool tier_file(const std::string& name) {
     const std::string prefix = ConversationDiskTier::file_prefix();
@@ -64,16 +50,15 @@ void remove_file(const std::string& path) {
     fs::remove(fs::path(path), ec);
 }
 
-// The files an entry on the disk owns: v1's session files, or a v2 container's `.bin` per stage.
+// The files an entry on the disk owns: its `.bin` per stage (and, for the caller, its index).
 std::vector<std::string> files_of(const ConversationDiskEntry& e) {
-    std::vector<std::string> out = e.files;
+    std::vector<std::string> out;
     for (const auto& stage : e.stages) out.push_back(stage.file);
     return out;
 }
 
 // The index file of a persistent entry: native-endian fields (the session files refuse a big-endian build too),
-// counts before arrays.
-constexpr uint64_t kIndexMagic = 0x3158444943525453ull;     // "STRCIDX1"
+// counts before arrays.  Magic "STRCIDX2"; a v1 index ("STRCIDX1") no longer reads and is removed at start.
 constexpr uint64_t kIndexMagicV2 = 0x3258444943525453ull;   // "STRCIDX2"
 
 // The v2 container's `.bin`: magic "STRACNV2", version 2, a 64-byte header (conversation_disk.hpp).
@@ -348,8 +333,8 @@ public:
         uint8_t bytes[kConversationDiskBinHeader];
         f_.read(reinterpret_cast<char*>(bytes), (std::streamsize) kConversationDiskBinHeader);
         ConversationDiskBinHeader found;
-        // the id is not compared: the start-up scan renumbers the entries it takes in (as it does for the v1 index), so
-        // the header's id is the one the write used, not the tier's.  The file's name and the stage bind it.
+        // the id is not compared: the start-up scan renumbers the entries it takes in, so the header's id is the one the
+        // write used, not the tier's.  The file's name and the stage bind it.
         if (!f_ || !conversation_disk_bin_header_read(bytes, kConversationDiskBinHeader, found) ||
             found.model != header.model || found.config != header.config || found.stage != header.stage) {
             error = "the header of " + path + " names another file";
@@ -877,7 +862,7 @@ bool conversation_disk_index_read(const std::string& path, const SessionFileIden
                                   ConversationDiskEntry& entry) {
     std::ifstream f(fs::path(path), std::ios::binary);
     const std::string b((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
-    if (b.size() < 8 || std::memcmp(b.data(), &kIndexMagicV2, 8) != 0) return false;   // not a v2 index (v1: the tier)
+    if (b.size() < 8 || std::memcmp(b.data(), &kIndexMagicV2, 8) != 0) return false;   // not a v2 index
     entry = ConversationDiskEntry{};
     if (!read_index_v2(b, identity, entry)) {
         entry = ConversationDiskEntry{};
@@ -938,36 +923,14 @@ bool ConversationDiskTier::write_index_v2(Entry& e, std::string& error) const {
 bool ConversationDiskTier::read_index(const std::string& path, Entry& e) const {
     std::ifstream f(fs::path(path), std::ios::binary);
     const std::string b((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
-    const SessionFileIdentity id = file_identity();
     uint64_t magic = 0;
     if (b.size() >= sizeof magic) std::memcpy(&magic, b.data(), sizeof magic);
-    if (magic == kIndexMagicV2) {   // the container the write path publishes (phase 1, steps 3-4)
-        if (!read_index_v2(b, id, e)) return false;
-        std::error_code ec;
-        for (auto& stage : e.stages) stage.file = (fs::path(options_.dir) / fs::path(stage.file).filename()).string();
-        for (const auto& stage : e.stages)
-            if (!fs::is_regular_file(fs::path(stage.file), ec)) return false;
-        e.index = path;
-        return true;
-    }
-    IndexReader in{b};
-    if (in.get<uint64_t>() != kIndexMagic || in.get<uint64_t>() != id.model || in.get<uint64_t>() != id.config)
-        return false;
-    e.written_s = in.get<int64_t>();
-    e.cvec = in.get<uint8_t>() != 0;
-    e.bytes = in.get<uint64_t>();
-    const uint32_t nfiles = in.get<uint32_t>();
-    for (uint32_t i = 0; in.ok && i < nfiles; ++i) e.files.push_back((fs::path(options_.dir) / in.str()).string());
-    if (!in.key(e.live)) return false;
-    const uint32_t nck = in.get<uint32_t>();
-    for (uint32_t i = 0; in.ok && i < nck; ++i) {
-        ConversationCheckpoint c;
-        if (in.key(c)) e.checkpoints.push_back(std::move(c));
-    }
-    if (!in.ok || in.left() != 0 || e.files.empty()) return false;
+    if (magic != kIndexMagicV2) return false;   // a v1 index ("STRCIDX1") or not an index: the scan removes it
+    if (!read_index_v2(b, file_identity(), e)) return false;
     std::error_code ec;
-    for (const auto& file : e.files)
-        if (!fs::is_regular_file(fs::path(file), ec)) return false;
+    for (auto& stage : e.stages) stage.file = (fs::path(options_.dir) / fs::path(stage.file).filename()).string();
+    for (const auto& stage : e.stages)
+        if (!fs::is_regular_file(fs::path(stage.file), ec)) return false;
     e.index = path;
     return true;
 }
@@ -1004,8 +967,9 @@ std::string ConversationDiskTier::scan_folder(size_t& stale, std::error_code& ec
         remove_locked(0, true);
         ++over;
     }
-    return fmt("persistent (budget only): %zu conversations from earlier runs (%.0f MiB), %zu refused (another model, "
-               "engine version or settings), %zu over the budget removed", entries_.size(), mib(bytes_), refused, over);
+    return fmt("persistent (budget only): %zu conversations from earlier runs (%.0f MiB), %zu refused (a v1 index, "
+               "another model, engine version or settings), %zu over the budget removed", entries_.size(), mib(bytes_),
+               refused, over);
 }
 
 void ConversationDiskTier::log(const std::string& line) const {
@@ -1396,32 +1360,9 @@ bool ConversationDiskTier::take(uint64_t id, int64_t tokens, SavedConversation& 
     remove_locked(index, false);   // the entry goes now; its files are deleted after the read, whatever it gives
     lock.unlock();
     uint64_t bytes = 0;
-    bool ok = true;
-    size_t nfiles = 0;
-    if (!want.stages.empty()) {
-        // a v2 entry: the blocks the index names, read back into the image they describe
-        nfiles = want.stages.size();
-        ok = read_entry_image(want, out, bytes, admit, error);
-    } else {
-        const std::vector<std::string>& files = want.files;
-        nfiles = files.size();
-        const SessionFileIdentity fid = file_identity();
-        SessionReadLimits limits;
-        limits.admit = admit;
-        for (size_t k = 0; ok && k < files.size(); ++k) {
-            SavedConversation part;
-            size_t n = 0;
-            ok = session_file_read(files[k], fid, part, n, error, limits);
-            bytes += n;
-            if (!ok) break;
-            if (k == 0) out = std::move(part);
-            else out.stage_images.push_back(std::move(part));
-        }
-        if (ok && !holds(out, want.live, want.checkpoints, want.cvec)) {
-            ok = false;
-            error = "the files hold another conversation than their index";
-        }
-    }
+    size_t nfiles = want.stages.size();
+    // the blocks the index names, read back into the image they describe
+    bool ok = read_entry_image(want, out, bytes, admit, error);
     for (const auto& f : files_of(want)) remove_file(f);
     const double ms = ms_since(t0);
     lock.lock();

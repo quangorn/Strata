@@ -1,9 +1,9 @@
 // The disk tier of --serve's parked conversations (--conversation-disk-dir): the RAM cache's evictions
-// (ConversationCache::set_on_evict) are written to session files (conversation_file.hpp, one per layer-split stage)
-// by a background thread and read back when a request continues them, within a time limit and a byte budget.
-// By default only this process reads its files back, and the folder's files of this tier are removed at start and at
-// the end.  `persist`: the files are bound to the session files' identity (model and settings) instead, a small index
-// file beside each conversation lists its tokens, and the next start picks them up (no time limit, the budget only).
+// (ConversationCache::set_on_evict) are written by a background thread to a block store - one `.bin` per layer-split
+// stage, appended to, and one `.idx` naming its blocks - and read back when a request continues them, within a byte
+// budget and (unless `persist`) this run only.  `persist`: the files are bound to the session files' identity (model
+// and settings), and the next start picks them up (the budget only).  A folder written by an older build (the v1
+// session files one per stage) is removed at start: its entries are not read.
 #pragma once
 
 #include "strata/core/conversation_cache.hpp"
@@ -46,7 +46,7 @@ struct ConversationDiskStats {
 
 // ---- container v2: a `.bin` per stage - a header, then immutable blocks - and one `.idx` naming every block.
 // The index, not the file, says where the bytes are and what they hold: a `.bin` has no length and no trailer.
-// Native-endian fields, counts before arrays, as the v1 index.  The format is this phase's one new thing
+// Native-endian fields, counts before arrays.  The format is this phase's one new thing
 // (docs/CONVERSATION_DISK_STORE_PHASE1.md, "Container v2"); the write path and the read path fill and consume it.
 
 /// The `.bin`'s header (64 bytes).
@@ -94,7 +94,6 @@ struct ConversationDiskStage {
 struct ConversationDiskEntry {
     uint64_t id = 0;                                ///< in the files' names
     std::vector<ConversationDiskStage> stages;      ///< the first stage's image, then one per later stage
-    std::vector<std::string> files;                 ///< v1 only: one session file per stage (the v1 read path)
     ConversationCheckpoint live;                    ///< keys only: the deepest state
     std::vector<ConversationCheckpoint> checkpoints;   ///< keys only, deepest first
     std::array<int64_t, 18> geometry{};             ///< v2: the image's geometry (the restore checks the runtime's)
@@ -142,9 +141,8 @@ public:
         bool live = false;
         uint64_t bytes = 0;     ///< the entry's files (queued: the image's estimate)
         bool queued = false;    ///< still in RAM: take() hands it back without reading a file
-        /// The tokens a read of this match lands on: a v1 file holds exactly the matched state, while a v2 entry
-        /// reports the position of the `state` block its table can rebuild (at most one checkpoint interval behind
-        /// `tokens`).  The "read the file or read the tokens" estimate uses this one.
+        /// The tokens a read of this match lands on: the position of the `state` block the read can rebuild (at most
+        /// one checkpoint interval behind `tokens`).  The "read the file or read the tokens" estimate uses this one.
         int64_t restore_tokens = 0;
     };
     /// The longest prefix of `prompt` an entry holds (its live state or its checkpoint), queued or on the disk, as
@@ -165,7 +163,7 @@ public:
         for (const auto& e : entries_) scan(e, false);
         for (const auto& j : queue_) scan(j.entry, true);
         if (writing_) scan(writing_entry_, false);   // its file appears when the write ends: take() waits for it
-        best.restore_tokens = best.tokens;   // a v1 file holds the matched state whole; the v2 read path lowers this
+        best.restore_tokens = best.tokens;   // a whole read lands on the matched state; step 4 lowers this on damage
         return best;
     }
 
@@ -192,7 +190,7 @@ public:
     static const char* file_prefix() { return "strata-conv-"; }
 
 private:
-    using Entry = ConversationDiskEntry;   ///< the v1 keys and files, or the v2 block table (container v2 above)
+    using Entry = ConversationDiskEntry;   ///< the keys and the block table (container v2 above)
     struct Job {
         Entry entry;
         SavedConversation image;
@@ -203,7 +201,7 @@ private:
     void log(const std::string& line) const;
     SessionFileIdentity file_identity() const;
     bool write_index_v2(Entry& e, std::string& error) const; // v2: the block store's index
-    bool read_index(const std::string& path, Entry& e) const;   // v1 and v2
+    bool read_index(const std::string& path, Entry& e) const;   // v2 only: a v1 index is refused and removed
     std::string scan_folder(size_t& stale, std::error_code& ec);   // open(): take in or remove; its log part
 
     ConversationDiskOptions options_;

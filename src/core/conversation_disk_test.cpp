@@ -130,7 +130,7 @@ bool same_entry(const ConversationDiskEntry& a, const ConversationDiskEntry& b) 
     if (a.cvec != b.cvec || a.bytes != b.bytes || a.geometry != b.geometry ||
         a.tokens != b.tokens || a.written_s != b.written_s || a.last_used_s != b.last_used_s ||
         !same_key(a.live, b.live) || a.checkpoints.size() != b.checkpoints.size() ||
-        a.stages.size() != b.stages.size() || !b.files.empty())
+        a.stages.size() != b.stages.size())
         return false;
     for (size_t i = 0; i < a.checkpoints.size(); ++i)
         if (!same_key(a.checkpoints[i], b.checkpoints[i])) return false;
@@ -164,6 +164,33 @@ size_t tier_files(const fs::path& dir) {
 }
 
 void touch(const fs::path& p) { std::ofstream(p, std::ios::binary) << "x"; }
+
+// A v1 index file as the previous build wrote it ("STRCIDX1"): the scan must remove it and the files it names.
+void write_v1_index(const fs::path& path, uint64_t model, uint64_t config, const std::vector<std::string>& files) {
+    std::string b;
+    auto put = [&](const void* p, size_t n) { b.append(static_cast<const char*>(p), n); };
+    auto u64 = [&](uint64_t v) { put(&v, 8); };
+    auto i64 = [&](int64_t v) { put(&v, 8); };
+    u64(0x3158444943525453ull);   // "STRCIDX1"
+    u64(model);
+    u64(config);
+    i64(0);                       // written_s
+    b.push_back(0);               // cvec
+    u64(0);                       // bytes
+    const uint32_t n = (uint32_t) files.size();
+    put(&n, 4);
+    for (const auto& f : files) {
+        const uint32_t len = (uint32_t) f.size();
+        put(&len, 4);
+        b += f;
+    }
+    const uint32_t none = 0;      // the live key: no tokens, no images; no checkpoints
+    put(&none, 4);
+    put(&none, 4);
+    put(&none, 4);
+    std::ofstream f(path, std::ios::binary | std::ios::trunc);
+    f.write(b.data(), (std::streamsize) b.size());
+}
 
 std::vector<std::string> lines;   // the tier's diagnostic lines
 std::mutex lines_m;
@@ -534,6 +561,40 @@ int main() {
             check(tier.best(prompt_of(1700), {}, false).tokens == 1600, "supersede: the longer entry is the one left");
         }
         fs::remove_all(sdir);
+    }
+
+    {   // a folder of the previous build: its v1 conversation is removed at start, a v2 entry beside it stays
+        const fs::path vdir = dir / "v1";
+        fs::create_directories(vdir);
+        const SessionFileIdentity vid{5, 5};
+        auto store_v = [&] {
+            auto o = opts(vdir, GiB);
+            o.persist = true;
+            o.identity = vid;
+            return o;
+        };
+        {
+            ConversationDiskTier tier(store_v());
+            check(tier.open(e) && tier.put(image(300, 50, 1000, 0, 48, 1)), "v1 folder: a v2 entry first");
+            tier.wait_idle();
+        }
+        const fs::path old_bin = vdir / "strata-conv-0123-7-0.bin";
+        {
+            std::ofstream f(old_bin, std::ios::binary);
+            f << "the previous build's session file";
+        }
+        write_v1_index(vdir / "strata-conv-0123-7.idx", vid.model, vid.config, {old_bin.filename().string()});
+        {
+            ConversationDiskTier tier(store_v());
+            check(tier.open(e), "v1 folder: open");
+            check(tier.size() == 1 && tier.best(prompt_of(350), {}, false).tokens == 300,
+                  "v1 folder: the v2 entry is taken in");
+            check(!fs::exists(old_bin) && !fs::exists(vdir / "strata-conv-0123-7.idx"),
+                  "v1 folder: the v1 conversation and its file are removed");
+            check(logged("1 refused"), "v1 folder: the start counts it as refused");
+            check(tier_files(vdir) == 2, "v1 folder: only the v2 entry's .bin and index are left");
+        }
+        fs::remove_all(vdir);
     }
 
     {   // persist: the files outlive the tier, and the next tier with the same identity takes them in
