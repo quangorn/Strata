@@ -439,6 +439,21 @@ int main() {
         check(tier.stats().read_failed == 1, "a failed read is counted");
     }
 
+    {   // the disk's own reserve (--session-min-free-mib): a write whose blocks plus the reserve do not fit the free
+        // space is dropped before anything is written, as a session file's write is
+        const fs::path fdir = dir / "free";
+        fs::create_directories(fdir);
+        auto o = opts(fdir, GiB);
+        o.min_free_bytes = ~0ull / 2;   // no volume is that empty: every write is refused
+        ConversationDiskTier tier(std::move(o));
+        check(tier.open(e) && tier.put(image(400, 150)), "free space: the write is queued");
+        tier.wait_idle();
+        check(tier.size() == 0 && tier_files(fdir) == 0 && tier.stats().write_failed == 1,
+              "free space: nothing was written and the entry is gone");
+        check(logged("not enough disk space"), "free space: the line says why");
+        fs::remove_all(fdir);
+    }
+
     {   // the RAM cache's evictions go to the disk tier (set_on_evict)
         ConversationDiskTier tier(opts(dir, GiB));
         check(tier.open(e), "open 6");
@@ -500,6 +515,11 @@ int main() {
             check(tier.put(image(4200, 30, 1000, 0, 48, 1)), "store: put the longer image");
             tier.wait_idle();
             check(tier.size() == 1 && logged(" (appended)"), "store: it appended to the entry of the earlier run");
+            check(logged("new kv block stage 0: tokens 600-2648") &&
+                  logged("new state block stage 0: at 4200 tokens"),
+                  "store: the write logs its new blocks one by one");
+            check(logged("in 5 blocks (2 new kv") && logged("; 3 new state"),
+                  "store: the summary splits new K/V, new states and the index it rewrote");
         }
         ConversationDiskEntry second;
         check(only_index(second) && second.tokens == 4200 && second.live.ids.size() == 4200,
@@ -613,6 +633,8 @@ int main() {
             tier.wait_idle();
             check(tier.size() == 2 && !logged(" (appended)") && logged("0 superseded"),
                   "rewrite: a new entry, nothing appended and nothing superseded");
+            check(logged("new entry: no stored conversation is a prefix"), "rewrite: the log says why it is new");
+            check(logged("new kv block stage 0: tokens 0-600"), "rewrite: its blocks are in the log too");
         }
         uint64_t bins = 0, idxs = 0;
         for (const auto& f : fs::directory_iterator(wdir)) {

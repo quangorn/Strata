@@ -52,9 +52,9 @@ tests 2-7 run on what steps 3 and 4 give.
 
 ## Where each step stands
 
-2026-11-02. **Steps 1 to 8 are done and green.** Step 1 touched only the gate's test; steps 2-6
-the tier's own files; step 7 the serve loop's restore estimate; step 8 the tier's tests. A park now writes the block
-store, a read keeps the entry and reads only the blocks its
+2026-11-02. **All nine steps are done and green.** Step 1 touched only the gate's test; steps 2-6
+the tier's own files; step 7 the serve loop's restore estimate; step 8 the tier's tests; step 9 the tier's log and
+[DETAILS.md](DETAILS.md). A park now writes the block store, a read keeps the entry and reads only the blocks its
 state needs, the budget evicts whole conversations by use and leaves a pinned one, `used` and `pinned` survive a
 restart through the index, a folder of the previous build is refused and removed at start (decision 3), and the
 "read the file or read the tokens" estimate counts what a read lands on rather than what the index claims. The
@@ -376,10 +376,46 @@ Measured on this PC (same build folder, Release):
 - `ctest -C Release -R "conversation_|session_"`: 11 of 11 passed in one run, 21.30 s in all (all three snapshot
   entries included).
 
-**Next: step 9, the docs and the log** - the tier's section of [DETAILS.md](DETAILS.md), and a line per new
-block in the write so the validation can tell a new block from a rewrite. Found on the way: the v1 writer's
-`--session-min-free-mib` reserve did not survive step 3's block writer, so a cache write could fill the volume; step 9
-puts it back for the blocks a write adds.
+**Step 9, the docs and the log: done.** What landed:
+
+- `src/core/conversation_disk.cpp`: the writer logs every block it adds - `new kv block stage 0: tokens 600-2648,
+  4.6 MiB at 1418495`, `new kv block stage 0: tokens 2648-4200, 3.5 MiB at 6202807` and
+  `new state block stage 0: at 4200 tokens, 0.0 MiB at 9828463` (a pinned state says so; the test images' states are
+  a few KiB, hence the 0.0) - so a write's log answers "how much of this was new" block by block; the write's summary
+  now separates them (`wrote 4200 tokens (appended): 9 MiB in 5 blocks (2 new kv, 8.0 MiB; 3 new state, 0.0 MiB),
+  index 0.0 MiB rewritten`), and a write that found no entry to append to says `new entry: no stored conversation is a
+  prefix of this one's 600 tokens`. Nothing else in the write path moved: same blocks, same order, same index.
+- `docs/DETAILS.md`'s tier section describes the store as it is: `.bin` + `.idx`, blocks of at most 2,048 tokens on
+  whole pages and states with `used`/`pinned`, append instead of rewrite, a shorter superseded copy removed with its
+  files, keep-on-read, the 128-bit block hashes and the chain fallback, the budget by use and the pin, the v1 refusal
+  and the torn tail, the estimate counting `restore_tokens`, and the per-block log lines. The paragraph's measured
+  numbers are marked as the file-per-conversation version's: the block store's own comparison has not been run on
+  hardware yet.
+- **a write that would fill the disk is refused again.** The v1 writer used the session files' free-space preflight
+  (`--session-min-free-mib`, `conversation_file.cpp:1049`) and step 3's block writer did not carry it over, so a full
+  volume could take a cache write to 0 bytes free. `session_free_bytes()` (new in `conversation_file.{hpp,cpp}`, the
+  same platform call the session writer makes) is asked by the writer for the blocks it is about to add, before
+  anything is evicted for them; without the reserve the write is dropped with `not enough disk space (N MiB plus a
+  reserve of M MiB needed, K MiB free)` and nothing is written.
+- the new lines and the reserve are asserted in `conversation_disk_test.cpp` (seven new checks on top of step 8's):
+  the append writes two `new kv block` lines and three `new state block` lines, its summary splits `2 new kv` from
+  `3 new state` and the index's size, a rewrite logs `new entry: no stored conversation is a prefix`, and a write
+  whose blocks plus the reserve do not fit the free space (`min_free_bytes = UINT64_MAX / 2`) leaves no entry, no
+  file, one `write_failed` and `not enough disk space` in the log.
+
+Measured on this PC (same build folder, Release):
+
+- the engine: `--target strata` built, exit 0; no warning from the touched files.
+- `conversation_disk_test`: **219 checks, exit 0** (step 8's 212 plus the seven above).
+- `conversation_file_test`: **183 checks, exit 0**, the golden included: the fixed sample's file is still 17 878 535
+  bytes with hash `0x70f812b350360d09` - the new helper does not touch the format.
+- `ctest -C Release -R "conversation_|session_"`: 11 of 11 passed in one run, 21.67 s in all.
+
+**Phase 1 is complete in code and tests. What is left is the plan's own validation on hardware**
+([CONVERSATION_DISK_STORE_PHASE1.md](CONVERSATION_DISK_STORE_PHASE1.md), "Validation on hardware"): a day of agent
+sessions against a same-day run without the change, the `new blocks versus a rewrite` share now readable from the log,
+and start-up with a full folder. None of it is run, and nothing here claims a saving. The Windows build is done - this
+PC is Windows and MSVC 14.44, and `--target strata` is green - but no serving session was measured.
 
 ## What each step must not touch
 

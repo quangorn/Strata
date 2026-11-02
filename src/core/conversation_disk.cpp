@@ -1317,6 +1317,8 @@ void ConversationDiskTier::write(Job& job) {
     } else {
         merge_keys(updated, images.front());
     }
+    if (!target)
+        log(fmt("new entry: no stored conversation is a prefix of this one's %zu tokens", tokens));
 
     // 2. what the write will add: the blocks this image has and the entry does not (sizes only, before anything is
     // written, so the budget can make room first)
@@ -1364,6 +1366,20 @@ void ConversationDiskTier::write(Job& job) {
     }
     need += index_estimate(updated) + 72 * new_blocks;   // the v2 index, rewritten whole on every publish
 
+    // 2b. the disk's own reserve (--session-min-free-mib, as a session file's write): a cache must not be the write
+    // that fills the volume, so a write whose blocks plus the reserve do not fit the free space is dropped here,
+    // before anything is evicted for it
+    if (error.empty() && options_.min_free_bytes) {
+        uint64_t avail = 0;
+        if (!session_free_bytes(options_.dir, avail)) {
+            error = "cannot read the free disk space for " + options_.dir;
+        } else if (avail < need || avail - need < options_.min_free_bytes) {
+            error = "not enough disk space (" + std::to_string(need >> 20) + " MiB plus a reserve of " +
+                    std::to_string(options_.min_free_bytes >> 20) + " MiB needed, " + std::to_string(avail >> 20) +
+                    " MiB free)";
+        }
+    }
+
     // 3. the budget: whole conversations, the least recently used first, never the entry being extended, one a read
     // holds, or one holding a pinned shared prefix
     size_t made_room = 0, pins = 0;
@@ -1386,6 +1402,8 @@ void ConversationDiskTier::write(Job& job) {
     const SessionFileIdentity fid = file_identity();
     std::vector<std::string> created;   // this write's own files, removed when it fails before the index is published
     size_t blocks_written = 0;
+    size_t kv_written = 0, state_written = 0;
+    uint64_t kv_bytes_written = 0, state_bytes_written = 0;
     for (size_t s = 0; s < images.size() && error.empty(); ++s) {
         const SavedConversation& img = images[s];
         ConversationDiskStage& stage = updated.stages[s];
@@ -1419,6 +1437,10 @@ void ConversationDiskTier::write(Job& job) {
             prefix = rec.prefix_digest;
             stage.blocks.push_back(rec);
             ++blocks_written;
+            ++kv_written;
+            kv_bytes_written += rec.size;
+            log(fmt("new kv block stage %zu: tokens %lld-%lld, %.1f MiB at %llu", s, (long long) r.first,
+                    (long long) r.second, mib(rec.size), (unsigned long long) rec.offset));
         }
         for (const auto* c : states[s]) {
             if (!error.empty()) break;
@@ -1439,6 +1461,10 @@ void ConversationDiskTier::write(Job& job) {
             prefix = rec.prefix_digest;
             stage.blocks.push_back(rec);
             ++blocks_written;
+            ++state_written;
+            state_bytes_written += rec.size;
+            log(fmt("new state block stage %zu: at %lld tokens, %.1f MiB at %llu%s", s, (long long) at, mib(rec.size),
+                    (unsigned long long) rec.offset, rec.pinned ? ", pinned" : ""));
         }
         if (error.empty() && !file.close(error)) break;
     }
@@ -1519,14 +1545,14 @@ void ConversationDiskTier::write(Job& job) {
         disk_bytes = bytes_;
     }
     images.clear();
-    log(fmt("wrote %zu tokens%s: %.0f MiB in %zu blocks, %zu file%s, %.0f ms (%.0f MB/s); on disk %zu, %.0f MiB; "
+    log(fmt("wrote %zu tokens%s: %.0f MiB in %zu blocks (%zu new kv, %.1f MiB; %zu new state, %.1f MiB), index "
+            "%.1f MiB rewritten, %zu file%s, %.0f ms (%.0f MB/s); on disk %zu, %.0f MiB; "
             "%zu removed for the budget, %zu superseded", tokens, target ? " (appended)" : "", mib(bin_bytes),
-            blocks_written, nstages, nstages == 1 ? "" : "s", ms, mbps(bin_bytes, ms), on_disk, mib(disk_bytes),
-            made_room, superseded));
+            blocks_written, kv_written, mib(kv_bytes_written), state_written, mib(state_bytes_written), mib(index_bytes),
+            nstages, nstages == 1 ? "" : "s", ms, mbps(bin_bytes, ms), on_disk, mib(disk_bytes), made_room, superseded));
     if (pins)
         log(fmt("on disk %.0f MiB is over the budget of %.0f MiB: %zu pinned conversation%s kept, a pin is never "
                 "traded for room", mib(disk_bytes), mib(options_.budget_bytes), pins, pins == 1 ? "" : "s"));
-    (void) index_bytes;
 }
 
 

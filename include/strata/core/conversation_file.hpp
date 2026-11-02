@@ -240,4 +240,8 @@ bool session_file_read(const std::string& path, const SessionFileIdentity& id, S
 // folder (\\server\share\dir\) and gives a drive root (C:\); empty for a bare file name (the current folder).
 std::string session_free_space_dir(const std::string& path, bool windows_rules);
 
+// The free bytes of the volume `path` is on: the session writer's preflight, and the disk tier's (a write needs its
+// bytes plus the reserve).  False when the volume cannot be asked.
+bool session_free_bytes(const std::string& path, uint64_t& out);
+
 } // namespace strata::core

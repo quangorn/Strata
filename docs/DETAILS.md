@@ -818,32 +818,47 @@ budget together reads ~150K tokens again on every switch. With `--conversation-d
 goes to `DIR` instead, and a request that continues it reads it back (the same validation and restore as a RAM-parked
 one) when the disk holds a longer prefix than the session, a `--batch` slot or the RAM cache:
 
-- every image of it (one per stage with `--layer-split`) is one session file, written and read with the session files'
-  code above (the same size, header and hash checks, and the free-space preflight `--session-min-free-mib`), with the
-  live state and every checkpoint, as in RAM; a park that does not fit the cache's byte budget goes to the disk too
-  (`sent to the disk` in the log) instead of being dropped;
-- a background thread (CPU nice 10 on Linux) writes the files, so a switch never waits for the disk; a conversation
+- every image of it (one per stage with `--layer-split`) is one `.bin` file, and the conversation's place in the store
+  is one `.idx` index beside it. A `.bin` is a 64-byte header and a table of blocks: one block is up to 2,048 tokens
+  of K/V on whole pages (the page is the boundary the engine itself reuses K/V on), another is one state - the live
+  state or a checkpoint, with its `used` and `pinned`. A park appends the blocks the folder does not already have
+  instead of writing the conversation again, and publishes the index last, so a crash leaves blocks no index names,
+  never an index naming bytes that are not there; a new image that contains an older stored one removes the older one,
+  index and `.bin` together; a park that does not fit the cache's byte budget goes to the disk too (`sent to the disk`
+  in the log) instead of being dropped, and a write needs its blocks plus `--session-min-free-mib` free on the volume,
+  as a session file's write does (`not enough disk space` in the log, nothing written);
+- a background thread (CPU nice 10 on Linux) writes the blocks, so a switch never waits for the disk; a conversation
   asked for again before its write ends comes back from the write queue (a "RAM hit"). A queued image holds its RAM
   until it is written: when RAM is short, parking and a read back wait for the queue before they evict more;
 - a read back needs RAM for the whole image above `--conversation-cache-min-free-mib`, as a park does; without it the
-  prompt is read again (`not restored (not enough RAM ...)`). A read back removes the conversation from the disk (the
-  session holds it again, and it is parked again on the next switch);
+  prompt is read again (`not restored (not enough RAM ...)`). A read keeps the conversation on the disk (the next
+  eviction of it appends to the same entry) and reads only the blocks its deepest stored state needs. Every block is
+  checked against its 128-bit hash and the chain of the blocks before it, and a damaged block falls back to the deepest
+  earlier state whose chain verifies: one bad byte costs the states above it, not the conversation;
 - a file is read back only when that is faster than reading the tokens it adds, by this run's measured disk speed and
   prompt speed (the prompt path's parts of 2,048 tokens or more): a new conversation that shares only the system prompt
   with a saved one no longer reads the saved one's whole file (on the box below 6,033 MiB for 16,384 tokens, 11.4 s
   from its NVMe against ~8 s to read the tokens). Until both speeds are measured the file is read; a skip is logged
-  (`not read`, with both estimates);
-- `--conversation-disk-mib N` (default 32768): the files' total, oldest out first. Without `--conversation-disk-persist`
-  the files' identity is a random number of the run: only this engine reads them, and its files (`strata-conv-*`) are
-  removed at start and when it ends;
-- the log has a line for every queue, write, hit and wait (MiB, ms, MB/s) and a totals line
-  (`strata serve: conversation disk: ...`); a request reused from the disk says so at the end of its line.
+  (`not read`, with both estimates). The tokens counted are the ones a read lands on - the deepest state the file
+  holds, and less after a fallback on damage - not what the index claims;
+- `--conversation-disk-mib N` (default 32768): the files' total, the least recently used conversation out first (a read
+  and a write both stamp it; a conversation holding a pinned shared prefix is left while another one can go, and the
+  budget goes over rather than trade the pin). Without `--conversation-disk-persist` the files' identity is a random
+  number of the run: only this engine reads them, and its files (`strata-conv-*`) are removed at start and when it
+  ends;
+- the log has a line for each new block of a write (kind, tokens, MiB, offset), the write's summary (new K/V and new
+  states in MiB, and the size of the index it rewrote - the first time the log can tell a new block from a rewrite),
+  a line for every queue, hit and wait (MiB, ms, MB/s) and a totals line (`strata serve: conversation disk: ...`); a
+  request reused from the disk says so at the end of its line.
 
 `--conversation-disk-persist on|exit-only` (default `off`): the conversations outlive the engine, for whoever stops
 Strata between sessions or restarts it (an update, a settings change, a reboot). The files are bound to the session
 files' identity (the model files, the engine version and the settings that change the saved bytes); a small index file
 beside each conversation lets the next start take them in without reading the images, and files of another model,
-engine version or settings, a damaged index and leftovers of an interrupted write are removed at start. On QUIT the
+engine version or settings, a damaged index and leftovers of an interrupted write are removed at start. A folder the
+previous build wrote (its index is the older format) is refused and removed too: the store reads only the current
+format, and the worst case is one longer prompt read. A `.bin` longer than its table says (an interrupted append) is
+kept and the excess ignored until the next append cuts it back. On QUIT the
 engine parks the current conversation, moves every parked one to the disk and waits for the writes; the server waits
 up to 300 s for that (20 s otherwise). While persist is on, the engine ignores SIGINT, SIGTERM and SIGHUP and ends only
 through its stdin (the server's QUIT, or EOF when the server is gone), so Ctrl+C in the server's terminal and the
@@ -862,6 +877,9 @@ three, and each came back from the disk with the same answer as before the resta
 one-slot RAM cache that pushed conversations to the disk while the engine ran: a 165,557-token conversation came back in 6.4 s
 instead of a 77.8 s cold read; the background writes ran at 80-370 MB/s while the next prompt was read, and a request
 waited for a write once (0.9 s). Unit test: `conversation_disk_test` (CPU only, `-DSTRATA_BUILD_CONVERSATION_TESTS=ON`).
+The block store above (append, keep-on-read, the budget by use) is measured by that test alone so far; the numbers in
+this paragraph are the file-per-conversation version, and the comparison the block store was written for has not been
+run on hardware yet.
 Not run on Windows, HIP, SYCL or Metal.
 
 ### API request monitor

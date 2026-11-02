@@ -823,6 +823,11 @@ void header_bytes(uint8_t* h, const SessionFileIdentity& id, uint64_t payload) {
 }
 } // namespace
 
+bool session_free_bytes(const std::string& path, uint64_t& out) {
+    out = 0;
+    return free_space(path, out);
+}
+
 SessionHasher::SessionHasher(uint64_t seed)
     : lane_{seed + P1 + P2, seed + P2, seed, seed - P1}, pending_{} {}
 
