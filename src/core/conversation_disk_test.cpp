@@ -1,5 +1,10 @@
 // CPU-only tests for the disk tier of the parked conversations (include/strata/core/conversation_disk.hpp).
 // Built with -DSTRATA_BUILD_CONVERSATION_TESTS=ON; no CUDA, no model.
+//
+// The plan's tests (docs/CONVERSATION_DISK_STORE_PHASE1.md, tests 2-11) are the blocks below: 2 "the block store's
+// write path", 3 and 6 "background write"/"the read path", 4 "the budget by use", 5 and 8 "start-up", 7 "the LRU stamp
+// and the pin", 9 "the block store's write path" and "supersede", 10 "history rewrite", 11 "a folder of the previous
+// build".  Test 1, the gate, is `conversation_snapshot_test.cpp`: it needs a card.
 #include "strata/core/conversation_disk.hpp"
 
 #include <algorithm>
@@ -208,6 +213,10 @@ bool logged(const char* what) {
     std::lock_guard<std::mutex> g(lines_m);
     for (const auto& l : lines) if (l.find(what) != std::string::npos) return true;
     return false;
+}
+void lines_clear() {
+    std::lock_guard<std::mutex> g(lines_m);
+    lines.clear();
 }
 }  // namespace
 
@@ -418,7 +427,7 @@ int main() {
     }
     check(tier_files(dir) == 0, "the tier removes its files when it ends");
 
-    {   // a read the RAM preflight refuses: nothing restored, the files are gone anyway
+    {   // a read the RAM preflight refuses: nothing restored, the entry and its files stay
         ConversationDiskTier tier(opts(dir, GiB));
         check(tier.open(e) && tier.put(split_image(400, 10)), "put for a refused read");
         tier.wait_idle();
@@ -571,6 +580,77 @@ int main() {
             check(tier.best(prompt_of(1700), {}, false).tokens == 1600, "supersede: the longer entry is the one left");
         }
         fs::remove_all(sdir);
+    }
+
+    {   // history rewrite (the plan's test 10): a client that edited its own history sends tokens that diverge from
+        // the stored ones, so no stored chain is a prefix and the write starts a new entry instead of appending.  The
+        // old entry is not dead weight - the tokens before the divergence are still a valid read - so it stays until
+        // the budget takes it by use, and neither index nor .bin is ever left orphaned.
+        const fs::path wdir = dir / "rewrite";
+        fs::remove_all(wdir);
+        fs::create_directories(wdir);
+        const SessionFileIdentity wid{11, 11};
+        auto store_w = [&](uint64_t budget) {
+            auto o = opts(wdir, budget);
+            o.persist = true;
+            o.identity = wid;
+            return o;
+        };
+        const SavedConversation original = image(600, 140, 1000, 0, 48, 1);
+        auto rewritten = [] {
+            SavedConversation s = image(600, 141, 1000, 0, 48, 1);
+            for (size_t i = 400; i < s.live.ids.size(); ++i) s.live.ids[i] = 7000 + int32_t(i);   // the client's edit
+            return s;
+        };
+        const SavedConversation edited = rewritten();
+        const uint64_t each = image(600, 140, 1000, 0, 48, 1).bytes();   // one conversation, the index aside
+        {
+            ConversationDiskTier tier(store_w(GiB));
+            check(tier.open(e) && tier.put(image(600, 140, 1000, 0, 48, 1)), "rewrite: put the original");
+            tier.wait_idle();
+            lines_clear();
+            check(tier.put(rewritten()), "rewrite: put the edited history");
+            tier.wait_idle();
+            check(tier.size() == 2 && !logged(" (appended)") && logged("0 superseded"),
+                  "rewrite: a new entry, nothing appended and nothing superseded");
+        }
+        uint64_t bins = 0, idxs = 0;
+        for (const auto& f : fs::directory_iterator(wdir)) {
+            if (f.path().extension() == ".bin") ++bins;
+            else if (f.path().extension() == ".idx") ++idxs;
+        }
+        check(bins == 2 && idxs == 2 && tier_files(wdir) == 4,
+              "rewrite: two entries, each with its own index and .bin, no orphan file");
+        {
+            // a budget for both and not for a third: the reads below order the two entries by use, in this tier, so
+            // the write of a third one evicts the one read first
+            ConversationDiskTier tier(store_w(each * 5 / 2));
+            check(tier.open(e) && tier.size() == 2, "rewrite: both fit the budget");
+            const auto o = tier.best(prompt_of(601), {}, false);
+            check(o.tokens == 600 && o.live, "rewrite: the original still matches its own tokens");
+            SavedConversation old_back;
+            check(tier.take(o.id, o.restore_tokens, old_back, e) && same(old_back, original),
+                  "rewrite: and it still reads back as the original");
+            std::this_thread::sleep_for(std::chrono::milliseconds(1100));   // the LRU order is in seconds
+            std::vector<int32_t> ep = edited.live.ids;
+            ep.push_back(9999);
+            const auto m = tier.best(ep, {}, false);
+            check(m.tokens == 600 && m.restore_tokens == 600 && m.live && m.id != o.id,
+                  "rewrite: the edited entry matches its tokens, not the original's");
+            SavedConversation back;
+            check(tier.take(m.id, m.restore_tokens, back, e) && same(back, edited),
+                  "rewrite: the edited image came back byte for byte");
+            check(tier.put(image(600, 142, 9000, 0, 48, 1)), "rewrite: put a third conversation");
+            tier.wait_idle();
+            check(tier.size() == 2 && tier.stats().evicted == 1, "rewrite: the budget made room for it");
+            const auto after = tier.best(prompt_of(601), {}, false);
+            check(after.tokens == 300 && !after.live,
+                  "rewrite: the entry read first went (no live state, only the surviving entry's checkpoint), "
+                  "the one read last stayed");
+            check(tier.best(prompt_of(601, 9000), {}, false).tokens == 600, "rewrite: the third one is there");
+            check(tier_files(wdir) == 4, "rewrite: the eviction took its index and .bin with it");
+        }
+        fs::remove_all(wdir);
     }
 
     {   // a folder of the previous build: its v1 conversation is removed at start, a v2 entry beside it stays
@@ -866,7 +946,6 @@ int main() {
             std::sort(out.begin(), out.end());
             return out;
         };
-        auto lines_clear = [] { std::lock_guard<std::mutex> g(lines_m); lines.clear(); };
         auto refused_at_start = [&](const char* label) {
             ConversationDiskTier tier(store());
             check(tier.open(e) && tier.size() == 0 && tier_files(sdir) == 0 && logged("1 refused"), label);

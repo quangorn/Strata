@@ -52,9 +52,9 @@ tests 2-7 run on what steps 3 and 4 give.
 
 ## Where each step stands
 
-2026-11-02. **Steps 1, 2, 3, 4, 5, 6 and 7 are done and green.** Step 1 touched only the gate's test; steps 2-6
-the tier's own files; step 7 the serve loop's restore estimate. A park now writes the block store, a read keeps the
-entry and reads only the blocks its
+2026-11-02. **Steps 1 to 8 are done and green.** Step 1 touched only the gate's test; steps 2-6
+the tier's own files; step 7 the serve loop's restore estimate; step 8 the tier's tests. A park now writes the block
+store, a read keeps the entry and reads only the blocks its
 state needs, the budget evicts whole conversations by use and leaves a pinned one, `used` and `pinned` survive a
 restart through the index, a folder of the previous build is refused and removed at start (decision 3), and the
 "read the file or read the tokens" estimate counts what a read lands on rather than what the index claims. The
@@ -348,9 +348,38 @@ Measured on this PC (same build folder, Release):
   three snapshot entries included, 20.95 s total). Step 7 has no test of its own: the estimate is a branch in the
   serve loop, and step 8's tests are the store's.
 
-**Next: step 8, the tests of the plan, 2-11** (`conversation_disk_test.cpp`): append, keep-on-read, budget by use,
-torn tail, one bad block, `used`/`pinned` across a restart, append across runs, history rewrite, a v1 folder removed
-at start.
+**Step 8, the tests of the plan, 2-11: done.** All of the plan's CPU tests are in `conversation_disk_test.cpp`, and the
+one that was missing (test 10, history rewrite) arrived with this step. What landed:
+
+- the plan's list now has a home: the file's header says which block is which test (2 "the block store's write path",
+  3 and 6 "background write"/"the read path", 4 "the budget by use", 5 and 8 "start-up", 7 "the LRU stamp and the
+  pin", 9 "the block store's write path" and "supersede", 10 "history rewrite", 11 "a folder of the previous build"),
+  because the blocks were written one step at a time and the numbering no longer matches their order in the file;
+- **test 10, history rewrite**: a client that edited its own history sends 600 tokens that diverge from the stored
+  ones at 400, so no stored chain is a prefix, the write starts a new entry, appends nothing and supersedes nothing
+  (all three lines are checked), and each of the two entries has its own `.bin` and `.idx` - two entries, four files,
+  no orphan. Both read back byte for byte, each on its own tokens. The old one is not dead weight: the tokens before
+  the divergence are still a valid read, so it stays until the budget takes it by use - with room for two and not for
+  three, reading the original first and the rewritten one second makes the original the write's victim, and its index
+  and `.bin` go with it;
+- **the plan's wording for test 10 was corrected**, not the code: it says "the old one is gone" after a diverged write,
+  which the write path cannot do (the supersede rule removes only entries whose whole chain is a prefix, and a diverged
+  entry is not one - its shorter prefix stays useful, and `best()` still finds it). The test asserts what the store
+  does, and the diverged entry leaves through the budget instead;
+- a stale comment on the refused-read test ("the files are gone anyway", from before step 4) now says what the test
+  asserts: the entry and its files stay.
+
+Measured on this PC (same build folder, Release):
+
+- `conversation_disk_test`: **212 checks, exit 0** (198 before; 14 new, the history-rewrite block). It takes 5.7 s, of
+  which 2.2 s are the two ordering pauses (1.1 s each).
+- `ctest -C Release -R "conversation_|session_"`: 11 of 11 passed in one run, 21.30 s in all (all three snapshot
+  entries included).
+
+**Next: step 9, the docs and the log** - the tier's section of [DETAILS.md](DETAILS.md), and a line per new
+block in the write so the validation can tell a new block from a rewrite. Found on the way: the v1 writer's
+`--session-min-free-mib` reserve did not survive step 3's block writer, so a cache write could fill the volume; step 9
+puts it back for the blocks a write adds.
 
 ## What each step must not touch
 
