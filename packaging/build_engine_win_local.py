@@ -22,12 +22,19 @@ Settings are environment variables, all optional:
                    on the C++ side
     CUDA_ROOT      the toolkit (default CUDA_PATH, then the newest CUDA\\v* folder)
     STRATA_VCVARS  a vcvars64.bat that vswhere cannot find (setup.py reads the same name)
-    VCVARS_VER     an MSVC toolset to pick, e.g. 14.42 (`vcvars64.bat -vcvars_ver=...`). CUDA needs MSVC's
-                   crt/host_config.h; the newest toolset on this PC (14.44.35207) has no crt headers, so nvcc's
-                   check fails without this. Install the toolset in the Visual Studio Installer first
+    VCVARS_VER     an MSVC toolset to pick, e.g. 14.42 (`vcvars64.bat -vcvars_ver=...`). CUDA checks the MSVC
+                   version in crt/host_config.h: CUDA 13.4 accepts _MSC_VER below 1960, so this PC's newest
+                   toolset (14.44.35207, _MSC_VER 1944) needs nothing. Measured 2026-11-02: all 169 CUDA and C++
+                   targets compiled with it. Set this only when a toolkit rejects the toolset (CUDA 13.0 refused
+                   1944, which is where this knob comes from).
     MIN_DRIVER     the driver the package is recorded for (default this PC's, from nvidia-smi; the release
                    value 580.65 is CUDA 13.0's, so do not use it for a build of a newer toolkit)
-    VERSION        default the version in CMakeLists.txt
+    VERSION        default the version in CMakeLists.txt. A build number goes here (`VERSION=0.1.55.1`): it names
+                   the package folder and the manifest only. Do NOT bump the engine's own version string
+                   (CMakeLists `project(VERSION)`): `engine_version` is part of the conversation identity
+                   (`src/program/generate.cpp:10507`, `src/core/conversation_file.cpp:880`), and a start deletes
+                   every disk index whose identity differs (`src/core/conversation_disk.cpp:210-211, 247-248`).
+                   Measured 2026-11-02: bumping `project(VERSION)` to 0.1.55.1 emptied the disk store.
     VERSION_SUFFIX the suffix the engine adds to its own version string (default `-local`), so a forked build names
                    itself `strata 0.1.55-local` and its INFO line reads `engine=0.1.55-local`; the web monitor shows
                    that (`serve/server.py:1156-1158` takes the engine's INFO line over the manifest, and
@@ -60,8 +67,8 @@ What has been run on this PC (RTX 4080 sm_89, driver 610.88, CUDA 13.4, MSVC 14.
 (169 ninja targets) and the picture reader (275 targets), at 24 jobs (peak RAM 4 GB) and at 8, the package
 (`package_engine.py --verify`: ok, 6 files, manifest sha256 `36d385581b5a…`), `strata components engine --full`
 (the local package is chosen, nothing downloaded with `STRATA_NO_ACQUIRE=1`), and `strata.exe --version` printing
-`strata 0.1.55-local`. Not measured: a build with `VCVARS_VER` set (the toolset that ships crt headers came from the
-toolkit's extra components).
+`strata 0.1.55-local`. 2026-11-02: a build of this tree with CUDA 13.4 and the newest toolset (14.44.35207)
+compiled all 169 CUDA and C++ targets, 96 executables, exit 0. Not measured: a build with `VCVARS_VER` set.
 
 MSVC is used through `vcvars64.bat`: its environment is read once and given to cmake, ninja and the picture
 reader, so the build works from a cygwin shell with no "x64 Native Tools" prompt. `packaging/build_vision_windows.bat`
