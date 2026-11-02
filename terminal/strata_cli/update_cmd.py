@@ -1,15 +1,18 @@
 """`strata update`, `strata components update|rollback`: the one explicit step that downloads and installs.
 
-    strata update                 the engine for this PC and Control, from the signed feed; switches only after a test start
+    strata update                 Control from the signed feed; NOT the engine, which this fork builds in the checkout
+    strata update --engine        fetch an engine package for this PC as upstream does (the same as STRATA_ENGINE_FROM_FEED=1)
     strata update --check         read the feed and say what would change; downloads nothing else
     strata update --app           also download and verify the desktop app's installer
-    strata components update      the same as `strata update` (engine + Control)
+    strata components update      the same as `strata update` (Control; the engine is off by default here)
     strata components rollback    return to the previous engine version the last update kept
     strata components engines     list the engines installed on this computer (sizes, which one is in use)
     strata components use X       switch to an installed engine (a version or folder name; `newest` follows updates again)
     strata components remove X    delete an installed engine (never the one in use)
 
-Starting and serving never come here. A process that has forbidden acquiring (STRATA_NO_ACQUIRE) is refused with exit 5.
+Starting and serving never come here, and `strata launch` never comes here for an engine: the engine that runs is the package
+built in this checkout (`tools/packaging/build_engine_win_local.py`). A process that has forbidden acquiring (STRATA_NO_ACQUIRE)
+is refused with exit 5.
 Exit codes: 0 done or nothing to do, 2 usage, 5 refused (signature, hash, downgrade, no key, acquiring forbidden),
 6 failed and the old version is still in use (network, test start), 7 a model is loaded and nothing was changed, 8 the update is done (or
 failed with the old engine in use) but a model that was stopped for it did not start again, 130 stopped.
@@ -37,6 +40,17 @@ ENV_FEED = "STRATA_UPDATE_FEED"
 
 ENV_APP_VERSION = "STRATA_APP_VERSION"
 
+#: This fork builds its own engine in the checkout (`tools/packaging/build_engine_win_local.py`), so `strata update` does not fetch
+#: an engine package: the one in the component folder is the one that runs. Set this to 1 (or true/yes/on) to get engines from
+#: the feed as upstream does. `--no-engine` and `--engine` say the same for one run.
+ENV_ENGINE_FEED = "STRATA_ENGINE_FROM_FEED"
+
+
+def engine_from_feed(environ=None) -> bool:
+    """Whether `strata update` may take an engine package from the feed: off by default on this PC, on with ENV_ENGINE_FEED=1."""
+    environ = os.environ if environ is None else environ
+    return environ.get(ENV_ENGINE_FEED, "").strip().lower() in ("1", "true", "yes", "on")
+
 
 def default_feed() -> str:
     """DEFAULT_FEED for this machine: a Linux ARM64 machine (the DGX Spark) reads strata-feed-linux-aarch64.json from the same release."""
@@ -63,6 +77,8 @@ def add_parsers(sp, components_sp) -> list:
     update.add_argument("--app", action="store_true", help="also download and verify the desktop app's installer")
     update.add_argument("--app-version", default=None, help=f"the installed app's version (default: ${ENV_APP_VERSION})")
     update.add_argument("--no-engine", action="store_true")
+    update.add_argument("--engine", action="store_true", help=f"take an engine package from the feed for this run (off by default on this PC; "
+                                                              f"default: ${ENV_ENGINE_FEED}=1)")
     update.add_argument("--no-control", action="store_true")
     update.add_argument("--yes", action="store_true", help="ask nothing (a script); a loaded model is not stopped by this alone, see --stop-model")
     update.add_argument("--stop-model", action="store_true", help="let the update stop a loaded model first (the script's yes to the question a terminal asks)")
@@ -73,6 +89,7 @@ def add_parsers(sp, components_sp) -> list:
     comp_update.add_argument("--app", action="store_true")
     comp_update.add_argument("--app-version", default=None)
     comp_update.add_argument("--no-engine", action="store_true")
+    comp_update.add_argument("--engine", action="store_true")
     comp_update.add_argument("--no-control", action="store_true")
     comp_update.add_argument("--yes", action="store_true", help="ask nothing (a script); a loaded model is not stopped by this alone, see --stop-model")
     comp_update.add_argument("--stop-model", action="store_true", help="let the update stop a loaded model first (the script's yes to the question a terminal asks)")
@@ -354,8 +371,9 @@ def run(a) -> int:
         ctx.source = _feed_source(a, root)
         if signing.extra_keys_in_effect() and not machine:
             print(f"note: trusting the extra keys in {os.environ.get(signing.ENV_EXTRA_KEYS)} (a test setup)", file=sys.stderr)
+        engine = (getattr(a, "engine", False) or engine_from_feed()) and not a.no_engine
         if a.check:
-            report = updater.check(ctx)
+            report = updater.check(ctx, engine=engine)
             if machine:
                 print(json.dumps({"schema_version": 1, "ok": True, **report}, ensure_ascii=False))
             else:
@@ -365,11 +383,13 @@ def run(a) -> int:
             print(f"Strata update ({ctx.source})")
         from strata_control import engine_update
         out = engine_update.update_with_models(ctx, _gate_for(a, ctx, machine), show=None if machine else _show_results,
-                                               engine=not a.no_engine, control=not a.no_control, app=a.app)
+                                               engine=engine, control=not a.no_control, app=a.app)
         if machine:
             print(json.dumps({"schema_version": 1, "ok": out["exit_code"] == 0, **out}, ensure_ascii=False))
         elif out["exit_code"] == engine_update.EXIT_NOT_RESTARTED:
             print("The update is done. A model that was stopped for it did not start again (see above); the new engine is in use.")
+        elif not engine and not a.no_engine:
+            print(f"{'Engine':<8}   {updater.engine_skipped(ctx)['note']}")
         return out["exit_code"]
     except updater.UpdateError as exc:
         if exc.exit_code == 0:                           # the person said no to stopping the model: nothing was changed
