@@ -1302,7 +1302,10 @@ void ConversationDiskTier::write(Job& job) {
         }
         if (!target) {
             updated = Entry{};
-            updated.id = ++next_id_;
+            // The id `put` gave the queued image: a match taken while the writer runs names this entry by it, so the
+            // published entry keeps it and a read that waited for the file finds its entry (a new id here loses the
+            // match, and the read reports "the entry is gone").
+            updated.id = job.entry.id;
         }
     }
     if (!target) {

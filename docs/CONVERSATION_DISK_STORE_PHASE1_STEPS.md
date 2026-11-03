@@ -527,6 +527,23 @@ restore lands as live, the request answered (`prompt_tokens=25485`, wall 1.5 s),
 damage` over the run. After the restart, every disk read in the log prints `(live)`; the last
 `the engine stopped unexpectedly` line in the server log is from 00:14, before this engine started.
 
+**The live append measured on the same engine, and an id defect it found.** The next run parked a 25 412-token
+conversation, filled the cache with 48-50k ones, and continued it with its real assistant turn: the continuation's
+write `wrote 25504 tokens (appended): 782 MiB in 3 blocks (1 new kv, 0.4 MiB; 2 new state, 225.2 MiB), index 0.5 MiB
+rewritten, 1 file, 469 ms (1749 MB/s)` - the entry got the delta, as the plan says. Its prompt replay read back from
+the RAM cache (`restored 25428 tokens (live)`, `prompt 31548 tokens = 25428 reused + 6120 read`). The last request,
+which asked for the appended entry after the cache filled, printed
+`conversation disk: 31541 tokens not restored (the entry is gone (its write failed, or the budget removed it));
+reading the prompt` and read the prompt from 0 (`prompt 31548 tokens = 0 reused + 31548 read in 13500 ms`). The
+reason: `put` gives the queued image an id (`conversation_disk.cpp:1232`), `best` reports a match by it, and the
+writer's publish of a new entry took **another** id (line 1305, `updated.id = ++next_id_`). The published entry is
+the one the match named, and a read that waits for its file by the old id finds nothing. The fix publishes the entry
+under the id `put` gave it; the store test adds the case: a match of the entry being written, then
+`take(a_now.id, 400, ...)` after the write ends, which reads the published entry back
+(`the published entry keeps the id of its queued image`). `conversation_disk_test`: **232 checks passed** (230
+before, 2 added); the rest of the offline suite is as in step 9 (183 / 4865 / 972 / 4854 / 119). Reading the
+appended entry from the disk under this fix on hardware is **not yet measured**.
+
 **The version rule held**: `project(strata VERSION 0.1.55)` is unchanged, the engine names itself `0.1.55-local`,
 and the build number lives only in the package folder and manifest (`0.1.55.3-...`). The index identity hash is
 built from the settings and the engine's version string (`conversation_file.cpp:891` writes the pair

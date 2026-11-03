@@ -409,12 +409,17 @@ int main() {
         check(tier.pending(), "pending while the writer waits");
         const auto b = tier.best(prompt_of(450, 5000), {}, false);
         check(b.tokens == 400 && b.queued && b.bytes > 0, "b matches in the queue");
+        const auto a_now = tier.best(prompt_of(450), {}, false);
+        check(a_now.tokens == 400 && a_now.id != 0, "the entry being written is matched by the id put gave it");
         SavedConversation back;
         check(tier.take(b.id, b.tokens, back, e) && same(back, image(400, 3, 5000)), "b back from RAM");
         check(tier.stats().ram_hits == 1 && logged("RAM hit: 400 tokens"), "a RAM hit, logged");
         release.set_value();
         tier.wait_idle();
         check(!tier.pending() && tier.size() == 1 && tier_files(dir) == 2, "a written after the release");
+        SavedConversation a_back;
+        check(tier.take(a_now.id, 400, a_back, e) && same(a_back, image(400, 2)),
+              "the published entry keeps the id of its queued image: the match the writer saw reads back");
         check(tier.best(prompt_of(450, 5000), {}, false).tokens == 0, "b is gone from the tier");
     }
 
