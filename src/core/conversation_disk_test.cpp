@@ -619,6 +619,37 @@ int main() {
                   "append id: clear takes the entry and the map, so the queued id finds nothing");
         }
 
+        {   // the chain's image keys: ids alone are not a prefix.  Measured on live traffic: a continuation read
+            // 26 240 tokens from a stored entry and its write printed `new entry: no stored conversation is a
+            // prefix`, because the new conversation held a mid-prompt image key the stored chain does not have.
+            std::promise<void> release;
+            std::shared_future<void> gate = release.get_future().share();
+            auto o = store();
+            o.before_write = [gate] { gate.wait(); };
+            ConversationDiskTier keyed(std::move(o));
+            check(keyed.open(e) && keyed.put(image(600, 44, 1000, 0, 48, 1)), "append imgs: put 600 tokens");
+            release.set_value();
+            keyed.wait_idle();
+            check(keyed.size() == 1 && tier_files(sdir) == 2, "append imgs: the first image is on the disk");
+
+            ConversationDiskTier same(store());
+            check(same.open(e), "append imgs: the tier opens for the 1200-token write");
+            check(same.size() == 1, "append imgs: the 600-token entry is taken in");
+            const bool put_ok = same.put(image(1200, 44, 1000, 0, 48, 1));
+            check(put_ok, "append imgs: put 1200 tokens, the same keys");
+            same.wait_idle();
+            check(same.size() == 1, "append imgs: no image keys at all, the ids are a prefix, one entry");
+
+            ConversationDiskTier extra(store());
+            check(extra.open(e) && extra.size() == 1, "append imgs: the entry taken in");
+            SavedConversation mid = image(1200, 44, 1000, 0, 48, 1);
+            mid.live.imgs.push_back({300, 777});   // a mid-conversation image key the stored chain does not hold
+            check(extra.put(std::move(mid)), "append imgs: put 1200 tokens with an image key the chain lacks");
+            extra.wait_idle();
+            check(extra.size() == 2 && logged("no stored conversation is a prefix of this one's 1200 tokens"),
+                  "append imgs: an image key the stored chain lacks starts a new entry, not an append");
+        }
+
         // a stale shorter copy of the same conversation: the write appends to the longest and removes the shorter one
         ConversationDiskEntry stale;
         std::string ierr;

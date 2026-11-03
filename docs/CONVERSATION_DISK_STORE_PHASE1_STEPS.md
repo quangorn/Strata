@@ -606,7 +606,29 @@ fillers, which were older) was never queued and never read from the disk: the re
 from the cache (`restored 32355 tokens (checkpoint)`, `prompt 32362 tokens = 32355 reused + 7 read in 210 ms`).
 So the scripted test must fill the cache past the parked image to make the disk path run; that is phase 11.
 
-**The version rule held**: `project(strata VERSION 0.1.55)` is unchanged, the engine names itself `0.1.55-local`,
+**Phase 11: the disk path driven by evictions, and why a scripted continuation is not an append.** N1's 26 176-token
+turn is parked; six 48k conversations evict it: `queued 26240 tokens (564 MiB in RAM until written; queue 1, 564 MiB)`,
+`wrote 26240 tokens: 564 MiB in 16 blocks (13 new kv, 225.8 MiB; 3 new state, 337.8 MiB), index 0.3 MiB rewritten,
+1 file, 770 ms (767 MB/s)`. N2 reads it back: `disk hit: 26240 tokens, 564 MiB in 1 file, 610 ms (968 MB/s)`,
+`restored 26240 tokens (live) in 27.5 ms`, `prompt 32362 tokens = 26240 reused + 6122 read in 3688 ms (1659.9 tok/s)`.
+Its parked image reaches the disk after seven more fillers: `queued 32428 tokens (730 MiB in RAM until written)`, and
+its write is a **new entry**, not an append: `new entry: no stored conversation is a prefix of this one's 32428
+tokens` - the whole image is written again, `wrote 32428 tokens: 729 MiB in 20 blocks (16 new kv, 279.1 MiB;
+4 new state, 450.4 MiB), index 0.4 MiB rewritten, 1 file, 4351 ms (176 MB/s)`. The last request read that entry:
+`disk hit: 32355 tokens, 617 MiB in 1 file, 451 ms (1434 MB/s), after 3373 ms waiting for its write`,
+`restored 32355 tokens (live) in 30.0 ms` - the read waited for the writer, landed as live, no `the entry is gone`.
+Over the run on this engine: `not restored` = 0, `0/0 writes/reads failed, 0 reads fell back on damage`.
+
+**The prefix rule, measured offline.** The chain check compares the stored entry's keys against the new image by
+**token ids and image keys** (`ConversationImageKey {start, hash}`; `chain_prefix`'s `same_state` at
+`conversation_disk.cpp:749`, `prefix_digest` at 354 hashes the ids up to the block's start and every image key with a
+start below it). A continuation whose prompt-cache added an image key inside the reused prefix is not a prefix, so its
+write starts a new entry. The store test shows both sides: a 600-token entry, then 1200 tokens with no image keys -
+one entry, appended; then 1200 tokens with one image key at 300 tokens the chain does not hold - two entries and the
+line `no stored conversation is a prefix of this one's 1200 tokens`. `conversation_disk_test`: **249 checks passed**
+(240 before, 9 added). The live append measured above (79 700 to 81 047 tokens, two delta blocks) is the case where
+the image keys stay the chain's prefix.
+: `project(strata VERSION 0.1.55)` is unchanged, the engine names itself `0.1.55-local`,
 and the build number lives only in the package folder and manifest (`0.1.55.3-...`). The index identity hash is
 built from the settings and the engine's version string (`conversation_file.cpp:891` writes the pair
 `"engine", c.engine_version`; `generate.cpp:10507` sets it to `STRATA_VERSION`), so a package folder named
