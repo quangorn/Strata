@@ -5,6 +5,8 @@
 // write path", 3 and 6 "background write"/"the read path", 4 "the budget by use", 5 and 8 "start-up", 7 "the LRU stamp
 // and the pin", 9 "the block store's write path" and "supersede", 10 "history rewrite", 11 "a folder of the previous
 // build".  Test 1, the gate, is `conversation_snapshot_test.cpp`: it needs a card.
+// Phase 2's plan tests land one step at a time: 10 (flag 0: a park writes nothing, an eviction writes the whole image)
+// is the block "the cache's events drive the disk tier" below, written with step 2.
 #include "strata/core/conversation_disk.hpp"
 
 #include <algorithm>
@@ -478,17 +480,33 @@ int main() {
         fs::remove_all(fdir);
     }
 
-    {   // the RAM cache's evictions go to the disk tier (set_on_evict)
+    {   // the cache's events drive the disk tier (set_on_change); with flush 0 (phase 2 step 2, plan test 10) a park
+        // writes nothing: an eviction writes the whole image, exactly as phase 1's hook did
         ConversationDiskTier tier(opts(dir, GiB));
         check(tier.open(e), "open 6");
         ConversationCache cache(GiB, 1);
-        cache.set_on_evict([&](SavedConversation&& s) { tier.put(std::move(s)); });
+        size_t parked_events = 0, evicted_events = 0, taken_events = 0;
+        cache.set_on_change([&](CacheEvent event, uint64_t serial, std::shared_ptr<const SavedConversation> image) {
+            switch (event) {
+            case CacheEvent::parked: ++parked_events; tier.park(serial, std::move(image)); break;
+            case CacheEvent::evicted: ++evicted_events; tier.force(serial, std::move(image)); break;
+            case CacheEvent::taken: ++taken_events; tier.dropped(serial); break;
+            case CacheEvent::superseded: tier.dropped(serial); break;
+            case CacheEvent::cleared: tier.cancel_all(); break;
+            }
+        });
         check(cache.put(image(400, 11)), "park a");
+        tier.wait_idle();
+        check(parked_events == 1 && tier.stats().written == 0 && tier.size() == 0 && tier_files(dir) == 0,
+              "flush 0: a park queues no write and creates no file");
         check(cache.put(image(400, 12, 8000)), "park b: a leaves RAM");
         tier.wait_idle();
-        check(cache.size() == 1 && cache.evictions() == 1 && tier.size() == 1, "a is on the disk");
+        check(evicted_events == 1 && cache.size() == 1 && cache.evictions() == 1 && tier.size() == 1, "a is on the disk");
         check(tier.best(prompt_of(450), {}, false).tokens == 400, "a matches on the disk");
         check(cache.best(prompt_of(450, 8000), {}, false).tokens == 400, "b stays in RAM");
+        // the event comes before take() hands the image over (its queued write is cancelled, step 5)
+        auto b_image = cache.take(cache.best(prompt_of(450, 8000), {}, false).index);
+        check(b_image && taken_events == 1, "take reports the taken event with the image");
     }
 
     {   // the block store's write path: append (across runs), page-aligned kv blocks, a torn tail cut back

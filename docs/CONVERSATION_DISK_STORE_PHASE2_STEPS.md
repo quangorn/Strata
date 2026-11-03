@@ -335,8 +335,60 @@ The park's duration was not measured: the engine was not restarted (the serving 
 running), so the hot path's number is the next check before step 2 - with the same traffic, compare
 `conversation cache: parked ... in N ms` before and after this change.
 
-Next is step 2: the `CacheEvent` callback and the tier's event seam, with flush `0` keeping phase 1's
+Next was step 2: the `CacheEvent` callback and the tier's event seam, with flush `0` keeping phase 1's
 behaviour.
+
+2026-11-03. **Step 2 is done, and it is green.** The cache reports what happened to a parked
+conversation through one callback; the disk tier is driven by those five events and no longer by a single
+eviction hook. With flush `0` (the only mode until step 3 adds the flag) the behaviour is phase 1's: a
+park queues nothing, an eviction writes the whole image, and a taken or superseded conversation's queued
+write is cancelled.
+
+What landed:
+
+- `include/strata/core/conversation_cache.hpp`: `enum class CacheEvent { parked, taken, evicted,
+  superseded, cleared }` and `set_on_change(std::function<void(CacheEvent, uint64_t serial,
+  std::shared_ptr<const SavedConversation>)>)`; `set_on_evict` is gone. The events fire from `put()`
+  (`parked`, after the entry is admitted), `take()` (`taken`, before the image is returned),
+  `evict_oldest()` (`evicted`), `drop_superseded()` (`superseded`, which `put()`'s own pre-admission
+  call also reaches) and `clear()` (`cleared`, serial `0`). The image handed to the callback is the shared
+  allocation, never a copy.
+- `include/strata/core/conversation_disk.hpp` / `src/core/conversation_disk.cpp`: the tier's event
+  surface - `park(serial, image)` (a no-op at flush `0`), `dropped(serial)` (erases that serial's queued
+  job), `force(serial, image)` (phase 1's `put()`, whole image) and `cancel_all()` (the queue goes) -
+  beside `put(SavedConversation&&)` for callers without a cache entry (`put()` is now `force(0, ...)` over
+  a `make_shared` of the moved image; `generate.cpp`'s RAM-refused park still uses it).
+  `Job` holds `std::shared_ptr<SavedConversation> image` and the entry's `serial`. The shared pointer is
+  mutable on purpose: the cache hands the allocation out as `const`, the tier recovers the mutable handle
+  for the one case that needs it - `take()` hands a queued image back to the restore path as the same
+  allocation (step 5) - and the writer itself only reads it. `write()` no longer moves the image apart
+  (it renders `const SavedConversation*` views of the first image and each stage image, and drops its
+  handle when the write ends, so the cache, if it still holds it, keeps the bytes).
+  `chain_prefix()` takes those views too.
+- `src/program/generate.cpp`: registers `set_on_change` and switches on the event (`parked` -> `park` when
+  disk writes are on, `taken`/`superseded` -> `dropped`, `evicted` -> `force`, `cleared` -> `cancel_all`).
+  The QUIT path (`persist`) still sets `disk_writes = true`, parks the current conversation and evicts the
+  rest, which forces the writes as before.
+- `src/core/conversation_disk_test.cpp`: the cache-driven block now uses `set_on_change`, and it is plan
+  test 10 - a park writes nothing (`stats().written == 0`, no file), an eviction writes the whole image,
+  and `take()` reports `taken` before handing the image over. The file's header says so.
+
+Measured on this PC (build folder `build-c13-gate`, Release, the serving model running, no restart):
+
+- `conversation_cache_test`: **4 862 checks, exit 0** (unchanged from step 1).
+- `conversation_disk_test`: **260 checks, exit 0** (258 from step 1 plus the two assertions of test 10).
+- `conversation_file_test`: **183 checks, exit 0**; `conversation_validation_test`: **972 host-only
+  checks, exit 0**; `session_save_reclaim_test`: **119 checks, exit 0**.
+- the engine: `--target strata` built, exit 0; the only warnings are the tree's own C4244 template lines
+  and the C4324 padding notes in the CPU kernel headers.
+
+The park's duration is still not measured: the serving model was left running (a restart is the owner's
+call), so the hot path's before/after number for steps 1 and 2 stays the first check to make when it is
+restarted.
+
+Step 3 is next: the queue and the clock (`Job.due`, `wait_until`, replace-by-serial, `pending()`/
+`wait_idle()`) and the `--conversation-disk-flush-seconds` flag. `park()` becomes real there; nothing else
+in this step has to change.
 
 ## Risks and open questions
 

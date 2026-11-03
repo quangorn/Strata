@@ -10598,8 +10598,25 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "strata serve: conversation disk tier off: %s\n", disk_err.c_str());
         bool disk_writes = conv_disk.enabled() && o.conversation_disk_persist != "exit-only";   // none until QUIT
         if (conv_disk.enabled())
-            conversations.set_on_evict([&conv_disk, &disk_writes](strata::core::SavedConversation&& image) {
-                if (disk_writes) conv_disk.put(std::move(image));   // queued for the writer; a refusal is in its log
+            conversations.set_on_change(
+                [&conv_disk, &disk_writes](strata::core::CacheEvent event, uint64_t serial,
+                                           std::shared_ptr<const strata::core::SavedConversation> image) {
+                switch (event) {
+                case strata::core::CacheEvent::parked:
+                    // flush 0: nothing is written at park time; the debounce arms a write here (phase 2, step 3)
+                    if (disk_writes) conv_disk.park(serial, std::move(image));
+                    break;
+                case strata::core::CacheEvent::taken:
+                case strata::core::CacheEvent::superseded:
+                    conv_disk.dropped(serial);   // the cache handed the image out: a queued write of it must not run
+                    break;
+                case strata::core::CacheEvent::evicted:
+                    if (disk_writes) conv_disk.force(serial, std::move(image));   // queued; a refusal is in its log
+                    break;
+                case strata::core::CacheEvent::cleared:
+                    conv_disk.cancel_all();
+                    break;
+                }
             });
         // Room in RAM for `need` more bytes above `floor`: the disk tier's queued writes first (their RAM comes back),
         // then the RAM cache's oldest conversations.  `mem` keeps the last reading for the caller's message.

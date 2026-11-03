@@ -733,17 +733,17 @@ ConversationCheckpoint key_only(const ConversationCheckpoint& c) {
 // The entry a write appends to: the same stages, layer carves and layer counts; the deepest stored state's tokens
 // and images equal to the image's at that length; and every stored block's chained digest recomputed from the image.
 // That is the entry a read would have picked, so it is the one worth extending.
-bool chain_prefix(const ConversationDiskEntry& e, const std::vector<SavedConversation>& images) {
-    if (e.stages.empty() || e.stages.size() != images.size() || e.cvec != images.front().cvec ||
-        e.geometry != images.front().geometry || e.tokens <= 0)
+bool chain_prefix(const ConversationDiskEntry& e, const std::vector<const SavedConversation*>& images) {
+    if (e.stages.empty() || e.stages.size() != images.size() || e.cvec != images.front()->cvec ||
+        e.geometry != images.front()->geometry || e.tokens <= 0)
         return false;
     for (size_t s = 0; s < images.size(); ++s) {
         const auto& stage = e.stages[s];
-        if (stage.layer_lo != images[s].layer_lo || stage.layer_hi != images[s].layer_hi ||
-            stage.layers != images[s].kv.size() || stage.blocks.empty())
+        if (stage.layer_lo != images[s]->layer_lo || stage.layer_hi != images[s]->layer_hi ||
+            stage.layers != images[s]->kv.size() || stage.blocks.empty())
             return false;
     }
-    const SavedConversation& img = images.front();
+    const SavedConversation& img = *images.front();
     const size_t tokens = img.live.ids.size();
     if ((size_t) e.tokens > tokens) return false;
     auto same_state = [&](const ConversationCheckpoint& key) {
@@ -1212,14 +1212,29 @@ void ConversationDiskTier::remove_locked(size_t index, bool delete_files) {
     entries_.erase(entries_.begin() + (std::ptrdiff_t) index);
 }
 
-bool ConversationDiskTier::put(SavedConversation&& image) {
-    if (!open_) return false;
+void ConversationDiskTier::dropped(uint64_t serial) {
+    if (!open_) return;
+    std::lock_guard<std::mutex> lock(m_);
+    for (size_t i = queue_.size(); i-- > 0;)
+        if (queue_[i].serial == serial) queue_.erase(queue_.begin() + (std::ptrdiff_t) i);
+}
+
+void ConversationDiskTier::cancel_all() {
+    std::lock_guard<std::mutex> lock(m_);
+    queue_.clear();
+}
+
+bool ConversationDiskTier::force(uint64_t serial, std::shared_ptr<const SavedConversation> image) {
+    if (!open_ || !image) return false;
     Job job;
-    job.image = std::move(image);
-    job.entry.live = key_of(job.image.live);
-    for (const auto& c : job.image.checkpoints) job.entry.checkpoints.push_back(key_of(c));
-    job.entry.cvec = job.image.cvec;
-    job.entry.bytes = job.image.bytes();
+    job.serial = serial;
+    // the cache handed the allocation over as `const`; the object itself is the one it made, and the restore path
+    // (take) may move sub-objects out of it, so the tier keeps the mutable handle and only reads it in write()
+    job.image = std::const_pointer_cast<SavedConversation>(std::move(image));
+    job.entry.live = key_of(job.image->live);
+    for (const auto& c : job.image->checkpoints) job.entry.checkpoints.push_back(key_of(c));
+    job.entry.cvec = job.image->cvec;
+    job.entry.bytes = job.image->bytes();
     const size_t tokens = job.entry.live.ids.size();
     if (job.entry.bytes > options_.budget_bytes) {
         log(fmt("dropped %zu tokens: %.0f MiB is over the disk budget", tokens, mib(job.entry.bytes)));
@@ -1245,6 +1260,10 @@ bool ConversationDiskTier::put(SavedConversation&& image) {
     log(fmt("queued %zu tokens (%.0f MiB in RAM until written; queue %zu, %.0f MiB)", tokens, mib(estimate), depth,
             mib(queued_bytes)));
     return true;
+}
+
+bool ConversationDiskTier::put(SavedConversation&& image) {
+    return force(0, std::make_shared<SavedConversation>(std::move(image)));
 }
 
 void ConversationDiskTier::writer() {
@@ -1277,16 +1296,17 @@ void ConversationDiskTier::write(Job& job) {
     if (options_.before_write) options_.before_write();
     const size_t tokens = job.entry.live.ids.size();
     const auto t0 = std::chrono::steady_clock::now();
-    // the image's stages: the first stage's, then each later stage's (the writer takes no nested images)
-    std::vector<SavedConversation> images;
-    images.push_back(std::move(job.image));
-    for (auto& stage : images.front().stage_images) images.push_back(std::move(stage));
-    images.front().stage_images.clear();
+    // the image's stages: the first stage's, then each later stage's (the image is shared with the cache, so the writer
+    // only reads it - it moves nothing apart)
+    const SavedConversation& front = *job.image;
+    std::vector<const SavedConversation*> images;
+    images.push_back(&front);
+    for (const auto& stage : front.stage_images) images.push_back(&stage);
     // STRATA_PARK_ASYNC: the park that produced these images may still be copying its K/V into them; the request
     // thread cannot wait (that would undo the asynchronous park), so the writer does, once per image, before it
     // reads a buffer below
     if (options_.join)
-        for (const auto& image : images) options_.join(image);
+        for (const auto* image : images) options_.join(*image);
 
     // 1. the entry to append to: the longest chain that is a prefix of this image (the one a read would pick)
     Entry updated;
@@ -1309,20 +1329,20 @@ void ConversationDiskTier::write(Job& job) {
         }
     }
     if (!target) {
-        updated.cvec = images.front().cvec;
-        updated.geometry = images.front().geometry;
-        updated.tokens = (int64_t) images.front().live.ids.size();
-        updated.live = key_of(images.front().live);
-        for (const auto& c : images.front().checkpoints) updated.checkpoints.push_back(key_of(c));
+        updated.cvec = images.front()->cvec;
+        updated.geometry = images.front()->geometry;
+        updated.tokens = (int64_t) images.front()->live.ids.size();
+        updated.live = key_of(images.front()->live);
+        for (const auto& c : images.front()->checkpoints) updated.checkpoints.push_back(key_of(c));
         updated.stages.resize(images.size());
         for (size_t s = 0; s < images.size(); ++s) {
-            updated.stages[s].layer_lo = images[s].layer_lo;
-            updated.stages[s].layer_hi = images[s].layer_hi;
-            updated.stages[s].layers = (uint32_t) images[s].kv.size();
+            updated.stages[s].layer_lo = images[s]->layer_lo;
+            updated.stages[s].layer_hi = images[s]->layer_hi;
+            updated.stages[s].layers = (uint32_t) images[s]->kv.size();
         }
         updated.bytes = 0;
     } else {
-        merge_keys(updated, images.front());
+        merge_keys(updated, *images.front());
     }
     if (!target)
         log(fmt("new entry: no stored conversation is a prefix of this one's %zu tokens", tokens));
@@ -1336,7 +1356,7 @@ void ConversationDiskTier::write(Job& job) {
     std::vector<std::vector<std::pair<int64_t, int64_t>>> ranges(images.size());   // per stage: the new kv ranges
     std::vector<std::vector<const ConversationCheckpoint*>> states(images.size());
     for (size_t s = 0; s < images.size() && error.empty(); ++s) {
-        const SavedConversation& img = images[s];
+        const SavedConversation& img = *images[s];
         if (!kv_plan(img, plans[s], error)) break;
         ConversationDiskStage& stage = updated.stages[s];
         if (plans[s].page <= 0) {
@@ -1412,7 +1432,7 @@ void ConversationDiskTier::write(Job& job) {
     size_t kv_written = 0, state_written = 0;
     uint64_t kv_bytes_written = 0, state_bytes_written = 0;
     for (size_t s = 0; s < images.size() && error.empty(); ++s) {
-        const SavedConversation& img = images[s];
+        const SavedConversation& img = *images[s];
         ConversationDiskStage& stage = updated.stages[s];
         ConversationDiskBinHeader header;
         header.model = fid.model;
@@ -1494,7 +1514,6 @@ void ConversationDiskTier::write(Job& job) {
             updated.bytes += index_bytes;
         }
     }
-    job.image = SavedConversation{};   // the RAM goes back now, written or not
     const double ms = ms_since(t0);
     if (!error.empty()) {
         for (const auto& f : created) remove_file(f);
@@ -1503,6 +1522,7 @@ void ConversationDiskTier::write(Job& job) {
             ++stats_.write_failed;
         }
         images.clear();
+        job.image.reset();   // the RAM goes back now, written or not (the cache may hold the same allocation)
         log(fmt("dropped %zu tokens: the write failed after %.0f ms (%s)", tokens, ms, error.c_str()));
         return;
     }
@@ -1555,6 +1575,7 @@ void ConversationDiskTier::write(Job& job) {
         disk_bytes = bytes_;
     }
     images.clear();
+    job.image.reset();   // the RAM goes back now, written or not (the cache may hold the same allocation)
     log(fmt("wrote %zu tokens%s: %.0f MiB in %zu blocks (%zu new kv, %.1f MiB; %zu new state, %.1f MiB), index "
             "%.1f MiB rewritten, %zu file%s, %.0f ms (%.0f MB/s); on disk %zu, %.0f MiB; "
             "%zu removed for the budget, %zu superseded", tokens, target ? " (appended)" : "", mib(bin_bytes),
@@ -1576,7 +1597,8 @@ bool ConversationDiskTier::take(uint64_t id, int64_t tokens, SavedConversation& 
     for (size_t i = 0; i < queue_.size(); ++i)
         if (queue_[i].entry.id == id) {
             const uint64_t b = queue_[i].entry.bytes;
-            out = std::move(queue_[i].image);
+            std::shared_ptr<SavedConversation> back = std::move(queue_[i].image);   // the same allocation, no copy
+            out = std::move(*back);
             queue_.erase(queue_.begin() + (std::ptrdiff_t) i);
             ++stats_.ram_hits;
             stats_.tokens_back += (uint64_t) std::max<int64_t>(tokens, 0);

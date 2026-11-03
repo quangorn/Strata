@@ -1,6 +1,7 @@
-// The disk tier of --serve's parked conversations (--conversation-disk-dir): the RAM cache's evictions
-// (ConversationCache::set_on_evict) are written by a background thread to a block store - one `.bin` per layer-split
-// stage, appended to, and one `.idx` naming its blocks - and read back when a request continues them, within a byte
+// The disk tier of --serve's parked conversations (--conversation-disk-dir): the RAM cache's events
+// (ConversationCache::set_on_change) drive it - an evicted image is written by a background thread to a block store,
+// one `.bin` per layer-split stage, appended to, and one `.idx` naming its blocks - and read back when a request
+// continues them, within a byte
 // budget and (unless `persist`) this run only.  A read keeps the entry: the next eviction of the same conversation
 // appends only its delta.  The budget evicts whole conversations, the least recently used first (`last_used_s`, which a
 // read stamps; `written_s` for one never read); a conversation holding a pinned shared prefix is left while another can
@@ -151,9 +152,24 @@ public:
     /// stays off) when the folder cannot be used.
     bool open(std::string& error);
 
-    /// Queues `image` for the writer; its RAM is freed when its write ends, stored or not.  Every checkpoint is written
-    /// with it (they hold no K/V), so a prompt that leaves the conversation early still resumes from one.  False when
-    /// the tier is off or over budget.
+    /// The cache's events (ConversationCache::set_on_change), flush 0 for now - phase 1's behaviour byte for byte:
+    /// nothing is written at park time, an eviction writes the whole image, and a taken or superseded conversation's
+    /// queued write is cancelled.  The debounce (`--conversation-disk-flush-seconds`) makes `park` arm a write later.
+    void park(uint64_t serial, std::shared_ptr<const SavedConversation> image) {
+        (void) serial;
+        (void) image;   // flush 0: no write is queued at park time, the image stays the cache's
+    }
+    /// The conversation `serial` left the cache (taken or superseded): a queued write of it is cancelled.
+    void dropped(uint64_t serial);
+    /// Writes `image` whole (eviction or QUIT): phase 1's put(), with the cache entry's serial.  Its RAM is freed when
+    /// the write ends, stored or not.
+    bool force(uint64_t serial, std::shared_ptr<const SavedConversation> image);
+    /// Nothing the cache queued is restorable any more (#879's clear): the queue goes.
+    void cancel_all();
+
+    /// Queues `image` for the writer, as force() without a cache entry (tests, and a park the RAM cache refused).
+    /// Every checkpoint is written with it (they hold no K/V), so a prompt that leaves the conversation early still
+    /// resumes from one.  False when the tier is off or over budget.
     bool put(SavedConversation&& image);
 
     struct Match {
@@ -218,7 +234,11 @@ private:
     using Entry = ConversationDiskEntry;   ///< the keys and the block table (container v2 above)
     struct Job {
         Entry entry;
-        SavedConversation image;
+        /// The image to write.  The cache shares this allocation (one allocation, two references) and hands it out
+        /// as `const`; the tier keeps it mutable only so a read that matches a queued image can hand the allocation
+        /// back to the restore path (take) without a copy - the writer itself only reads it.
+        std::shared_ptr<SavedConversation> image;
+        uint64_t serial = 0;   ///< the cache entry the job came from (0: put(), no entry)
     };
     void writer();
     void write(Job& job);                                    // without the lock
