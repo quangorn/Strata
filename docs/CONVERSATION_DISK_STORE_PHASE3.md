@@ -219,3 +219,17 @@ restore of a 165K-token conversation was 5.6 s at 643 MB/s on the 2x CMP box
   multi-GiB conversation under paging has been measured. A rule for this (a floor that accepts paging, a
   measured restore budget, or reading the blocks in batches the way the prompt path does) needs its own
   investigation; no design here.
+- **One store for several models, to be researched separately.** Today the store is one folder per
+  preset: `--conversation-disk-dir` and `--conversation-disk-mib` belong to a model's launch, the index
+  binds model, config and engine version (`SessionFileIdentity`), and the start scan refuses an index of
+  another model, engine version or settings — measured on this PC with one model: 67 conversations,
+  69 965 MiB under a 76 800 MiB budget, `0 refused` at the start, `1 removed for the budget` after a
+  write (2026-11-03). The wish is one folder and one size limit shared by several models, with the
+  budget removing the least recently used conversation across all of them, not one model evicting only
+  its own. The rule exists inside one model already: the budget's order is `last_used_s` (a read stamps
+  it), and the entry the budget removes next is the least recently used whole conversation
+  (`conversation_disk.cpp:61, 76`). What the investigation has to answer: what two models share at all
+  (the block key includes model, config and geometry, so two models share no bytes — a shared store is
+  about the budget and eviction, not about sharing blocks), how the scan tells one store's namespaces
+  apart, how `pinned()`, QUIT `persist` and the "budget only" line behave when several models write into
+  one folder, and which log lines say what was evicted for whom. No design here.
