@@ -866,6 +866,9 @@ struct Options {
     /// is written to this folder instead of dropped, and read back when a request continues it.  Empty = off.
     std::string conversation_disk_dir;
     int64_t conversation_disk_mib = 32768;    ///< --conversation-disk-mib: at most this many MiB of files
+    /// --conversation-disk-flush-seconds N: write a parked conversation after N quiet seconds (the debounce).  0 =
+    /// off, today's behaviour byte for byte; 1 = write at every park.
+    int64_t conversation_disk_flush_seconds = 0;
     /// --conversation-disk-persist: off = the files end with the engine; on = they outlive it and QUIT writes the
     /// current and the parked conversations; exit-only = the same, but nothing is written while the engine runs
     std::string conversation_disk_persist = "off";
@@ -1041,6 +1044,8 @@ void usage() {
                  "  --conversation-disk-dir DIR  --serve: a conversation the RAM cache evicts is written to DIR and read\n"
                  "                       back when a request continues it (needs --conversation-cache-mib; default off)\n"
                  "  --conversation-disk-mib N  --serve: at most N MiB of such files (default 32768)\n"
+                 "  --conversation-disk-flush-seconds N  --serve: write a parked conversation after N quiet seconds\n"
+                 "                       (default 0 = off: written on eviction and at QUIT only; 1 = at every park)\n"
                  "  --conversation-disk-persist off|on|exit-only  --serve: keep the disk's conversations for the next start:\n"
                  "                       off (default) removes them at the end; on keeps them and QUIT writes the\n"
                  "                       current and the parked ones there first; exit-only writes at QUIT alone,\n"
@@ -3256,7 +3261,8 @@ int main(int argc, char** argv) {
         else if (a == "--conversation-cache-mib" || a == "--conversation-cache-slots" ||
                  a == "--conversation-cache-min-free-mib" || a == "--conversation-cache-min-tokens" ||
                  a == "--conversation-cache-park-gain" ||
-                 a == "--session-min-free-mib" || a == "--memory-limit-mib" || a == "--conversation-disk-mib") {
+                 a == "--session-min-free-mib" || a == "--memory-limit-mib" || a == "--conversation-disk-mib" ||
+                 a == "--conversation-disk-flush-seconds") {
             const std::string value = next(a.c_str());
             int64_t number = 0;
             const auto result = std::from_chars(value.data(), value.data() + value.size(), number);
@@ -3274,6 +3280,7 @@ int main(int argc, char** argv) {
             else if (a == "--session-min-free-mib") o.session_min_free_mib = number;
             else if (a == "--memory-limit-mib") o.memory_limit_mib = number;
             else if (a == "--conversation-disk-mib") o.conversation_disk_mib = number;
+            else if (a == "--conversation-disk-flush-seconds") o.conversation_disk_flush_seconds = number;
             else o.conversation_cache_slots = (int) number;
         }
         else if (a == "--conversation-disk-dir") o.conversation_disk_dir = next("--conversation-disk-dir");
@@ -10567,6 +10574,7 @@ int main(int argc, char** argv) {
         disk_opts.dir = conversations.enabled() ? o.conversation_disk_dir : std::string();
         disk_opts.budget_bytes = (uint64_t) o.conversation_disk_mib << 20;
         disk_opts.min_free_bytes = (uint64_t) o.session_min_free_mib << 20;
+        disk_opts.flush_seconds = o.conversation_disk_flush_seconds;   // 0: nothing at park time (phase 1)
         disk_opts.keep_on_ram_refusal = o.conversation_disk_keep_on_ram;   // by default a read refused for RAM drops the entry
         // STRATA_PARK_ASYNC: the writer waits on its own thread for the background copy of the park that produced
         // an image; waiting here, in the request thread, would undo the asynchronous park

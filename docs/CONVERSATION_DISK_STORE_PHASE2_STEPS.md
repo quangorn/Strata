@@ -390,6 +390,63 @@ Step 3 is next: the queue and the clock (`Job.due`, `wait_until`, replace-by-ser
 `wait_idle()`) and the `--conversation-disk-flush-seconds` flag. `park()` becomes real there; nothing else
 in this step has to change.
 
+2026-11-03. **Step 3 is done, and it is green.** The queue is ordered by due time and the writer sleeps
+until the earliest one; `--conversation-disk-flush-seconds N` arms a park's write `N` seconds out,
+eviction and QUIT force it at once, and a deferred job never reads as RAM pressure. The flag defaults to
+`0`, which is step 2's behaviour (and phase 1's) byte for byte.
+
+What landed:
+
+- `include/strata/core/conversation_disk.hpp`: `ConversationDiskOptions::flush_seconds` (`0` = off);
+  `Job.due`, `Job.forced` beside `serial`; the queue is
+  `std::multimap<std::chrono::steady_clock::time_point, Job>`; `writing_serial_` records the serial the
+  writer is on; `enqueue()`/`enqueue_image()` are the one place a job is admitted, given an id and logged.
+- `src/core/conversation_disk.cpp`:
+  - `park(serial, image)` is a no-op at flush `0`; otherwise it queues the shared image with
+    `due = now + N s`. `force(serial, image)` is `due = now`. Both go through `enqueue()`, which replaces
+    an earlier job of the same serial (the newer image wins, and the id the first park gave it is kept, so
+    a read that matched the queued id still finds the entry).
+  - `dropped(serial)` erases that serial's queued job; if the writer is already on that serial it waits
+    for that one write (the caller is about to move sub-objects out of the shared image), and says so in
+    the log. This is the safety step 5 described; it is here because step 3 turns the flag on.
+  - `writer()` waits on `cv_.wait_until(queue_.begin()->first)`, re-reads the queue on every wake, and
+    writes the earliest due job.
+  - `pending()` is `writing_` or a job whose `due` has passed. `wait_idle()` makes every deferred job due
+    now (again on every wake, so a park arriving during the wait cannot hold it up) and then waits.
+  - `clear()` drops queued and deferred jobs, then waits for the running write and every reader, as before.
+- `src/program/generate.cpp`: `--conversation-disk-flush-seconds N` (nonnegative integer, in the existing
+  numeric group; a negative value is refused with the group's message), the usage line, and
+  `disk_opts.flush_seconds`. The flag is numeric, so `strata_cli/launch/settings.py` needs no entry
+  (`WORD_VALUE_FLAGS` lists word-valued flags only). `serve/server.py`'s 300 s QUIT wait already covers
+  the debounce, because QUIT collapses every due time; the log line beside it is step 7.
+- `src/core/conversation_disk_test.cpp`: plan tests 1 (debounce), 2 (reset), 4 (eviction bypass) and 5
+  (QUIT bypass), plus a `wait_until` helper. The debounce is one second in the tests (the flag is in
+  whole seconds), so the blocks take about a second each.
+
+Deliberate departures from the plan's wording:
+
+- `Job.cancelled` is not a field. A cancelled job is erased from the queue under the same mutex the
+  writer pops under, so there is no window in which a cancelled job is visible, and `pending()`/`best()`
+  need no filter. The observable behaviour the field was for (a taken or superseded entry is not
+  written) is what `dropped()` does.
+- The wait for a running write of the same serial (`writing_serial_`) landed here rather than in step 5,
+  because step 3 is where the debounce starts writing images the cache still owns. Step 5's remaining
+  work is its tests (3, 8, 9) and the id-map check across an append.
+- Until step 4, a debounced write has the forced shape (the whole image, chain included): `job.forced` is
+  recorded and ignored by `write()`. Step 4 adds the K/V-only + one-state shape.
+
+Measured on this PC (build folder `build-c13-gate`, Release, the serving model running, no restart):
+
+- `conversation_disk_test`: **281 checks, exit 0** (260 from step 2 plus the 21 of tests 1, 2, 4 and 5).
+- `conversation_cache_test`: **4 862 checks, exit 0**; `conversation_file_test`: **183 checks, exit 0**;
+  `conversation_validation_test`: **972 host-only checks, exit 0**; `session_save_reclaim_test`:
+  **119 checks, exit 0**.
+- the engine: `--target strata` built, exit 0. `--help` shows the new flag, and
+  `--conversation-disk-flush-seconds -1` is refused with "needs a nonnegative integer within range".
+
+Step 4 is next: what a debounced flush writes (K/V delta, at most one end state per
+`--prompt-cache-every`, no checkpoint chain), while a forced write keeps the whole-image shape.
+
 ## Risks and open questions
 
 - **The hot path.** `shared_ptr` in `ConversationCache` touches every park, take and admission. Any

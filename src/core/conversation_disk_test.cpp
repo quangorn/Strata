@@ -6,7 +6,8 @@
 // and the pin", 9 "the block store's write path" and "supersede", 10 "history rewrite", 11 "a folder of the previous
 // build".  Test 1, the gate, is `conversation_snapshot_test.cpp`: it needs a card.
 // Phase 2's plan tests land one step at a time: 10 (flag 0: a park writes nothing, an eviction writes the whole image)
-// is the block "the cache's events drive the disk tier" below, written with step 2.
+// is the block "the cache's events drive the disk tier", written with step 2; 1, 2, 4 and 5 (debounce, reset, eviction
+// bypass, QUIT bypass) are the four "debounce"/"reset"/"eviction"/"quit" blocks, written with step 3.
 #include "strata/core/conversation_disk.hpp"
 
 #include <algorithm>
@@ -236,6 +237,16 @@ bool logged(const char* what) {
 void lines_clear() {
     std::lock_guard<std::mutex> g(lines_m);
     lines.clear();
+}
+// Polls `done` until it holds or `ms` passes (the writer's deadlines are real time).
+template <class F>
+bool wait_until(F done, int ms = 10000) {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(ms);
+    while (std::chrono::steady_clock::now() < deadline) {
+        if (done()) return true;
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    return done();
 }
 }  // namespace
 
@@ -507,6 +518,87 @@ int main() {
         // the event comes before take() hands the image over (its queued write is cancelled, step 5)
         auto b_image = cache.take(cache.best(prompt_of(450, 8000), {}, false).index);
         check(b_image && taken_events == 1, "take reports the taken event with the image");
+    }
+
+    {   // debounce (phase 2 step 3, plan test 1): a park is queued at once and written only after the quiet time, and
+        // a job waiting for its due time is not RAM pressure
+        const fs::path fdir = dir / "flush1";
+        fs::remove_all(fdir);
+        fs::create_directories(fdir);
+        auto o = opts(fdir, GiB);
+        o.flush_seconds = 1;
+        ConversationDiskTier tier(std::move(o));
+        check(tier.open(e), "debounce: open");
+        tier.park(1, std::make_shared<SavedConversation>(image(400, 60)));
+        std::this_thread::sleep_for(std::chrono::milliseconds(150));
+        check(tier.stats().written == 0 && tier.size() == 0 && tier_files(fdir) == 0 && !tier.pending(),
+              "debounce: nothing before the deadline, nothing pending");
+        check(tier.best(prompt_of(450), {}, false).tokens == 400 && tier.best(prompt_of(450), {}, false).queued,
+              "debounce: the queued image is matched meanwhile");
+        check(wait_until([&] { return tier.stats().written == 1; }), "debounce: written after the deadline");
+        check(tier.size() == 1 && tier_files(fdir) == 2, "debounce: one entry, its index and its .bin");
+        check(tier.best(prompt_of(450), {}, false).tokens == 400 && !tier.best(prompt_of(450), {}, false).queued,
+              "debounce: and it is on the disk now");
+        fs::remove_all(fdir);
+    }
+
+    {   // reset (plan test 2): a second park of the same entry replaces the first; one write, with the second image
+        const fs::path rdir = dir / "flush2";
+        fs::remove_all(rdir);
+        fs::create_directories(rdir);
+        auto o = opts(rdir, GiB);
+        o.flush_seconds = 1;
+        ConversationDiskTier tier(std::move(o));
+        check(tier.open(e), "reset: open");
+        tier.park(7, std::make_shared<SavedConversation>(image(400, 61, 5000)));
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        tier.park(7, std::make_shared<SavedConversation>(image(600, 62, 7000)));   // the newer image replaces the job
+        std::this_thread::sleep_for(std::chrono::milliseconds(300));   // still inside the second park's quiet time
+        check(tier.stats().written == 0, "reset: the second park moved the deadline out");
+        check(wait_until([&] { return tier.stats().written == 1; }), "reset: one write after the quiet time");
+        check(tier.size() == 1 && tier.stats().written == 1, "reset: two parks, one write");
+        check(tier.best(prompt_of(650, 7000), {}, false).tokens == 600 &&
+                  tier.best(prompt_of(650, 5000), {}, false).tokens == 0,
+              "reset: the written image is the second one");
+        fs::remove_all(rdir);
+    }
+
+    {   // eviction bypasses the debounce (plan test 4): with flush 3600 an eviction is written at once
+        const fs::path edir = dir / "flush3";
+        fs::remove_all(edir);
+        fs::create_directories(edir);
+        auto o = opts(edir, GiB);
+        o.flush_seconds = 3600;
+        ConversationDiskTier tier(std::move(o));
+        check(tier.open(e), "eviction: open");
+        tier.park(11, std::make_shared<SavedConversation>(image(400, 63)));
+        check(!tier.pending() && tier.stats().written == 0, "eviction: the deferred park is not RAM pressure");
+        check(tier.force(12, std::make_shared<SavedConversation>(image(400, 64, 8000))),
+              "eviction: the forced write is queued");
+        check(tier.pending(), "eviction: a due job is RAM pressure");
+        check(wait_until([&] { return tier.stats().written == 1; }), "eviction: written at once");
+        check(tier.size() == 1 && tier.best(prompt_of(450, 8000), {}, false).tokens == 400,
+              "eviction: the forced image is on the disk, the deferred park still waits");
+        fs::remove_all(edir);
+    }
+
+    {   // QUIT bypasses the debounce (plan test 5): wait_idle() makes every deferred job due now and returns quickly
+        const fs::path qdir = dir / "flush4";
+        fs::remove_all(qdir);
+        fs::create_directories(qdir);
+        auto o = opts(qdir, GiB);
+        o.flush_seconds = 3600;
+        ConversationDiskTier tier(std::move(o));
+        check(tier.open(e), "quit: open");
+        tier.park(21, std::make_shared<SavedConversation>(image(400, 65)));
+        tier.park(22, std::make_shared<SavedConversation>(image(400, 66, 8000)));
+        check(tier.stats().written == 0 && !tier.pending(), "quit: both parks wait, neither is RAM pressure");
+        const auto t0 = std::chrono::steady_clock::now();
+        tier.wait_idle();
+        const double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        check(tier.stats().written == 2 && tier.size() == 2, "quit: wait_idle() wrote both deferred parks");
+        check(secs < 60.0, "quit: it collapsed the due times instead of waiting an hour");
+        fs::remove_all(qdir);
     }
 
     {   // the block store's write path: append (across runs), page-aligned kv blocks, a torn tail cut back

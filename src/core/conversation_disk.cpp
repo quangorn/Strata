@@ -1213,28 +1213,58 @@ void ConversationDiskTier::remove_locked(size_t index, bool delete_files) {
 }
 
 void ConversationDiskTier::dropped(uint64_t serial) {
-    if (!open_) return;
-    std::lock_guard<std::mutex> lock(m_);
-    for (size_t i = queue_.size(); i-- > 0;)
-        if (queue_[i].serial == serial) queue_.erase(queue_.begin() + (std::ptrdiff_t) i);
+    if (!open_ || serial == 0) return;
+    std::unique_lock<std::mutex> lock(m_);
+    for (auto it = queue_.begin(); it != queue_.end();)
+        it = it->second.serial == serial ? queue_.erase(it) : std::next(it);
+    // A write already running for this entry reads the same allocation, and the caller is about to move sub-objects
+    // out of it (the restore path): wait for that write, on this serial only (bounded by one write).
+    if (writing_ && writing_serial_ == serial) {
+        const auto t0 = std::chrono::steady_clock::now();
+        const size_t tokens = writing_entry_.live.ids.size();
+        cv_.wait(lock, [&] { return !(writing_ && writing_serial_ == serial); });
+        const double ms = ms_since(t0);
+        lock.unlock();
+        log(fmt("cancelled the write of %zu tokens after waiting %.0f ms for it: the cache took the image back", tokens,
+                ms));
+    }
 }
 
 void ConversationDiskTier::cancel_all() {
     std::lock_guard<std::mutex> lock(m_);
     queue_.clear();
+    cv_.notify_all();
+}
+
+void ConversationDiskTier::park(uint64_t serial, std::shared_ptr<const SavedConversation> image) {
+    // flush 0: nothing is queued at park time (phase 1's behaviour byte for byte), the image stays the cache's
+    if (options_.flush_seconds <= 0) return;
+    const auto due = std::chrono::steady_clock::now() + std::chrono::seconds(options_.flush_seconds);
+    enqueue_image(serial, std::move(image), false, due);   // a refusal is in the log
 }
 
 bool ConversationDiskTier::force(uint64_t serial, std::shared_ptr<const SavedConversation> image) {
+    return enqueue_image(serial, std::move(image), true, std::chrono::steady_clock::now());
+}
+
+bool ConversationDiskTier::enqueue_image(uint64_t serial, std::shared_ptr<const SavedConversation> image, bool forced,
+                                         std::chrono::steady_clock::time_point due) {
     if (!open_ || !image) return false;
     Job job;
     job.serial = serial;
+    job.forced = forced;
+    job.due = due;
+    job.entry.live = key_of(image->live);
+    for (const auto& c : image->checkpoints) job.entry.checkpoints.push_back(key_of(c));
+    job.entry.cvec = image->cvec;
+    job.entry.bytes = image->bytes();
     // the cache handed the allocation over as `const`; the object itself is the one it made, and the restore path
     // (take) may move sub-objects out of it, so the tier keeps the mutable handle and only reads it in write()
     job.image = std::const_pointer_cast<SavedConversation>(std::move(image));
-    job.entry.live = key_of(job.image->live);
-    for (const auto& c : job.image->checkpoints) job.entry.checkpoints.push_back(key_of(c));
-    job.entry.cvec = job.image->cvec;
-    job.entry.bytes = job.image->bytes();
+    return enqueue(std::move(job));
+}
+
+bool ConversationDiskTier::enqueue(Job job) {
     const size_t tokens = job.entry.live.ids.size();
     if (job.entry.bytes > options_.budget_bytes) {
         log(fmt("dropped %zu tokens: %.0f MiB is over the disk budget", tokens, mib(job.entry.bytes)));
@@ -1242,23 +1272,38 @@ bool ConversationDiskTier::force(uint64_t serial, std::shared_ptr<const SavedCon
         ++stats_.write_failed;
         return false;
     }
-    {
-        std::lock_guard<std::mutex> lock(m_);
-        job.entry.id = ++next_id_;
-        ++stats_.queued;
-    }
+    const auto now = std::chrono::steady_clock::now();
+    const bool deferred = !job.forced && job.due > now;
+    const double delay_s = std::chrono::duration<double>(job.due - now).count();
+    const uint64_t estimate = job.entry.bytes;
     size_t depth = 0;
     uint64_t queued_bytes = 0;
-    const uint64_t estimate = job.entry.bytes;
     {
         std::lock_guard<std::mutex> lock(m_);
-        queue_.push_back(std::move(job));
+        // a second park of the same entry replaces its queued job: the newer image is strictly better, and the id the
+        // first park gave the entry is kept (a read matched while the writer runs names the entry by it)
+        uint64_t id = 0;
+        if (job.serial != 0)
+            for (auto it = queue_.begin(); it != queue_.end();)
+                if (it->second.serial == job.serial) {
+                    id = it->second.entry.id;
+                    it = queue_.erase(it);
+                } else {
+                    ++it;
+                }
+        job.entry.id = id ? id : ++next_id_;
+        queue_.emplace(job.due, std::move(job));
+        ++stats_.queued;
         depth = queue_.size();
-        for (const auto& j : queue_) queued_bytes += j.entry.bytes;
+        for (const auto& e : queue_) queued_bytes += e.second.entry.bytes;
     }
     cv_.notify_all();
-    log(fmt("queued %zu tokens (%.0f MiB in RAM until written; queue %zu, %.0f MiB)", tokens, mib(estimate), depth,
-            mib(queued_bytes)));
+    if (deferred)
+        log(fmt("parked %zu tokens: the write is due in %.1f s (%.0f MiB in RAM until then; queue %zu, %.0f MiB)",
+                tokens, delay_s, mib(estimate), depth, mib(queued_bytes)));
+    else
+        log(fmt("queued %zu tokens (%.0f MiB in RAM until written; queue %zu, %.0f MiB)", tokens, mib(estimate), depth,
+                mib(queued_bytes)));
     return true;
 }
 
@@ -1275,17 +1320,32 @@ void ConversationDiskTier::writer() {
         Job job;
         {
             std::unique_lock<std::mutex> lock(m_);
-            cv_.wait(lock, [&] { return stop_ || !queue_.empty(); });
-            if (stop_) return;
-            job = std::move(queue_.front());
-            queue_.pop_front();
-            writing_ = true;
-            writing_entry_ = job.entry;   // best() still sees it; take() waits for its file
+            for (;;) {
+                if (stop_) return;
+                if (queue_.empty()) {
+                    cv_.wait(lock);   // a job was cancelled, or none arrived yet
+                    continue;
+                }
+                const auto it = queue_.begin();
+                const auto now = std::chrono::steady_clock::now();
+                if (it->first > now) {
+                    // the earliest due time: sleep until it, and re-read the queue when anything is added or cancelled
+                    cv_.wait_until(lock, it->first);
+                    continue;
+                }
+                job = std::move(it->second);
+                writing_ = true;
+                writing_serial_ = job.serial;
+                writing_entry_ = job.entry;   // best() still sees it; take() waits for its file
+                queue_.erase(it);
+                break;
+            }
         }
         write(job);
         {
             std::lock_guard<std::mutex> lock(m_);
             writing_ = false;
+            writing_serial_ = 0;
             writing_entry_ = Entry{};
         }
         cv_.notify_all();
@@ -1593,13 +1653,13 @@ bool ConversationDiskTier::take(uint64_t id, int64_t tokens, SavedConversation& 
     const auto t0 = std::chrono::steady_clock::now();
     std::unique_lock<std::mutex> lock(m_);
     if (!open_) { error = "the disk tier is off"; return false; }
-    // still queued: back from RAM, no disk at all
-    for (size_t i = 0; i < queue_.size(); ++i)
-        if (queue_[i].entry.id == id) {
-            const uint64_t b = queue_[i].entry.bytes;
-            std::shared_ptr<SavedConversation> back = std::move(queue_[i].image);   // the same allocation, no copy
+    // still queued (due or deferred): back from RAM, no disk at all
+    for (auto it = queue_.begin(); it != queue_.end(); ++it)
+        if (it->second.entry.id == id) {
+            const uint64_t b = it->second.entry.bytes;
+            std::shared_ptr<SavedConversation> back = std::move(it->second.image);   // the same allocation, no copy
             out = std::move(*back);
-            queue_.erase(queue_.begin() + (std::ptrdiff_t) i);
+            queue_.erase(it);
             ++stats_.ram_hits;
             stats_.tokens_back += (uint64_t) std::max<int64_t>(tokens, 0);
             lock.unlock();
@@ -1718,7 +1778,10 @@ bool ConversationDiskTier::take(uint64_t id, int64_t tokens, SavedConversation& 
 
 bool ConversationDiskTier::pending() const {
     std::lock_guard<std::mutex> lock(m_);
-    return !queue_.empty() || writing_;
+    if (writing_) return true;
+    // a job waiting for its due time is not RAM pressure: the bytes are the cache's (or an evicted image the writer
+    // already holds), so only a due job counts
+    return !queue_.empty() && queue_.begin()->first <= std::chrono::steady_clock::now();
 }
 
 double ConversationDiskTier::wait_idle() {
@@ -1726,7 +1789,20 @@ double ConversationDiskTier::wait_idle() {
     if (queue_.empty() && !writing_) return 0;
     const auto t0 = std::chrono::steady_clock::now();
     const size_t depth = queue_.size() + (writing_ ? 1 : 0);
-    cv_.wait(lock, [&] { return queue_.empty() && !writing_; });
+    // "make room in RAM" and "shut down" never become timer waits: every deferred job is due now.  A park that arrives
+    // while we wait is collapsed on the next wake, so a long debounce cannot hold the wait up.
+    for (;;) {
+        bool moved = false;
+        for (auto it = queue_.begin(); it != queue_.end() && it->first > t0;) {
+            Job job = std::move(it->second);
+            it = queue_.erase(it);
+            queue_.emplace(t0, std::move(job));
+            moved = true;
+        }
+        if (moved) cv_.notify_all();
+        if (queue_.empty() && !writing_) break;
+        cv_.wait(lock);
+    }
     const double ms = ms_since(t0);
     ++stats_.waits;
     stats_.wait_ms += ms;

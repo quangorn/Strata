@@ -15,11 +15,13 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <deque>
 #include <functional>
+#include <map>
 #include <mutex>
 #include <string>
 #include <system_error>
@@ -34,6 +36,9 @@ struct ConversationDiskOptions {
     uint64_t min_free_bytes = 0;     ///< a write needs the file plus this much free on the disk (session preflight)
     bool persist = false;            ///< keep the files for later runs, bound to `identity`
     SessionFileIdentity identity;    ///< persist: the session files' identity (model and settings fingerprints)
+    /// --conversation-disk-flush-seconds: a park is written after this many quiet seconds (the debounce).  0 = off and
+    /// today's behaviour byte for byte: nothing is queued at park time, the tier is written on eviction and at QUIT.
+    int64_t flush_seconds = 0;
     /// Called with every diagnostic line (no trailing newline), from the caller's or the writer's thread.
     std::function<void(const std::string&)> log;
     /// Tests: called on the writer thread before each write starts.
@@ -152,19 +157,18 @@ public:
     /// stays off) when the folder cannot be used.
     bool open(std::string& error);
 
-    /// The cache's events (ConversationCache::set_on_change), flush 0 for now - phase 1's behaviour byte for byte:
-    /// nothing is written at park time, an eviction writes the whole image, and a taken or superseded conversation's
-    /// queued write is cancelled.  The debounce (`--conversation-disk-flush-seconds`) makes `park` arm a write later.
-    void park(uint64_t serial, std::shared_ptr<const SavedConversation> image) {
-        (void) serial;
-        (void) image;   // flush 0: no write is queued at park time, the image stays the cache's
-    }
-    /// The conversation `serial` left the cache (taken or superseded): a queued write of it is cancelled.
+    /// The cache's events (ConversationCache::set_on_change).  With flush 0 nothing is written at park time, an
+    /// eviction writes the whole image and a taken or superseded conversation's queued write is cancelled: phase 1's
+    /// behaviour byte for byte.  With `--conversation-disk-flush-seconds N` a park arms a write due in `N` seconds
+    /// (a second park of the same entry replaces it, keeping its id), and eviction or QUIT forces the write at once.
+    void park(uint64_t serial, std::shared_ptr<const SavedConversation> image);
+    /// The conversation `serial` left the cache (taken or superseded): a queued write of it is cancelled, and a write
+    /// already running for it is waited for (the caller moves sub-objects out of the shared image next).
     void dropped(uint64_t serial);
-    /// Writes `image` whole (eviction or QUIT): phase 1's put(), with the cache entry's serial.  Its RAM is freed when
-    /// the write ends, stored or not.
+    /// Writes `image` whole (eviction or QUIT), now: phase 1's put(), with the cache entry's serial.  Its RAM is freed
+    /// when the write ends, stored or not.
     bool force(uint64_t serial, std::shared_ptr<const SavedConversation> image);
-    /// Nothing the cache queued is restorable any more (#879's clear): the queue goes.
+    /// Nothing the cache queued is restorable any more (#879's clear): the queue goes, deferred jobs too.
     void cancel_all();
 
     /// Queues `image` for the writer, as force() without a cache entry (tests, and a park the RAM cache refused).
@@ -200,7 +204,7 @@ public:
             for (const auto& c : e.checkpoints) consider(c, false);
         };
         for (const auto& e : entries_) scan(e, false);
-        for (const auto& j : queue_) scan(j.entry, true);
+        for (const auto& job : queue_) scan(job.second.entry, true);
         if (writing_) scan(writing_entry_, false);   // its file appears when the write ends: take() waits for it
         return best;
     }
@@ -215,9 +219,11 @@ public:
     bool take(uint64_t id, int64_t tokens, SavedConversation& out, std::string& error,
               const std::function<bool(uint64_t need_bytes, std::string& why)>& admit = {});
 
-    /// Whether images wait in the queue or are being written (their RAM is not back yet).
+    /// Whether an image is being written or a queued write is due (their RAM is not back yet).  A job waiting for its
+    /// due time is not RAM pressure: the bytes are the cache's (or an evicted image the writer already holds).
     bool pending() const;
-    /// Blocks until the queue is empty and no write runs; returns the ms it waited.
+    /// Makes every deferred job due now, then blocks until the queue is empty and no write runs; returns the ms it
+    /// waited.  "Make room in RAM" and "shut down" never become timer waits.
     double wait_idle();
     /// #879: every conversation goes - queued, being written (waited for) and on the disk, files too.  Returns how many.
     size_t clear();
@@ -238,8 +244,15 @@ private:
         /// as `const`; the tier keeps it mutable only so a read that matches a queued image can hand the allocation
         /// back to the restore path (take) without a copy - the writer itself only reads it.
         std::shared_ptr<SavedConversation> image;
-        uint64_t serial = 0;   ///< the cache entry the job came from (0: put(), no entry)
+        uint64_t serial = 0;                          ///< the cache entry the job came from (0: put(), no entry)
+        std::chrono::steady_clock::time_point due;    ///< when the writer may start it
+        bool forced = false;                          ///< eviction or QUIT: write the whole image, chain included
     };
+    /// Queues `job` (keys, image, serial, due and shape filled): assigns its id, replaces an earlier job of the same
+    /// serial (keeping that job's id), logs and wakes the writer.  False when the tier is off or over budget.
+    bool enqueue(Job job);
+    bool enqueue_image(uint64_t serial, std::shared_ptr<const SavedConversation> image, bool forced,
+                       std::chrono::steady_clock::time_point due);
     void writer();
     void write(Job& job);                                    // without the lock
     void remove_locked(size_t index, bool delete_files);     // m_ held
@@ -256,8 +269,11 @@ private:
     mutable std::mutex m_;
     std::condition_variable cv_;
     std::deque<Entry> entries_;   ///< on the disk, least recently used first (the budget's order)
-    std::deque<Job> queue_;       ///< waiting for the writer, oldest first
+    /// The writer's work, ordered by due time (a multimap: two jobs may share a deadline).  Replace-by-serial keeps
+    /// one job per cache entry, so this holds at most a handful.
+    std::multimap<std::chrono::steady_clock::time_point, Job> queue_;
     bool writing_ = false;        ///< the writer holds a job (writing_entry_ is its keys)
+    uint64_t writing_serial_ = 0; ///< ... and its cache entry (0: put()), for a take() that must wait for it
     Entry writing_entry_;
     bool stop_ = false;
     std::thread thread_;
