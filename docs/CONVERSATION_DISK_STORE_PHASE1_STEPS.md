@@ -628,7 +628,22 @@ one entry, appended; then 1200 tokens with one image key at 300 tokens the chain
 line `no stored conversation is a prefix of this one's 1200 tokens`. `conversation_disk_test`: **249 checks passed**
 (240 before, 9 added). The live append measured above (79 700 to 81 047 tokens, two delta blocks) is the case where
 the image keys stay the chain's prefix.
-: `project(strata VERSION 0.1.55)` is unchanged, the engine names itself `0.1.55-local`,
+
+**Phase 12: the scripted append measured on the live engine.** Phase 11's fillers were not enough: the cache kept the
+continuation's parked image (`restored 40251 tokens (checkpoint)`, `prompt 40258 tokens = 40251 reused + 7 read in
+477 ms`), so its image never reached the disk. With twelve fillers after the continuation the eviction happens and the
+append runs: the first conversation's image on the disk as a new entry (`wrote 32663 tokens: 619 MiB in 19 blocks
+(16 new kv, 281.1 MiB; 3 new state, 337.8 MiB), 2120 ms (306 MB/s)`), the continuation reads it back
+(`prompt 40258 tokens = 32660 reused + 7598 read in 10038 ms`, `reused from the disk in 4.6 s`), its parked image goes
+to the disk and appends: `wrote 40321 tokens (appended): 797 MiB in 6 blocks (4 new kv, 65.9 MiB; 2 new state,
+225.2 MiB), index 0.5 MiB rewritten, 1 file, 3414 ms (245 MB/s)` - six blocks for the delta, the entry's older blocks
+copied. The last request read the appended entry from the disk: `disk hit: 40251 tokens, 685 MiB in 1 file, 752 ms
+(955 MB/s)`, `restored 40251 tokens (live) in 53.3 ms`, `prompt 40258 tokens = 40251 reused + 7 read in 1154 ms` - the
+state the prompt reaches is a checkpoint of the appended entry, it lands as live, no `the entry is gone`. Over the run:
+`0/0 writes/reads failed, 0 reads fell back on damage`, `not restored` = 0. The disk was near its budget
+(`on disk 81 (74567 MiB)` of 76800 MiB), so `40 removed for the budget` lines appear - LRU removals, not refusals.
+
+**The version rule held**: `project(strata VERSION 0.1.55)` is unchanged, the engine names itself `0.1.55-local`,
 and the build number lives only in the package folder and manifest (`0.1.55.3-...`). The index identity hash is
 built from the settings and the engine's version string (`conversation_file.cpp:891` writes the pair
 `"engine", c.engine_version`; `generate.cpp:10507` sets it to `STRATA_VERSION`), so a package folder named
