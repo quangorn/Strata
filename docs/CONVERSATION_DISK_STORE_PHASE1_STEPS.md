@@ -678,10 +678,21 @@ the RAM cache: `restored 36690 tokens (checkpoint) in 81.1 ms`, `prompt 36697 to
 (phase 13), 96 writes with 0 RAM hits (phase 14), and phase 15 never queued the image. Chasing the window by hand is
 not worth the traffic: the path is covered offline by the store test (the read of the queued image's id finds the
 appended entry, `conversation_disk_test` 249 checks). In normal use the log lines to watch are
-`RAM hit: N tokens back from the write queue (M MiB, no disk) in X ms`,
-`disk hit: N tokens, ..., after X ms waiting for its write` with `restored N tokens (live)`, and the refusal
-`N tokens not restored (the entry is gone (its write failed, or the budget removed it))`; every scripted run on
-`0.1.55.11` printed zero `not restored` lines.
+**A disk read refused by the RAM preflight, measured on a live session.** A request of 163 528 prompt tokens matched a
+stored entry of 163 466 tokens, and the read asked for its RAM first (`generate.cpp:14397`, `make_ram(need, floor,
+evicted, mem)`, `floor = --conversation-cache-min-free-mib = 512 MiB`): this entry holds 83 K/V blocks (1406.9 MiB)
+and 31 state blocks (3490.4 MiB), so `need = 4897.3 MiB`; `4897.3 + 512 = 5409.3 MiB` is above the 5391 MiB the host
+had free, and the read refused: `conversation disk: read of 163466 tokens failed after 4 ms (not enough RAM:
+5391 MiB available, source meminfo)`, `conversation disk: 163466 tokens not restored (not enough RAM: 5391 MiB
+available, source meminfo); reading the prompt`, and the prompt was read from 0 in the batched RAM path:
+`prompt 163528 tokens = 0 reused + 163528 read in 67112 ms (2436.6 tok/s)`. The entry stays on the disk: a preflight
+refusal is not a removal. A long conversation grows its state list with every append (the state positions of this one
+include the checkpoints of the day's traffic: 9 601, 79 700, 81 047, 132 287, 148 780, 155 566 tokens), and a disk
+read asks for the payload of **every** block at once, while the prompt path reads in batches of 2048 tokens. Reading
+the code, a lower `--conversation-cache-min-free-mib` or more free RAM passes this preflight; **not measured**.
+So in the daily logs, `not restored (not enough RAM ...)` is the preflight's rule, and the lines to watch for the id
+path are `not restored (the entry is gone ...)` (should stay absent), `RAM hit: ...`, and
+`disk hit: ..., after X ms waiting for its write`.
 
 **The version rule held**: `project(strata VERSION 0.1.55)` is unchanged, the engine names itself `0.1.55-local`,
 and the build number lives only in the package folder and manifest (`0.1.55.3-...`). The index identity hash is
