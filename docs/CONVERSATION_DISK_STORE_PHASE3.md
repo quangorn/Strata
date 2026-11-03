@@ -174,7 +174,12 @@ disappear" is the same tool, not a new one.
 ## Validation on hardware
 
 Not run. The measured targets are CONVERSATION_DISK_STORE_MEASUREMENTS.md's: 14 429 MiB of 21 118 MiB duplicated, and on the old drive 21-26% shared per
-write. The run: the same day of agent sessions with the same `.idx` reader, plus the phase 1 and 2
+write. The baseline moved, measured on this PC in the folder the live traffic serves: **at 20:31 on 2026-11-03** —
+58 entries, 76 397 MiB, the duplicated K/V 4364 MiB = 12.0%; **at 00:53 on 2026-11-04** — 37 entries,
+74 939 MiB, 18 892 MiB = 43.1% of the K/V, 25.2% of the store; **at 07:29 on 2026-11-04** — 35 entries,
+76 155 MiB, **16 914 MiB = 36.3% of the K/V, 22.2% of the store**, the biggest pair sharing 197 120 tokens
+of one dialogue. `0 superseded` in every one of the 403 writes of the phase-1 era.
+The run: the same day of agent sessions with the same `.idx` reader, plus the phase 1 and 2
 numbers (bytes per day split by K/V and states, QUIT duration, waits, restore time, `not read`).
 Restore time is the number to watch: a pack is not the single sequential file of today, and a
 restore of a 165K-token conversation was 5.6 s at 643 MB/s on the 2x CMP box
@@ -192,7 +197,17 @@ restore of a 165K-token conversation was 5.6 s at 643 MB/s on the 2x CMP box
   but the start-up scan must remove the old namespace, and this is a test.
 - **Complexity.** This phase is bigger than phases 1 and 2 together. It is justified only if the
   measurements after phase 2 still show the duplicated prefix as the dominant cost of the disk; if
-  they do not, the honest answer is to stop at phase 2.
+  they do not, the honest answer is to stop at phase 2. Measured on this PC in the folder the live traffic
+  serves: **at 20:31 on 2026-11-03** — 58 entries, 76 397 MiB, the duplicated prefix 4364 MiB (12.0% of the
+  K/V, 5.7% of the store) against 40 083 MiB of states (52%); **at 00:53 on 2026-11-04** — 37 entries,
+  74 939 MiB, the duplicated prefix 18 892 MiB (43.1% of the K/V, 25.2% of the store) against
+  31 076 MiB of states (41.5%), the biggest pairs sharing 116 022-197 120 tokens of one dialogue;
+  **at 07:29 on 2026-11-04** — 35 entries, 76 155 MiB, the duplicated prefix **16 914 MiB (36.3% of the
+  K/V, 22.2% of the store)** against 29 612 MiB of states (38.9%). The share moves with what the budget
+  keeps, the states are the store's largest part in every snapshot, and the long-prefix copies are what
+  phase 1 cannot stop (the chain rule sends a continuation to a new entry). Phase 3 is judged beside
+  phase 2's state window, not against the baseline's 68.3%, and the honest answer may be to stop at
+  phase 2.
 - **Static analysis, unconfirmed.** The duplication numbers are measured by that file's `.idx`
   reader; everything else here is read, not run.
 - **Conversations that compaction makes known-stale, to be researched separately.** When the client

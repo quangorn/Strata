@@ -63,7 +63,10 @@ Out (later phases, named at the end):
   writer, `shared_ptr` entries in `ConversationCache`;
 - deduplication across conversations, reference counts, garbage collection;
 - any change to the session files of the HTTP API (`/slots/0?action=save|restore`);
-- the other backends: the tier is not run on HIP, SYCL or Metal (`docs/DETAILS.md:864`).
+- the other backends: the tier's source is in the SYCL and Metal build lists (`sycl/CMakeLists.txt:258`,
+  `metal/CMakeLists.txt:102`) and must keep compiling there; HIP, SYCL and Metal are not built and not run
+  with the tier, and this fork builds the engine on this PC for this card only (CUDA) — see the tier's
+  section in [DETAILS.md](DETAILS.md).
 
 The default path stays byte-identical: the tier is already opt-in through `--conversation-disk-dir`,
 and its files are named `strata-conv-*`, a namespace nothing else uses
@@ -310,22 +313,40 @@ all one line each:
 
 ## Validation on hardware
 
-Not run. Phase 1 changes no measured number by itself, so the plan is a comparison, not a target:
+Part of it is measured on this PC; the comparison is not run. Measured on two serving profiles with real
+agent traffic, 2026-11-03/04 — the numbers, the launch lines and the log lines are in
+[CONVERSATION_DISK_STORE_PHASE1_STEPS.md](CONVERSATION_DISK_STORE_PHASE1_STEPS.md), "Live traffic on the
+serving profile":
 
-- same PC and profile as the measurements (`--conversation-cache-mib 2048 --conversation-cache-slots 8
-  --conversation-cache-min-free-mib 512 --conversation-disk-dir E:\strata-conv-data
-  --conversation-disk-mib 153600 --conversation-disk-persist on`), a day of agent sessions, against
-  a same-day run without the change;
-- from the log: bytes written, and the share of it that is new blocks versus a rewrite (the new
-  per-block lines make this the first time the log can answer it); bytes read; entries and blocks
-  on disk; the `not read` count; the moments a request waited for a write;
-- the expected saving is the rewrite share of the measured 88 306 MiB written for 6 097 745 tokens,
-  plus the 14 429 MiB of 21 118 MiB the store holds twice. It cannot be known before
-  the run: the current log does not say whether a write was a rewrite. That is one of the reasons to
-  add the per-block lines first;
-- startup with a full folder (13 entries, 28.5 MiB of indexes in the measurement) and the index read
-  time, since v2 indexes are larger (full ids per state, as today, plus the block table);
-- every backend the touched files compile for, and the Windows build.
+- bytes written, split into new blocks and whole images: 32 appends of 403 writes (7.9%), 323 955 MiB of
+  deltas against 383 782 MiB of published images — **59 825 MiB of rewrite avoided**; the density of an
+  append is 4.39 KB/token, of a new entry 9.82, the baseline day 15.2. On the live run alone the append
+  share is 9.1% of 77 writes;
+- bytes read, entries and blocks on disk: 102 disk hits, 58 146 MiB at 546 MB/s, 3 662 976 prompt tokens
+  given back over 12.9 h; the folder holds 35 conversations, 76 155 MiB (K/V 46 543, states 29 612), and the
+  K/V duplicated across shared token prefixes is 16 914 MiB = 36.3% of the K/V (12.0% at the 20:31 snapshot
+  of the same run, 43.1% at 00:53, against the baseline's 68.3%);
+- a read's scope: the bytes read equal exactly the blocks below the state it lands on (34 reads matched to
+  their entries), 87-100% of the entry;
+- the `not read` count (7 refusals in 12.9 h, 187 216 prompt tokens read from 0 after them; 1 refusal in the
+  smaller-cache run) and the budget's removals by use (103); 0 RAM hits, 0 dropped on RAM refusals,
+  0 failed writes/reads, 0 fallbacks; 12 waits for RAM in the live run (50.7 s), one `waited 15486 ms for
+  3 queued writes (their RAM was needed)` in the smaller-cache run;
+- the RAM side, from the same logs: 88 superseded copies dropped from the cache in the live run, and 2609 of
+  its 2738 parks reused the retained K/V allocation (42.6% of the era's snapshot bytes reused);
+- start-up with a full folder: 68 conversations, 75 985 MiB (and 67, 69 965 MiB on the smaller-cache
+  profile), `0 refused`, `0 stale files removed`; the index rewrite a publish costs is 2.4 MiB at 88 948
+  tokens, 5.1 MiB at 231 677, 15.3 MiB at 163 466, 3.8 MiB at 165 807;
+- the Windows build: every engine from `0.1.55.3` to `0.1.55.12` is built on this PC and has served.
+
+Not run, and no saving claimed: the same day of agent sessions against a same-day run without the change;
+a read of a damaged block on hardware (`0 reads fell back on damage` in every run); a read of a queued
+image (0 RAM hits over all the runs, one `after X ms waiting for its write` in the scripted phase 11); the
+disk pin in use (the folder has 0 pinned state blocks); a write refused by the free-space rule; the
+crutch's drop line (0 dropped so far, and 0 `forced write, the whole image` lines in the live run); the
+time of the start scan. The write line's MiB and MB/s count the whole published image, not the bytes
+appended, and the `not read` estimate counts the whole entry, not the blocks a read needs — both recorded
+as phase 2 step 9.
 
 ## Risks and open questions
 
@@ -335,15 +356,21 @@ Not run. Phase 1 changes no measured number by itself, so the plan is a comparis
   would otherwise rewrite the format anyway. Test 1 is the gate.
 - **Index size.** A 300 000-token conversation keeps full ids per state: about 8 MB with 7 states.
   Rewriting that on every append is a few tens of milliseconds; at start it is one read. No digest
-  short-cut is proposed, because `best()` needs the ids to compute the match length.
+  short-cut is proposed, because `best()` needs the ids to compute the match length. Measured on this PC
+  2026-11-03: the rewrite follows the **number of states**, not the token count — 2.4 MiB for 88 948
+  tokens with 7 states, 5.1 MiB for 231 677 tokens with 7 states, 15.3 MiB for 163 466 tokens with 31
+  states (a day of writes at a 16 384-token checkpoint interval). The time the scan spends on a full
+  folder is not measured.
 - **No compaction in phase 1.** Files only grow with the conversation's token count, so there is no
   garbage to collect — until phase 2 makes flushes frequent and phase 3 shares blocks between
   conversations.
 - **`last_used_s` and the LRU across restarts.** Written with the next publish; a crash loses the
   order since the last write, which the budget tolerates.
-- **Static analysis, unconfirmed.** Everything above about the current code is read, not run
-  (except the measurements quoted from CONVERSATION_DISK_STORE_MEASUREMENTS.md). Nothing here is
-  measured on hardware.
+- **Static analysis, unconfirmed.** The paragraphs above about the code are read, not run. What has been
+  measured on this PC is in "Validation on hardware" above and in the steps file's "Live traffic on the
+  serving profile"; the estimate that the `not read` rule counts the whole entry
+  (`conversation_disk.cpp:1592-1598`, `generate.cpp:14424`) is read from the code, and the live refusals
+  quoted 1600-2116 MiB for 7539-token reads whose entries are no longer in the folder.
 
 ## What phases 2 and 3 add on top (one line each)
 

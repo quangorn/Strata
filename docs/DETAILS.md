@@ -877,10 +877,37 @@ three, and each came back from the disk with the same answer as before the resta
 one-slot RAM cache that pushed conversations to the disk while the engine ran: a 165,557-token conversation came back in 6.4 s
 instead of a 77.8 s cold read; the background writes ran at 80-370 MB/s while the next prompt was read, and a request
 waited for a write once (0.9 s). Unit test: `conversation_disk_test` (CPU only, `-DSTRATA_BUILD_CONVERSATION_TESTS=ON`).
-The block store above (append, keep-on-read, the budget by use) is measured by that test alone so far; the numbers in
-this paragraph are the file-per-conversation version, and the comparison the block store was written for has not been
-run on hardware yet.
-Not run on Windows, HIP, SYCL or Metal.
+The block store above (append, keep-on-read, the budget by use) is measured on this PC's traffic
+(RTX 4080 16 GB, 48 GB RAM, Windows 10, engines `0.1.55.3` to `0.1.55.12`, real agent requests through
+`/v1/chat/completions`, plus the scripted runs of phases 10-15). Two serving profiles ran with it, on
+2026-11-03: `iq2_xs-max_ram` from 14:37, with `--conversation-cache-mib 8192
+--conversation-cache-slots 8 --conversation-cache-min-tokens 16384
+--conversation-cache-min-free-mib 0 --vram-reserve-mib 200 --max-context 262144 --kv q4_0
+--kv-resident 32768 --spec 4 --spec-min-p 0.50 --conversation-disk-dir E:\strata-conv-data
+--conversation-disk-mib 76800 --conversation-disk-persist on`; and `iq2_xs-low_ram` from 08:29 to 15:25,
+same disk parameters, `--conversation-cache-mib 6144 --vram-reserve-mib 700`. Over the block store's
+403 writes (both logs, scripted and live), 32 were appends (7.9%), and those 32 wrote 323 955 MiB of
+deltas where their published images are 383 782 MiB, so **59 825 MiB of rewrite is avoided**; a disk read
+takes exactly the blocks below the state it lands on — 87-100% of the entry it reads, the saving being the
+states above that state. In 12.9 h of live traffic on `iq2_xs-max_ram`: 5141 requests, 557.5 M prompt
+tokens (98.8% reused), 77 writes (7 appends, 9.1%), 102 disk hits (3 662 976 tokens, 58 146 MiB at
+546 MB/s), 103 budget removals, 12 waits for RAM (50.7 s), 7 `not read` refusals, 0 failed writes/reads,
+0 fallbacks, 0 RAM hits, 0 `not restored`, no engine exit. On the smaller cache, the `iq2_xs-low_ram` run
+(234 requests, 22.2 M prompt tokens, 98.9% reused) wrote 4 (2 appends), read back 4 disk hits
+(127 755 tokens at 914 MB/s), refused 1 read, and once `waited 15486 ms for 3 queued writes (their RAM
+was needed)`; it saved its 69 conversations for the next start in 16.8 s. The store holds 35 conversations,
+76 155 MiB (K/V 46 543, states 29 612); the K/V duplicated across shared token prefixes is 16 914 MiB —
+36.3% of the K/V, 22.2% of the store — and the biggest pair shares 197 120 tokens of one dialogue. The
+baseline measure on the file-per-conversation store was 68.3%, and its dominant case (the same conversation
+written whole again as it grew) is what the live traffic still produces, because a continuation whose image
+keys changed goes to a new entry with its whole prefix; `0 superseded` in every write means the supersede
+rule has had nothing to remove. The comparison the block store was written for (a day against a same-day
+run without the change) has not been run, so no saving is claimed. The numbers in the paragraph above are
+the file-per-conversation version.
+The tier is built and served on Windows with CUDA on this PC. Its source is in every backend's build list
+(`CMakeLists.txt:700`, `sycl/CMakeLists.txt:258`, `metal/CMakeLists.txt:102`) and must keep compiling
+there; HIP, SYCL and Metal are not built and not run with the tier, and this fork builds the engine on this
+PC for this card only, so no packages for other hardware are made or planned.
 
 ### API request monitor
 

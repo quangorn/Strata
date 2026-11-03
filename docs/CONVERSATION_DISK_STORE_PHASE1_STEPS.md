@@ -725,10 +725,135 @@ built from the settings and the engine's version string (`conversation_file.cpp:
 `"engine", c.engine_version`; `generate.cpp:10507` sets it to `STRATA_VERSION`), so a package folder named
 `0.1.55.3` does not empty the store, and the start line reports `0 refused`.
 
+**Live traffic on the serving profile, measured 2026-11-03/04.** The engine `0.1.55.12` (the crutch build,
+exe md5 `756882d7...`) serves `iq2_xs-max_ram` since 14:37 on 2026-11-03 with `--pack
+C:\Projects\Strata-data\packs\swift-iq2_xs --native .../Swift-Qwen3.8-Flash-Next-GSQ-RCO-IQ2_XS-00001-of-00002.gguf
+--ple-gguf (the same file) --expert-profile C:\Projects\Strata-fork\data\expert-profile.bin
+--expert-cache auto --prefill auto --spec 4 --mtp C:\Projects\Strata-data\mtp\rt --max-context 262144
+--kv q4_0 --kv-resident 32768 --vision --vram-reserve-mib 200 --conversation-cache-mib 8192
+--conversation-cache-slots 8 --conversation-cache-min-tokens 16384 --conversation-cache-min-free-mib 0
+--spec-min-p 0.50 --conversation-disk-dir E:\strata-conv-data --conversation-disk-mib 76800
+--conversation-disk-persist on`; its start line is `68 conversations from earlier runs (75 985 MiB),
+0 refused ... 0 stale files removed`. Measured three times on this run, with real agent traffic through
+`/v1/chat/completions`. At 20:03 (2.5 h): 559 requests, 45.87 M prompt tokens (98.2% reused), 843 127
+tokens read from 0, 751.6 s of prompt reading, 7 writes (1 append), 11 disk hits (5272 MiB at 531 MB/s),
+250 945 prompt tokens given back, 11 budget removals. At 00:53 (7.3 h): 3230 requests, 312.9 M prompt
+tokens (98.6% reused), 4.26 M tokens read from 0, 4283.8 s of prompt reading, 54 writes (5 appends =
+9.3%, 49 new entries), 90 disk hits (2 889 519 tokens, 46 239 MiB at 542 MB/s), 78 budget removals,
+7 waits for RAM (34.1 s), 6 `not read` refusals. At 07:29 on 2026-11-04 (12.9 h): 5141 requests,
+557.5 M prompt tokens (98.8% reused), 6.56 M tokens read from 0, 7086.5 s of prompt reading, 77 writes
+(7 appends = 9.1%, 70 new entries), 102 disk hits (3 662 976 tokens, 58 146 MiB at 546 MB/s),
+103 budget removals, 12 waits for RAM (50.7 s), 7 `not read` refusals, the log reports 158 401 MiB
+written at 370 MB/s. In all three snapshots: 0 RAM hits, no read of a queued image, 0 failed writes/reads,
+0 fallbacks, 0 dropped on RAM refusals, 0 `not restored`, no engine exit.
+
+**The same engine with the smaller cache, measured on the `iq2_xs-low_ram` profile, 2026-11-03.** The
+launch differs in two values: `--vram-reserve-mib 700 --conversation-cache-mib 6144` (and
+`--conversation-cache-min-free-mib 0`); the disk tier's parameters are the same. The run started at
+08:29 and ended by 15:25 (the log ends with `end: 69 conversations kept on the disk for the next start
+(74 652 MiB)`, after `saved for the next start in 16.8 s`). It served 234 requests, 22.2 M prompt tokens
+(98.9% reused), 234 542 tokens read from 0, 305.2 s of prompt reading; 4 writes (2 appends), 4 disk hits
+(127 755 tokens, 2912 MiB at 914 MB/s), 1 `not read` refusal (`its 764 more tokens read in ~0.4 s, its
+file (1494 MiB) in ~1.7 s`), 1 wait for RAM of **15 486 ms** (`waited 15486 ms for 3 queued writes
+(their RAM was needed)`), 10 cache superseded drops, 16 of 26 parks reused the retained K/V, 0 RAM hits,
+0 budget removals, 0 failed writes/reads, 0 fallbacks. Its start line: `67 conversations from earlier
+runs (69 965 MiB), 0 refused, 0 stale files removed`. This is the first small-RAM run with the tier, and
+the first live `waited N ms for N queued writes` line.
+
+**The append share, measured over all the block store's runs on this PC** (403 writes, scripted and live,
+of both engine logs): 32 appends (7.9%) and 371 new entries (92.1%). The appends wrote 323 955 MiB of
+deltas where the published images are 383 782 MiB: **59 825 MiB of rewrite avoided**. Density: 4.39
+KB/token for appends, 9.82 KB/token for new entries; the baseline file-per-conversation day was
+15.2 KB/token. So for 92.1% of the writes phase 1 costs the same bytes as before, and the plan's largest
+win is bounded by the chain rule: a continuation whose prompt-cache picture changed inside the reused
+prefix is not a prefix, and its write starts a new entry. The live traffic hits that rule constantly; the
+offline test of it ("The prefix rule, measured offline") is what the log shows over and over
+(`new entry: no stored conversation is a prefix of this one's N tokens`).
+
+**Supersede removes nothing, and the duplication depends on what the budget keeps.** Every one of the 403
+writes logs `0 superseded`. Reading the folder's `.idx` files with the baseline's method (for each entry,
+the longest token prefix it shares with any other entry, times its own K/V bytes per token), measured on
+this PC with the traffic running: **at 20:31 on 2026-11-03** — 58 entries, 4364 MiB duplicated = 12.0% of
+the store's 36 314 MiB of K/V, 5.7% of the 76 397 MiB store, the biggest live shared prefixes 7493-7664
+tokens (the system prompt, 12 entries), the pairs sharing 36 700-60 904 tokens being the scripted
+conversations of phases 10-13. **At 00:53 on 2026-11-04** — 37 entries, 18 892 MiB duplicated = **43.1% of
+the 43 863 MiB of K/V, 25.2% of the 74 939 MiB store**, and the biggest pairs share 116 022-197 120
+tokens, all of them copies of one client conversation (`26f940286177d623-*`): entries of 116k, 193k, 200k,
+225k, 227k, 235k tokens of the same dialogue. **At 07:29 on 2026-11-04** — 35 entries, 16 914 MiB
+duplicated = **36.3% of the 46 543 MiB of K/V, 22.2% of the 76 155 MiB store**, the biggest pair sharing
+197 120 tokens of the same dialogue (`-120` and `-116`), 7 state blocks per entry, 29 612 MiB of states.
+That is the baseline's case — the same conversation written whole again as it grew — reproduced by live
+traffic, because every continuation whose image keys changed goes to a new entry and carries its whole
+prefix with it; the append keeps one entry only when the chain stays identical, which on this profile
+happens on 9.1% of the writes. The number moves with the folder: the budget left 35 entries at the end of
+the run (103 removals), so the share depends on which conversations are left. `pinned` state blocks in the
+folder: **0** — the disk pin has never had a conversation to protect in live traffic, and its tests stay
+offline. Sharing blocks between entries is phase 3.
+
+**What a read takes, measured.** Matching the disk hits against the entries they read (the entries still in
+the folder), the bytes read equal exactly the blocks below the landing state: the ratio read/needed is
+**1.00** for every matched hit — 27 reads across the snapshots of 2026-11-03, 7 more at 07:29 on
+2026-11-04. The share of the entry read is 87-100%, and it is the **states above the landing state** that
+phase 1 saves, not the K/V: the 18 671-token read took 847 MiB of a 960 MiB entry, the 73 867-token read
+1328 MiB of 1445 MiB, the 104 039-token read 1574 MiB of 1710 MiB; at the end of the run the reads land
+deep — a 188 735-token state read 2984 MiB of a 3112 MiB entry, and a read that lands on the entry's
+deepest state takes 100% of it (3096 MiB of 3096 MiB). The plan's expectation ("a block read is ~190 MiB
+for 7362 tokens, 8% of the file") has not been seen on live traffic: the shallow reads are the ones the
+economics rule refused (below), and those entries are no longer in the folder. The states are the store's
+bulk: 40 083 MiB of 76 397 MiB at 20:31, 31 076 MiB of 74 939 MiB at 00:53, 29 612 MiB of 76 155 MiB at
+07:29.
+
+**The `not read` rule counts the whole entry, not the blocks a read needs.** Read from the code:
+`Match.bytes` is the entry's `.bin` plus its index (`conversation_disk.cpp:1592-1598`), and
+`generate.cpp:14424` divides it by the mean read speed to compare a disk read with reading the added
+tokens. The estimate therefore speaks of the whole entry, while the read takes the blocks it needs (the
+point above). In the live run, seven refusals quote a "file" of 1600, 2116, 2371 and 2460 MiB for reads of
+7539-7586 tokens — the system prompt's prefix; the `iq2_xs-low_ram` run refused one read of 764 added
+tokens whose "file" was 1494 MiB. The same run's real reads of 9601-token states cost 201 MiB, and the
+matched reads above show that a read takes exactly the blocks below its state, so for a shallow state the
+entry's size over-states the read by several times. After each refusal in the live run the client's prompt
+was read from 0: 67 727 tokens in 30.2 s at 2.5 h, 149 521 tokens in 61.3 s at 7.3 h, **187 216 tokens in
+78.6 s** at 12.9 h, where the refused reads would have given back 37 695, 45 281 and 52 878 tokens. The
+refused entries are not in the folder, so their state positions come from the log lines, not from the
+files: the cost of the refusals is measured, the exact read time for them is static analysis. The estimate
+has to count the blocks a read needs; recorded as phase 2 step 9.
+
+**The write line's MiB and MB/s are the whole image, not the bytes written.** `bin_bytes` sums every block
+of the published entry and `stats_.bytes_written` adds it, so an append logs
+`wrote 88948 tokens (appended): 1666 MiB in 2 blocks (1 new kv, 9.6 MiB; 1 new state, 112.6 MiB),
+204 ms (8554 MB/s)` — the device wrote 122.2 MiB in 204 ms, about 600 MB/s. The per-block lines are the
+truth. Over the phase-1 runs the log reports 383 782 MiB "written" while **323 955 MiB** went to the disk.
+Recorded as phase 2 step 9.
+
+**The RAM side, from the same logs.** The cache's own dedup runs on live traffic: `conversation cache:
+dropped N superseded copies of this conversation` appears 12 times in the live run's first 2.5 h, 36 times
+at 7.3 h, **88 times at 12.9 h**; over the phase-1 era of both engine logs, **475 lines** (475 copies).
+Every line drops exactly one copy, the one a turn back, before the new park is admitted. The K/V sharing
+shows up in the park's own line as `reused_kv_bytes`: 177 of the live run's 194 parks reused the retained
+K/V allocation at 2.5 h, 1869 of 1928 at 7.3 h, **2609 of 2738 at 12.9 h** — over the phase-1 era, 5689 of
+6807 parks, **4739.2 GiB reused out of 11 115.4 GiB of snapshots (42.6%)**. The line that would report a
+*partial* reuse (`retained K/V reused for N of its M tokens`, `generate.cpp:10732`) appears **0** times in
+both logs, so every reuse that ran was complete; the RAM dedup's number comes from `reused_kv_bytes`, and
+the field is not documented in [DETAILS.md](DETAILS.md).
+
+The disk side is the append: a conversation that grows gets its delta (measured above), so the store never
+rewrites the prefix it holds; `0 superseded` in every write means the store has no shorter copy of a chain
+to remove. The duplication that stays is the one phase 1 cannot reach: entries of the same dialogue whose
+image-key chains diverge, 43.1% of the K/V at the end of the live run — phase 3's work, not phase 1's.
+
+**The index size, now measured**: the rewrite a publish costs grows with the entry's states — 2.4 MiB at
+88 948 tokens, 5.1 MiB at 231 677, and 15.3 MiB at 163 466 (the scripted run of phase 15); the start scan
+takes a full folder in whole with `0 refused` (68 conversations, 75 985 MiB) and the time of the scan is
+**not measured**. The plan's other validation items stay not run: the same day against a same-day run
+without the change, a damaged block read on hardware, a read of a queued image (0 RAM hits over all the
+runs), the disk pin, a full-volume write refusal, the crutch's drop line (0 dropped so far).
+
 ## What each step must not touch
 
 - the session files of the HTTP API (`/slots/0?action=save|restore`) - keep v1 byte-identical,
   every phase;
-- the other backends - the tier is not run on HIP, SYCL or Metal ([DETAILS.md](DETAILS.md));
+- the other backends - the tier's source stays in every backend's build list (`sycl/CMakeLists.txt:258`,
+  `metal/CMakeLists.txt:102`), so it must keep compiling there. This fork builds the engine on this PC for
+  this card only (CUDA), and HIP, SYCL and Metal are not run with the tier ([DETAILS.md](DETAILS.md));
 - the default path of a conversation without `--conversation-disk-dir` - byte-identical, as the
   plan requires.

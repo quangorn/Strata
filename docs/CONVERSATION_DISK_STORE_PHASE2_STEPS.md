@@ -63,7 +63,7 @@ Decisions already agreed (2026-11-03):
 | 6 | **the Windows writer priority** | `src/core/conversation_disk.cpp` | the writer stops competing with decode: `THREAD_PRIORITY_BELOW_NORMAL`, not `IDLE`, beside the Linux `PRIO_PROCESS 10` |
 | 7 | **flag plumbing in the launcher and the server** | `strata_cli/launch/settings.py` (check only), `serve/server.py`, `tests/terminal/test_launch.py` | the preset → launch-file → engine round trip keeps the number; the QUIT wait knows a debounce can be pending |
 | 8 | **the tests of the plan, 1-10** | `conversation_disk_test.cpp` | debounce, reset, read cancels, eviction bypasses, QUIT bypasses, one state per flush, growth threshold, shared ownership, take during a write, flag `0` |
-| 9 | **the docs and the log line** | `docs/DETAILS.md:814-869`, the writer's log | the tier's section describes the debounce, the flag and the two write shapes; one log line per flush says K/V versus state and why a state was written |
+| 9 | **the docs, the log line and the two numbers the log gets wrong** | `docs/DETAILS.md:814-869`, the writer's log, `conversation_disk.{hpp,cpp}`, `generate.cpp` | the tier's section describes the debounce, the flag and the two write shapes; one log line per flush says K/V versus state and why a state was written; the summary and the totals count the bytes appended, not the published entry; and `not read` weighs the blocks a read needs, not the entry's size |
 
 Steps 2 and 3 may be written in one branch (the event seam is not exercised until the queue exists),
 but they land as separate commits. Step 4 needs step 3's forced/debounced split; step 5 needs step 1's
@@ -266,6 +266,21 @@ the blocks were written one step at a time.
 - the writer's log: one line per flush with its shape, the K/V and state bytes it added, and the
   tokens since the deepest stored state. The validation's "bytes written per day, split by K/V and
   states" comes from these lines.
+- **the write line's MiB and MB/s must be the bytes appended, not the published entry.** Measured on this
+  PC 2026-11-03/04: `bin_bytes` sums every block of the entry (`conversation_disk.cpp:1592-1598`) and
+  `stats_.bytes_written` adds it, so an append logs `wrote 88948 tokens (appended): 1666 MiB in 2 blocks
+  (1 new kv, 9.6 MiB; 1 new state, 112.6 MiB), 204 ms (8554 MB/s)` while the device wrote 122.2 MiB in
+  204 ms (~600 MB/s). Over the phase-1 runs the log reports 383 782 MiB written and 323 955 MiB went to
+  the disk. The per-block lines are already right; the summary and the totals line have to count the
+  delta. This is code in `conversation_disk.cpp` with its tests, not a docs change.
+- **the `not read` estimate must count the blocks a read needs, not the entry's bytes.** `Match.bytes` is
+  the entry's `.bin` plus its index (`conversation_disk.cpp:1592-1598`), and `generate.cpp:14424` divides
+  it by the mean read speed. Measured on the live runs: seven refusals quote a "file" of 1600, 2116, 2371
+  and 2460 MiB for 7539-7586-token reads, and the smaller-cache run refused one read of 764 added tokens
+  whose "file" was 1494 MiB, while the reads that ran took exactly the blocks below the state they landed
+  on (ratio read/needed 1.00, 87-100% of the entry). The rule stays; the number it compares has to be the
+  bytes below the deepest state a read can land on. Code in `conversation_disk.{hpp,cpp}` and
+  `generate.cpp`, tested beside step 8.
 - [CONVERSATION_DISK_STORE_PHASE2.md](CONVERSATION_DISK_STORE_PHASE2.md) is not edited: this file
   records where each step stands, as phase 1's steps file does.
 

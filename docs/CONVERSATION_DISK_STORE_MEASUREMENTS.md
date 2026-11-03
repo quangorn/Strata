@@ -93,7 +93,7 @@ The old note's rule of thumb — "the fixed part is the live state plus 4-6 chec
 |---|---|
 | 47 writes of ~1 878 MiB mean on the new drive | the whole image is rewritten per eviction and per park — phase 1 appends instead |
 | 14 429 MiB of 21 118 duplicated, 68% | the same conversation, and the same system prompt, stored once per copy — phase 1 (append, drop the superseded entry) and phase 3 (one copy of a shared prefix) |
-| a 2 395 MiB file read for 7 362 tokens | a file is the unit; blocks make this ~190 MiB — phase 1 |
+| a 2 395 MiB file read for 7 362 tokens | a file is the unit; blocks make this ~190 MiB — phase 1. Measured on this PC 2026-11-03/04: a read takes exactly the blocks below the state it lands on (34 reads matched to their entries, ratio read/needed 1.00), which is **87-100% of the entry** — the saving is only the states above the landing state, and a read that lands on the entry's deepest state takes all of it. The shallow case (~190 MiB for 7362 tokens) has not been seen: the shallow reads are the ones the `not read` rule refused, and those entries are gone from the folder |
 | 4 waits at 1.4-2.7 s, QUIT in 3.9 s | the trigger still sits at eviction and QUIT; on a fast drive it is affordable but still a burst — phase 2 |
 | 15.2 KB/token, ~118 MiB per state | the K/V/state split, and the "one state or the whole chain per flush" question phase 2 leaves to this number |
 | `pinned` is not in the index, `used` is inside the payload | phase 1 moves both out of the payload |
@@ -116,9 +116,24 @@ image the disk already holds. Each piece now has a home:
 
 ## Still open
 
+- The duplication, measured on the store the block serves now (this PC, three snapshots of the live
+  folder): **at 20:31 on 2026-11-03** — 58 entries, 76 397 MiB, K/V 36 314 MiB, 4364 MiB duplicated =
+  12.0% of the K/V, 5.7% of the store, the live shared prefixes 7493-7664 tokens (the system prompt,
+  12 entries); **at 00:53 on 2026-11-04** — 37 entries, 74 939 MiB, K/V 43 863 MiB, **18 892 MiB
+  duplicated = 43.1% of the K/V, 25.2% of the store**, the biggest pairs sharing 116 022-197 120 tokens of
+  one dialogue; **at 07:29 on 2026-11-04** — 35 entries, 76 155 MiB, K/V 46 543 MiB, **16 914 MiB
+  duplicated = 36.3% of the K/V, 22.2% of the store**, the biggest pair sharing 197 120 tokens of the same
+  dialogue. The number moves with what the budget keeps (103 removals in the live run), and the case the
+  baseline measured (the same conversation written whole again as it grew) is what the live traffic still
+  produces: a continuation whose image keys changed goes to a new entry with its whole prefix, and
+  `0 superseded` in every one of the 403 writes means the supersede rule has nothing to remove. The rest is
+  phase 3's block sharing.
 - The pin still has no *semantic* disk side: phase 1 stores the flag, but nothing on the disk branches
-  from a prefix the way a suffix query does in RAM.
+  from a prefix the way a suffix query does in RAM. The folder has **0 pinned state blocks** in the live
+  traffic, so the disk pin is tested offline only.
 - `exit-only`'s measured cost on the old drive (40 writes, 197 GiB in a day, both disk hits from the
   QUIT save, `DETAILS.md:852-854`) is the argument for phase 2, not against `exit-only`.
-- Nothing here is measured for phases 1-3. Each phase document has its own validation plan, and the
-  numbers above are its baseline.
+- Phase 1 is measured in part on this PC (the numbers above, and "Live traffic on the serving profile" in
+  [CONVERSATION_DISK_STORE_PHASE1_STEPS.md](CONVERSATION_DISK_STORE_PHASE1_STEPS.md)). Phases 2 and 3 are
+  not measured on hardware. Each phase document has its own validation plan, and the numbers above are its
+  baseline.
