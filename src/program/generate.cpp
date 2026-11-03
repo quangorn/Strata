@@ -14379,7 +14379,9 @@ int main(int argc, char** argv) {
                 }
             }
             auto parked = conversations.best(ids, req_imgs, want_cvec);
-            std::optional<strata::core::SavedConversation> incoming;
+            // the shared image: the cache shares the bytes with the disk tier's writer (phase 2), and take() hands
+            // the allocation over instead of moving the image out
+            std::shared_ptr<strata::core::SavedConversation> incoming;
             // the disk tier holds a longer prefix than the session, a --batch slot or the RAM cache: restore that one
             if (conv_disk.enabled()) {
                 const auto on_disk = conv_disk.best(ids, req_imgs, want_cvec);
@@ -14419,7 +14421,7 @@ int main(int argc, char** argv) {
                         // what the read actually rebuilt: a damaged block falls back to an earlier state, and the
                         // prompt then starts again there (the estimate above is no promise, only a guess)
                         parked.tokens = (int64_t) image.live.ids.size();
-                        incoming.emplace(std::move(image));
+                        incoming = std::make_shared<strata::core::SavedConversation>(std::move(image));
                         // The image's `live` is the state the read lands on, checkpoint or not: a read restores the
                         // session with it, so this request resumes at its length as a live state.  The match's own
                         // `live` flag says only whether the entry's deepest key matched the prompt, and when the
@@ -14442,7 +14444,7 @@ int main(int argc, char** argv) {
             bool borrow = !incoming && stages.empty() && parked.tokens > std::max(resume, slot_tokens) &&
                           conversations.borrows(parked);
             if (!incoming && parked.tokens > std::max(resume, slot_tokens) && !borrow)
-                incoming.emplace(conversations.take(parked.index));
+                incoming = conversations.take(parked.index);
             if (incoming || borrow) slot_source = -1;
             // Reject the entire image before parking/overwriting the outgoing
             // state. Invalid entries can safely fall back to its existing prefix.
@@ -14501,7 +14503,7 @@ int main(int argc, char** argv) {
                                  tight <= 0 ? "CUDA0" : ("stage " + std::to_string(tight)).c_str(),
                                  (long long) (tight >= 0 ? restore_free[(size_t) tight] >> 20 : 0),
                                  (long long) strata::program::conv_cache::kRestoreFirstUseMib);
-                    auto retry = std::move(*incoming);
+                    auto retry = std::move(incoming);
                     incoming.reset();
                     if (!conversations.put(std::move(retry)))
                         std::fprintf(stderr, "strata serve: conversation cache: could not return the skipped snapshot\n");
@@ -14547,7 +14549,7 @@ int main(int argc, char** argv) {
                 ~ParkDrops() { f = nullptr; }
             } park_drops_reset{park_drops};
             if (park_async_env()) {
-                const bool drops_all = incoming.has_value() || borrow || slot_source >= 0 || want_cvec != cvec_cached;
+                const bool drops_all = incoming != nullptr || borrow || slot_source >= 0 || want_cvec != cvec_cached;
                 park_drops = [&, drops_all](const ConvCheckpoint& c) {
                     return drops_all || (int64_t) c.ids.size() > resume || !starts_with(c.ids, c.imgs);
                 };
@@ -14568,7 +14570,7 @@ int main(int argc, char** argv) {
                                          "this request starts with; taking it instead of borrowing\n");
                     borrow = false;
                     if (const size_t at = conversations.index_of(parked.serial); at != SIZE_MAX)
-                        incoming.emplace(conversations.take(at));
+                        incoming = conversations.take(at);
                     if (!park_current(incoming ? incoming->bytes() : 0)) {
                         std::printf("ERR %s\n", err.c_str());
                         return 1;

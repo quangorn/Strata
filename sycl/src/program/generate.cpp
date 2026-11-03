@@ -10177,8 +10177,8 @@ int main(int argc, char **argv) try {
                         }
                 }
             const auto parked = conversations.best(ids, req_imgs, want_cvec);
-            std::optional<strata::core::SavedConversation> incoming;
-            if (parked.tokens > std::max(resume, slot_tokens)) incoming.emplace(conversations.take(parked.index));
+            std::shared_ptr<strata::core::SavedConversation> incoming;
+            if (parked.tokens > std::max(resume, slot_tokens)) incoming = conversations.take(parked.index);
             if (incoming) slot_source = -1;
             // Reject the entire image before parking/overwriting the outgoing
             // state. Invalid entries can safely fall back to its existing prefix.

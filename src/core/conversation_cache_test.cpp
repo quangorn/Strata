@@ -127,13 +127,30 @@ int main() {
         auto match = cache.best(a, {}, true);
         check(match.tokens == 3 && match.live, "A/B/A: recover A");
         auto restored = cache.take(match.index);
-        check(restored.live.ids == std::vector<int32_t>({1, 2, 3}), "taking selected A preserves identity");
+        check(restored->live.ids == std::vector<int32_t>({1, 2, 3}), "taking selected A preserves identity");
         check(cache.size() == 1 && cache.best(b, {}, true).tokens == 3, "B remains parked");
         check(cache.bytes() == image({9,8,7}).bytes(), "byte accounting after take");
         check(cache.put(std::move(restored)), "park returned A as newest");
         check(cache.put(image({5, 6})), "evict oldest by slot limit");
         check(cache.best(b, {}, true).tokens == 0 && cache.best(a, {}, true).tokens == 3, "B evicted before A");
         check(cache.evictions() == 1, "eviction counter");
+    }
+    {   // phase 2's gate: the cache shares the image's bytes instead of owning the only copy (docs/CONVERSATION_DISK_STORE_PHASE2_STEPS.md, step 1)
+        auto owned = std::make_shared<SavedConversation>(image({1, 2, 3}));
+        const size_t bytes = owned->bytes();
+        ConversationCache cache(bytes * 2, 2);
+        check(cache.put(owned), "park the shared image");
+        check(owned.use_count() == 2, "the cache holds the same allocation, not a copy");
+        check(cache.bytes() == bytes, "a park counts the image once");
+        auto back = cache.take(cache.best(a, {}, true).index);
+        check(back.get() == owned.get(), "take hands the allocation over");
+        check(back.use_count() == 2 && cache.bytes() == 0,
+              "the taker and the original owner share it; the cache counts nothing");
+        check(cache.put(std::move(back)), "park the taken image again");
+        check(cache.bytes() == bytes, "byte accounting is unchanged by the round trip");
+        owned.reset();
+        check(cache.take(cache.best(a, {}, true).index).use_count() == 1,
+              "once the outside owner lets go, the image has one reference");
     }
     {
         // evict_oldest(): the physical-RAM admission gate in generate.cpp frees parked conversations
@@ -211,10 +228,10 @@ int main() {
         cache.put(image({1,2,3})); cache.put(image({9,8,7}));
         check(cache.bytes() == one*2, "budget holds two exact-sized images");
         auto held = cache.take(cache.best(a, {}, true).index);
-        check(cache.make_room(one, held.bytes()), "count in-flight image when reserving outgoing snapshot");
+        check(cache.make_room(one, held->bytes()), "count in-flight image when reserving outgoing snapshot");
         check(cache.size() == 0, "in-flight reservation evicts otherwise fitting B");
-        check(cache.put(image({5,6,7}), held.bytes()), "insert with in-flight accounting");
-        check(cache.bytes()+held.bytes() <= one*2, "exchange obeys byte budget");
+        check(cache.put(image({5,6,7}), held->bytes()), "insert with in-flight accounting");
+        check(cache.bytes()+held->bytes() <= one*2, "exchange obeys byte budget");
         check(!cache.make_room(one+1, one), "oversized exchange rejected");
         check(cache.size() == 1, "oversized snapshot does not evict useful entries");
         auto huge = image({1}); huge.live.gdn.resize(one*3);
@@ -597,7 +614,7 @@ int main() {
         check(tight.size() == 1 && tight.evictions() == 0, "nothing evicted by the refusal");
         tight.unguard();
         auto taken = tight.take(tight.index_of(m.serial));   // what the caller does then: take it, as before
-        check(taken.live.ids.size() == 6 && taken.checkpoints.size() == 2 && tight.size() == 0,
+        check(taken->live.ids.size() == 6 && taken->checkpoints.size() == 2 && tight.size() == 0,
               "the taken donor is whole");
         ConversationCache one_slot(1 << 20, 1);
         SavedConversation b = image({1, 2, 3, 4, 10, 11});
