@@ -447,6 +447,48 @@ Measured on this PC (build folder `build-c13-gate`, Release, the serving model r
 Step 4 is next: what a debounced flush writes (K/V delta, at most one end state per
 `--prompt-cache-every`, no checkpoint chain), while a forced write keeps the whole-image shape.
 
+2026-11-03. **Step 4 is done, and it is green.** A debounced flush now writes the K/V it is missing
+and at most one end state; a forced write (eviction, QUIT) is still phase 1's whole image. The write's
+log line says which shape it took, and a debounced flush that skipped the state says how far past the
+deepest stored state it is.
+
+What landed:
+
+- `include/strata/core/conversation_disk.hpp`: `ConversationDiskOptions::prompt_cache_every` (default
+  16 384), set from `--prompt-cache-every` in `generate.cpp`. `0` means a state at every debounced flush.
+- `src/core/conversation_disk.cpp`:
+  - `write()` computes `write_state = job.forced || !target || tokens - deepest_state >= prompt_cache_every`
+    before it touches the keys. `deepest_state` is the target entry's `tokens` (its deepest `state` block);
+    a new entry has none, so its first flush always writes the end state.
+  - the state list is `{&image.live}` for a debounced flush and live-plus-checkpoints for a forced one. A
+    new entry's keys are the end state alone (forced: plus the chain). An existing entry's keys gain the
+    end state only when it was written (`merge_live_key()`, `merge_keys()` minus the image's checkpoints),
+    so `best()` never claims a prefix no `state` block covers.
+  - `updated.tokens` is left alone when no state was written: the entry still claims only its deepest
+    stored state, while the K/V past it is on the disk for the next state to cover.
+  - the `wrote ...` line ends with `forced write, the whole image` or `debounced write, the end state
+    written` or `debounced write, no end state (N tokens past the deepest stored state, under
+    --prompt-cache-every)`.
+- `src/core/conversation_disk_test.cpp`: plan tests 6 and 7 in the "shape" block. The numbers are scaled
+  down - 600, 1200 and 1300 tokens with `prompt_cache_every = 512`, instead of 200k/260k with 16 384 - so
+  the test does not build 200k-token K/V on a CPU run. What it proves is the rule: the first flush writes
+  exactly one state (the end) and no checkpoints, the second adds one state because the growth passed the
+  threshold, the third adds K/V only because it did not; `best()` keeps returning the stored state, and a
+  read lands on it.
+
+Measured on this PC (build folder `build-c13-gate`, Release, the serving model running, no restart):
+
+- `conversation_disk_test`: **296 checks, exit 0** (281 from step 3 plus the 15 of tests 6 and 7).
+- `conversation_cache_test`: **4 862 checks, exit 0**; `conversation_file_test`: **183 checks, exit 0**;
+  `conversation_validation_test`: **972 host-only checks, exit 0**; `session_save_reclaim_test`:
+  **119 checks, exit 0** (the forced path is unchanged, so phase 1's tests still describe it).
+- the engine: `--target strata` built, exit 0.
+
+Step 5 is next: reads cancel writes - `taken`/`superseded` drop the handle, a queued image comes back as
+the same allocation, the id map keeps a match valid across an append, and tests 3, 8 and 9. The
+running-write wait and the no-copy queued handback are already in (steps 2 and 3), so step 5 is mostly
+its tests and the id-map check.
+
 ## Risks and open questions
 
 - **The hot path.** `shared_ptr` in `ConversationCache` touches every park, take and admission. Any

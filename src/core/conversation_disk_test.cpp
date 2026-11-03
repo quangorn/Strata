@@ -7,7 +7,8 @@
 // build".  Test 1, the gate, is `conversation_snapshot_test.cpp`: it needs a card.
 // Phase 2's plan tests land one step at a time: 10 (flag 0: a park writes nothing, an eviction writes the whole image)
 // is the block "the cache's events drive the disk tier", written with step 2; 1, 2, 4 and 5 (debounce, reset, eviction
-// bypass, QUIT bypass) are the four "debounce"/"reset"/"eviction"/"quit" blocks, written with step 3.
+// bypass, QUIT bypass) are the four "debounce"/"reset"/"eviction"/"quit" blocks, written with step 3; 6 and 7 (one end
+// state per --prompt-cache-every, a flush under it writes K/V and no state) are the "shape" block, with step 4.
 #include "strata/core/conversation_disk.hpp"
 
 #include <algorithm>
@@ -599,6 +600,75 @@ int main() {
         check(tier.stats().written == 2 && tier.size() == 2, "quit: wait_idle() wrote both deferred parks");
         check(secs < 60.0, "quit: it collapsed the due times instead of waiting an hour");
         fs::remove_all(qdir);
+    }
+
+    {   // what a debounced flush writes (phase 2 step 4, plan tests 6 and 7): the K/V delta and at most one end state,
+        // one per --prompt-cache-every tokens, and no checkpoint chain.  The numbers are scaled down (600/1200/1300
+        // tokens, prompt_cache_every 512) so the test does not build 200k-token K/V.
+        const fs::path sdir = dir / "flush-shape";
+        fs::remove_all(sdir);
+        fs::create_directories(sdir);
+        const SessionFileIdentity sid{17, 19};
+        auto o = opts(sdir, GiB);
+        o.persist = true;
+        o.identity = sid;
+        o.flush_seconds = 1;
+        o.prompt_cache_every = 512;
+        ConversationDiskTier tier(std::move(o));
+        check(tier.open(e), "shape: open");
+        auto read_entry = [&](ConversationDiskEntry& out) {
+            for (const auto& f : fs::directory_iterator(sdir))
+                if (f.path().extension() == ".idx") return conversation_disk_index_read(f.path().string(), sid, out);
+            return false;
+        };
+        auto states_of = [](const ConversationDiskEntry& e) {
+            size_t n = 0;
+            for (const auto& b : e.stages[0].blocks)
+                if (b.kind == ConversationDiskBlock::state) ++n;
+            return n;
+        };
+        auto kv_end_of = [](const ConversationDiskEntry& e) {
+            int64_t end = 0;
+            for (const auto& b : e.stages[0].blocks)
+                if (b.kind == ConversationDiskBlock::kv) end = std::max(end, b.tokens_end);
+            return end;
+        };
+        tier.park(1, std::make_shared<SavedConversation>(image(600, 70)));
+        check(wait_until([&] { return tier.stats().written == 1; }), "shape: the first debounced flush");
+        ConversationDiskEntry after1;
+        check(read_entry(after1), "shape: the index is readable");
+        check(states_of(after1) == 1 && after1.tokens == 600 && after1.live.ids.size() == 600 &&
+                  after1.checkpoints.empty(),
+              "shape: the first flush writes one state (the end) and no checkpoint chain");
+        const int64_t kv_end1 = kv_end_of(after1);
+        check(kv_end1 == 600, "shape: and the K/V of the whole entry");
+        // 600 tokens past the stored state (>= 512): the end state is written
+        tier.park(1, std::make_shared<SavedConversation>(image(1200, 71)));
+        check(wait_until([&] { return tier.stats().written == 2; }), "shape: the second debounced flush");
+        ConversationDiskEntry after2;
+        check(read_entry(after2) && states_of(after2) == 2 && after2.tokens == 1200,
+              "shape: the second flush adds one end state at 1200 (the growth passed 512)");
+        check(after2.checkpoints.size() == 1 && after2.checkpoints[0].ids.size() == 600 &&
+                  after2.live.ids.size() == 1200,
+              "shape: its keys are only the states it has blocks for");
+        // 100 tokens past the stored state (< 512): K/V only, no state
+        tier.park(1, std::make_shared<SavedConversation>(image(1300, 72)));
+        check(wait_until([&] { return tier.stats().written == 3; }), "shape: the third debounced flush");
+        ConversationDiskEntry after3;
+        check(read_entry(after3), "shape: the index after the K/V-only flush");
+        check(states_of(after3) == 2 && after3.tokens == 1200 && after3.live.ids.size() == 1200,
+              "shape: 100 tokens past the stored state: the K/V is written, no end state");
+        check(kv_end_of(after3) == 1300 && kv_end_of(after3) > kv_end1, "shape: the K/V past the stored state is on the disk");
+        check(tier.best(prompt_of(1300, 1000), {}, false).tokens == 1200,
+              "shape: best() claims the stored state, not the K/V tail");
+        check(logged("debounced write, the end state written") &&
+                  logged("debounced write, no end state (100 tokens past the deepest stored state"),
+              "shape: the write says which shape it was and why a state was skipped");
+        SavedConversation back;
+        const auto m = tier.best(prompt_of(1300, 1000), {}, false);
+        check(tier.take(m.id, m.tokens, back, e) && back.live.ids.size() == 1200,
+              "shape: a read lands on the stored state");
+        fs::remove_all(sdir);
     }
 
     {   // the block store's write path: append (across runs), page-aligned kv blocks, a torn tail cut back

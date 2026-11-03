@@ -10575,6 +10575,7 @@ int main(int argc, char** argv) {
         disk_opts.budget_bytes = (uint64_t) o.conversation_disk_mib << 20;
         disk_opts.min_free_bytes = (uint64_t) o.session_min_free_mib << 20;
         disk_opts.flush_seconds = o.conversation_disk_flush_seconds;   // 0: nothing at park time (phase 1)
+        disk_opts.prompt_cache_every = o.prompt_cache_every;            // one end state per this many tokens
         disk_opts.keep_on_ram_refusal = o.conversation_disk_keep_on_ram;   // by default a read refused for RAM drops the entry
         // STRATA_PARK_ASYNC: the writer waits on its own thread for the background copy of the park that produced
         // an image; waiting here, in the request thread, would undo the asynchronous park

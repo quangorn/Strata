@@ -791,6 +791,24 @@ void merge_keys(ConversationDiskEntry& e, const SavedConversation& img) {
     e.tokens = (int64_t) e.live.ids.size();
 }
 
+// A debounced flush writes no checkpoint chain, so the entry's keys gain the end state alone: a key without a `state`
+// block would claim a prefix no read can rebuild.  merge_keys() minus the image's checkpoints.
+void merge_live_key(ConversationDiskEntry& e, const ConversationCheckpoint& live) {
+    std::map<int64_t, ConversationCheckpoint> by_position;
+    auto add = [&](const ConversationCheckpoint& k) {
+        const int64_t at = (int64_t) k.ids.size();
+        if (!by_position.count(at)) by_position[at] = key_only(k);
+    };
+    for (const auto& c : e.checkpoints) add(c);
+    add(e.live);
+    add(live);
+    e.live = by_position.rbegin()->second;
+    e.checkpoints.clear();
+    for (auto it = std::next(by_position.rbegin()); it != by_position.rend(); ++it)
+        e.checkpoints.push_back(it->second);
+    e.tokens = (int64_t) e.live.ids.size();
+}
+
 // The state positions every stage holds a block for, deepest first, at or below `limit`: what a read can rebuild.
 // (A key without a block in every stage cannot be restored: its bytes are not there.)
 std::vector<int64_t> state_positions(const ConversationDiskEntry& e, int64_t limit) {
@@ -1388,12 +1406,20 @@ void ConversationDiskTier::write(Job& job) {
             updated.id = job.entry.id;
         }
     }
+    // The write's shape (phase 2): a forced write (eviction, QUIT) is phase 1's whole image - every `kv` range beyond
+    // the last stored block, the checkpoint chain and the end state.  A debounced flush writes the same `kv` ranges and
+    // at most one end state, and only when the end is `--prompt-cache-every` tokens past the deepest stored state (or
+    // the entry has no state at all): no checkpoint chain.
+    const int64_t deepest_state = target ? updated.tokens : 0;
+    const bool write_state = job.forced || !target ||
+                             (int64_t) tokens - deepest_state >= options_.prompt_cache_every;
     if (!target) {
         updated.cvec = images.front()->cvec;
         updated.geometry = images.front()->geometry;
         updated.tokens = (int64_t) images.front()->live.ids.size();
         updated.live = key_of(images.front()->live);
-        for (const auto& c : images.front()->checkpoints) updated.checkpoints.push_back(key_of(c));
+        if (job.forced)
+            for (const auto& c : images.front()->checkpoints) updated.checkpoints.push_back(key_of(c));
         updated.stages.resize(images.size());
         for (size_t s = 0; s < images.size(); ++s) {
             updated.stages[s].layer_lo = images[s]->layer_lo;
@@ -1401,8 +1427,10 @@ void ConversationDiskTier::write(Job& job) {
             updated.stages[s].layers = (uint32_t) images[s]->kv.size();
         }
         updated.bytes = 0;
-    } else {
+    } else if (job.forced) {
         merge_keys(updated, *images.front());
+    } else if (write_state) {
+        merge_live_key(updated, images.front()->live);
     }
     if (!target)
         log(fmt("new entry: no stored conversation is a prefix of this one's %zu tokens", tokens));
@@ -1437,8 +1465,12 @@ void ConversationDiskTier::write(Job& job) {
                 ++new_blocks;
             }
         }
-        states[s].push_back(&img.live);
-        for (const auto& c : img.checkpoints) states[s].push_back(&c);
+        if (job.forced) {
+            states[s].push_back(&img.live);
+            for (const auto& c : img.checkpoints) states[s].push_back(&c);
+        } else if (write_state) {
+            states[s].push_back(&img.live);   // one end state, no checkpoint chain
+        }
         for (const auto* c : states[s]) {
             const int64_t at = (int64_t) c->ids.size();
             bool held = false;
@@ -1634,13 +1666,21 @@ void ConversationDiskTier::write(Job& job) {
         on_disk = entries_.size();
         disk_bytes = bytes_;
     }
+    const char* shape = job.forced ? "forced" : "debounced";
+    std::string state_note;
+    if (job.forced) state_note = "the whole image";
+    else if (write_state) state_note = "the end state written";
+    else
+        state_note = "no end state (" + std::to_string((int64_t) tokens - deepest_state) +
+                     " tokens past the deepest stored state, under --prompt-cache-every)";
     images.clear();
     job.image.reset();   // the RAM goes back now, written or not (the cache may hold the same allocation)
     log(fmt("wrote %zu tokens%s: %.0f MiB in %zu blocks (%zu new kv, %.1f MiB; %zu new state, %.1f MiB), index "
             "%.1f MiB rewritten, %zu file%s, %.0f ms (%.0f MB/s); on disk %zu, %.0f MiB; "
-            "%zu removed for the budget, %zu superseded", tokens, target ? " (appended)" : "", mib(bin_bytes),
+            "%zu removed for the budget, %zu superseded; %s write, %s", tokens, target ? " (appended)" : "", mib(bin_bytes),
             blocks_written, kv_written, mib(kv_bytes_written), state_written, mib(state_bytes_written), mib(index_bytes),
-            nstages, nstages == 1 ? "" : "s", ms, mbps(bin_bytes, ms), on_disk, mib(disk_bytes), made_room, superseded));
+            nstages, nstages == 1 ? "" : "s", ms, mbps(bin_bytes, ms), on_disk, mib(disk_bytes), made_room, superseded,
+            shape, state_note.c_str()));
     if (pins)
         log(fmt("on disk %.0f MiB is over the budget of %.0f MiB: %zu pinned conversation%s kept, a pin is never "
                 "traded for room", mib(disk_bytes), mib(options_.budget_bytes), pins, pins == 1 ? "" : "s"));

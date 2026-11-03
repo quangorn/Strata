@@ -39,6 +39,9 @@ struct ConversationDiskOptions {
     /// --conversation-disk-flush-seconds: a park is written after this many quiet seconds (the debounce).  0 = off and
     /// today's behaviour byte for byte: nothing is queued at park time, the tier is written on eviction and at QUIT.
     int64_t flush_seconds = 0;
+    /// --prompt-cache-every: a debounced flush writes an end state only when the end is this many tokens past the
+    /// deepest stored state (or the entry holds no state at all).  0: a state at every flush.
+    int64_t prompt_cache_every = 16384;
     /// Called with every diagnostic line (no trailing newline), from the caller's or the writer's thread.
     std::function<void(const std::string&)> log;
     /// Tests: called on the writer thread before each write starts.
