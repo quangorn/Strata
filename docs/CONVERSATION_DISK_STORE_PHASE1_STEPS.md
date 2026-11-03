@@ -716,7 +716,8 @@ to watch it. The 163 466-token entry measured above is the one the crutch is for
 request can match its stored chain, and its `.idx` and `.bin` were deleted from `E:/strata-conv-data` (the folder
 after: 68 indexes, 68 `.bin`, 70 692 MiB; 0 indexes naming a missing file, 0 files named by no index). The plan for
 dropping such known-stale copies by a rule, not by hand, is a separate investigation, recorded in
-[CONVERSATION_DISK_STORE_PHASE3.md](CONVERSATION_DISK_STORE_PHASE3.md), "Risks and open questions".
+[CONVERSATION_DISK_STORE_PHASE3.md](CONVERSATION_DISK_STORE_PHASE3.md), "Risks and open questions". Allowing a
+disk read to page to swap is the same plan's neighbour, recorded in the same section as a separate investigation.
 
 **The version rule held**: `project(strata VERSION 0.1.55)` is unchanged, the engine names itself `0.1.55-local`,
 and the build number lives only in the package folder and manifest (`0.1.55.3-...`). The index identity hash is

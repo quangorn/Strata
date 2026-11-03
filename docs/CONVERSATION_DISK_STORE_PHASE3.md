@@ -206,3 +206,16 @@ restore of a 165K-token conversation was 5.6 s at 643 MB/s on the 2x CMP box
   from both tiers is worth having; what it needs is a separate investigation — where the compaction
   signal comes from, which copies it makes dead, how to prove a copy is dead before removing it. No
   design here.
+- **Letting a disk read page to swap, to be researched separately.** Today the gate compares the read's
+  `need` (the payload of every block below the state it lands on) plus `--conversation-cache-min-free-mib`
+  with the host's free RAM (`make_ram`, `generate.cpp:10612`), and paging is not part of the model: a
+  conversation whose payload is above what the host reports free is refused, and the eviction loop
+  evicts parked conversations before anything pages. Measured on this PC 2026-11-03 with the floor at 0:
+  the start scan `67 conversations, 69 965 MiB, 0 refused`, reads landed (`prompt 82 088 tokens = 82 053
+  reused + 35 read in 2207 ms; reused from the disk in 1.7 s`), `0 dropped on RAM refusals`, `0 waits for
+  RAM` — a floor of 0 admits a read whose need is below the free RAM, and no refusal appeared. The
+  unmeasured half is the host paging other processes' pages out for a payload of several GiB: the price is
+  page faults (a fresh 118 MiB vector costs ~40 ms at a save, `generate.cpp:10636`), and no restore of a
+  multi-GiB conversation under paging has been measured. A rule for this (a floor that accepts paging, a
+  measured restore budget, or reading the blocks in batches the way the prompt path does) needs its own
+  investigation; no design here.
