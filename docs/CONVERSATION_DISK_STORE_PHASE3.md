@@ -195,3 +195,14 @@ restore of a 165K-token conversation was 5.6 s at 643 MB/s on the 2x CMP box
   they do not, the honest answer is to stop at phase 2.
 - **Static analysis, unconfirmed.** The duplication numbers are measured by that file's `.idx`
   reader; everything else here is read, not run.
+- **Conversations that compaction makes known-stale, to be researched separately.** When the client
+  compacts a dialogue (rewrites its prefix), every stored copy of the pre-compaction branch — in the
+  RAM cache and on the disk — can never be matched again: a request carries the compacted prefix, and
+  the store's rule is that a read needs the stored image-key chain as a prefix, so a chain from before
+  the compaction is not one. Today those bytes sit until the budget evicts them. The measured case is
+  the 4897 MiB entry of section 6: its dialogue survived a compaction, the entry was deleted by hand,
+  and the folder after is 68 indexes, 68 `.bin`, 70 692 MiB, 0 indexes naming a missing file, 0 files
+  named by no index (`E:/strata-conv-data`, 2026-11-03). A rule that drops known-stale conversations
+  from both tiers is worth having; what it needs is a separate investigation — where the compaction
+  signal comes from, which copies it makes dead, how to prove a copy is dead before removing it. No
+  design here.

@@ -708,10 +708,15 @@ files and counts it (`ram drop: the entry and its files are gone, counted and lo
 The old check "the entry and its files stay" on a refused read now asserts the removal (the refusal test at
 `conversation_disk_test.cpp` and the totals term). Phases 2 and 3 make every file affordable to a read (one state per
 flush, a window of the newest states plus the root), so the crutch has nothing left to fix and is deleted; the list of
-what to take out is in [CONVERSATION_DISK_STORE_PHASE3.md](CONVERSATION_DISK_STORE_PHASE3.md), section 6. **Not
-measured live**: the running engine (`0.1.55.11`) does not have this code, so the `dropped N tokens on the RAM
-refusal` line and the totals term are to be checked in the daily logs after the next package build and restart; the
-163 466-token entry measured above is the one the crutch is for.
+what to take out is in [CONVERSATION_DISK_STORE_PHASE3.md](CONVERSATION_DISK_STORE_PHASE3.md), section 6. The
+crutch runs on this PC since `0.1.55.12` (build_id `dd6119b9b865`, exe md5 `756882d7...`): its start scan took in
+69 conversations, 76 752 MiB, `0 refused` (before the manual deletion below), and the totals line prints the new term
+(`0 dropped on RAM refusals`). A drop line appears only when a read is refused for RAM, so the daily logs are where
+to watch it. The 163 466-token entry measured above is the one the crutch is for, and it is gone by hand now: its dialogue survived a compaction, so no
+request can match its stored chain, and its `.idx` and `.bin` were deleted from `E:/strata-conv-data` (the folder
+after: 68 indexes, 68 `.bin`, 70 692 MiB; 0 indexes naming a missing file, 0 files named by no index). The plan for
+dropping such known-stale copies by a rule, not by hand, is a separate investigation, recorded in
+[CONVERSATION_DISK_STORE_PHASE3.md](CONVERSATION_DISK_STORE_PHASE3.md), "Risks and open questions".
 
 **The version rule held**: `project(strata VERSION 0.1.55)` is unchanged, the engine names itself `0.1.55-local`,
 and the build number lives only in the package folder and manifest (`0.1.55.3-...`). The index identity hash is
