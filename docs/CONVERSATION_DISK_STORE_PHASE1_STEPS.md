@@ -586,6 +586,26 @@ change: file 183, validation 972, cache 4854, session_save_reclaim 119, snapshot
 fail on a run started while the serving model holds the card (`six more restores allocate nothing on the card`) and
 pass on a rerun, measured on this PC 2026-11-03.
 
+**Phase 10: the append's delta and the cold read of the appended entry, measured on `0.1.55.11`** (manifest
+`ae272cabc26195e6ec286bfa9b0bb9194b4a6ed10deb19af1071d65cd9e24d2d`, `build_id 75dea3551a51`, started 06:52:24, engine
+string `strata 0.1.55-local`). The start line: `budget 76800 MiB, persistent (budget only): 62 conversations from
+earlier runs (53866 MiB), 0 refused (...)`, 0 removed for the budget, 0 stale files. A conversation of 79 700 tokens
+was read from the disk (`disk hit: 79700 tokens, 1474 MiB in 1 file, 1603 ms (965 MB/s)`,
+`restored 79700 tokens (live) in 65.0 ms`), continued with its assistant turn, and its parked image went to the disk
+as an append: `wrote 81047 tokens (appended): 1598 MiB in 2 blocks (1 new kv, 11.6 MiB; 1 new state, 112.6 MiB),
+index 2.1 MiB rewritten, 1 file, 115 ms (14596 MB/s)` - **two** blocks for a 1 347-token continuation, the entry's
+older blocks copied, not rewritten. The cold read of that appended entry: `disk hit: 81047 tokens, 1598 MiB in 1 file,
+12226 ms (137 MB/s)` (the writer was busy with parallel writes), `conversation cache: restored 81047 tokens (live) in
+328.8 ms` - the appended state lands as live, the request is served. Over the whole run on this engine: **zero**
+`not restored` lines, `0/0 writes/reads failed, 0 reads fell back on damage`.
+
+**A rule the scripted phase 10 showed.** The disk tier's queue is fed by the RAM cache's **evictions**
+(`generate.cpp:10590`, `conversations.set_on_evict(...)`): a parked conversation is written when the cache evicts it,
+not when it is parked. A scripted continuation whose image stayed in the cache (the cache evicted the longer
+fillers, which were older) was never queued and never read from the disk: the request that asked for it read back
+from the cache (`restored 32355 tokens (checkpoint)`, `prompt 32362 tokens = 32355 reused + 7 read in 210 ms`).
+So the scripted test must fill the cache past the parked image to make the disk path run; that is phase 11.
+
 **The version rule held**: `project(strata VERSION 0.1.55)` is unchanged, the engine names itself `0.1.55-local`,
 and the build number lives only in the package folder and manifest (`0.1.55.3-...`). The index identity hash is
 built from the settings and the engine's version string (`conversation_file.cpp:891` writes the pair
