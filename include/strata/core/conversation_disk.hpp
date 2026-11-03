@@ -231,6 +231,9 @@ private:
     bool stop_ = false;
     std::thread thread_;
     ConversationDiskStats stats_;
+    // a queued image published into an existing entry keeps that entry's id, so the id `put` gave the image stops
+    // existing.  The map (from the queued id, to the entry) lets a read that matched the queued image find the entry.
+    std::vector<std::pair<uint64_t, uint64_t>> published_;
 };
 
 }  // namespace strata::core

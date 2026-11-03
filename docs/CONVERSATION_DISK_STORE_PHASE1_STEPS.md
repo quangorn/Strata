@@ -544,6 +544,48 @@ under the id `put` gave it; the store test adds the case: a match of the entry b
 before, 2 added); the rest of the offline suite is as in step 9 (183 / 4865 / 972 / 4854 / 119). Reading the
 appended entry from the disk under this fix on hardware is **not yet measured**.
 
+**The append's id map, and a reader-release defect the new test found.** The fix above covers a write that starts a
+new entry. An append is the other half: `put` gives the queued image its own id, the append publishes under the
+**target** entry's id, and the queued id stops existing. A read that matched the queued image while the writer ran
+loses its entry - measured on `0.1.55.9` as
+`conversation disk: 208307 tokens not restored (the entry is gone (its write failed, or the budget removed it));
+reading the prompt`, the prompt read from 0. The tier now records the pair (the queued id, the entry published under
+its id) at publish, and `take()` follows it, so a read by the queued id finds the entry; `clear()` clears the map
+with the entries. The store test covers it: a 600-token image queued behind a gated writer, a 1200-token image
+behind it, `best` matches the queued image by its own id, and after the write ends `take(q.id, 1200, ...)` finds the
+entry. The live state and both K/V layers come back byte for byte, and the target entry's states stay as the first
+write wrote them (an append skips a state block it already holds at that token count), so the checkpoints that read
+back are the 600-, 300- and 150-token states of the first write, deepest first.
+
+The same test found a second defect: `take()` counts its reader on the entry it resolved through the map (the
+target's id) and released it by the id `put` gave the queued image - a lookup that finds nothing, so the reader's
+stamp never goes down, and `clear()`, which waits for `readers == 0`, hangs. The first run of the new test hung for
+2 minutes with 0.19 s of CPU time. The release is now keyed by the resolved entry's id, the test passes, and after
+`clear()` a later read by the old queued id reports `the entry is gone`.
+
+**Phase 9, measured on `0.1.55.10`** (manifest `676c8e567af01fdedb12400f0dcc5ad6d38d69a011135a8739eaba64e4b22a98`,
+`build_id 031e85249dab`, started 00:37:27, engine string `strata 0.1.55-local`). The start line:
+`conversation disk: on: E:\strata-conv-data, budget 76800 MiB, persistent (budget only): 42 conversations from
+earlier runs (34085 MiB), 0 refused (...)` - the whole folder of the earlier runs taken in, nothing refused, nothing
+removed for the budget (the budget is what the two models' stores share on this disk). A 25 460-token conversation
+is parked and written, the cache is filled with 48-50k conversations, then its continuation with the assistant turn:
+`new entry: no stored conversation is a prefix of this one's 31646 tokens` - the replayed assistant text tokenizes
+differently from the tokens generated for it, so no stored chain is a prefix and the write starts a new entry. The
+cold read of that entry: `conversation disk: disk hit: 31574 tokens, 498 MiB in 1 file, 602 ms (866 MB/s)`,
+`conversation cache: restored 31574 tokens (live) in 60.9 ms`,
+`prompt 31581 tokens = 31574 reused + 7 read in 840 ms (8.3 tok/s)`. Over the run's last totals line:
+`11 queued, 11 written (10601 MiB, 276 MB/s), 0 RAM hits, 5 disk hits (7259 MiB, 392 MB/s), 502722 prompt tokens
+given back, 5 waits for RAM (23824 ms), 0 removed for the budget, 0/0 writes/reads failed, 0 reads fell back on
+damage; on disk 53 (44696 MiB), queue 0` - and **zero** `not restored` lines in the whole run: the `the entry is
+gone` failure is gone from the log. The append's delta write on this engine is **not yet measured** (the live
+append measured on `0.1.55.9`, `wrote 25504 tokens (appended): 782 MiB in 3 blocks (1 new kv, 0.4 MiB; 2 new state,
+225.2 MiB), index 0.5 MiB rewritten, 1 file, 469 ms (1749 MB/s)`, needs the id map to be read back on hardware).
+
+`conversation_disk_test`: **240 checks passed** (232 before, 8 added). The rest of the offline suite after this
+change: file 183, validation 972, cache 4854, session_save_reclaim 119, snapshot 4865 - the snapshot's card checks
+fail on a run started while the serving model holds the card (`six more restores allocate nothing on the card`) and
+pass on a rerun, measured on this PC 2026-11-03.
+
 **The version rule held**: `project(strata VERSION 0.1.55)` is unchanged, the engine names itself `0.1.55-local`,
 and the build number lives only in the package folder and manifest (`0.1.55.3-...`). The index identity hash is
 built from the settings and the engine's version string (`conversation_file.cpp:891` writes the pair

@@ -588,6 +588,37 @@ int main() {
                   "store: the read keeps the entry and its files (step 4)");
         }
 
+        {   // an append published under the entry's id: a read that matched the queued image finds it by that id
+            std::promise<void> release;
+            std::shared_future<void> gate = release.get_future().share();
+            auto o = opts(sdir, GiB);
+            o.before_write = [gate] { gate.wait(); };
+            ConversationDiskTier tier(std::move(o));
+            check(tier.open(e) && tier.put(image(600, 42, 1000, 0, 48, 1)), "append id: put 600 (the writer waits)");
+            check(tier.put(image(1200, 42, 1000, 0, 48, 1)), "append id: put 1200 (queued behind it)");
+            const auto q = tier.best(prompt_of(1300, 1000), {}, false);
+            check(q.tokens == 1200 && q.queued && q.id != 0, "append id: the queued image is matched by its own id");
+            release.set_value();
+            tier.wait_idle();
+            check(logged(" (appended)"), "append id: the write appended to the published entry");
+            SavedConversation qback;
+            const bool qok = tier.take(q.id, 1200, qback, e);
+            check(qok, "append id: the read of the queued image's id finds the appended entry");
+            const SavedConversation expect = image(1200, 42, 1000, 0, 48, 1);
+            check(qok && qback.live.ids.size() == 1200 && same_checkpoint(qback.live, expect.live) &&
+                  qback.kv.size() == expect.kv.size() && same_kv(qback.kv[0], expect.kv[0]) &&
+                  same_kv(qback.kv[1], expect.kv[1]),
+                  "append id: the live state and the K/V of both writes came back byte for byte");
+            check(qok && qback.checkpoints.size() == 3 &&
+                  same_checkpoint(qback.checkpoints[0], checkpoint(600, 42)) &&
+                  same_checkpoint(qback.checkpoints[1], checkpoint(300, 51)) &&
+                  same_checkpoint(qback.checkpoints[2], checkpoint(150, 61)),
+                  "append id: the target entry's states are kept as written, deepest first below the appended live");
+            check(tier.clear() == 1 && !tier.take(q.id, 1200, qback, e) &&
+                  e.find("the entry is gone") != std::string::npos,
+                  "append id: clear takes the entry and the map, so the queued id finds nothing");
+        }
+
         // a stale shorter copy of the same conversation: the write appends to the longest and removes the shorter one
         ConversationDiskEntry stale;
         std::string ierr;

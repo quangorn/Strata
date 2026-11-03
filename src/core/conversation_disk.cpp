@@ -1537,6 +1537,9 @@ void ConversationDiskTier::write(Job& job) {
             entries_.push_back(std::move(updated));
             bytes_ += new_bytes;
         }
+        // an append publishes under the entry's id, and the queued image had another one: record where its id went,
+        // so a read that matched the queued image (while the writer ran) finds the entry by the old id
+        if (target && job.entry.id != target) published_.push_back({job.entry.id, target});
         for (size_t i = entries_.size(); i-- > 0;) {
             if (entries_[i].id == new_id || entries_[i].tokens >= new_tokens) continue;
             if (entries_[i].readers > 0) continue;   // a read is using it: the next publish removes it
@@ -1593,6 +1596,12 @@ bool ConversationDiskTier::take(uint64_t id, int64_t tokens, SavedConversation& 
     size_t index = entries_.size();
     for (size_t i = 0; i < entries_.size(); ++i)
         if (entries_[i].id == id) index = i;
+    // the writer can end between the match and this lookup, and its append published the image under the entry's id:
+    // follow the id the queued image had to that entry
+    for (const auto& p : published_)
+        if (p.first == id)
+            for (size_t i = 0; i < entries_.size(); ++i)
+                if (entries_[i].id == p.second) index = i;
     if (index == entries_.size()) {
         ++stats_.read_failed;
         error = "the entry is gone (its write failed, or the budget removed it)";
@@ -1601,6 +1610,7 @@ bool ConversationDiskTier::take(uint64_t id, int64_t tokens, SavedConversation& 
     // the entry stays on the disk: its table is copied out (a few hundred bytes), the reader's stamp taken, and its
     // files kept for this read - the writer leaves an entry a read holds until its next publish
     const Entry want = entries_[index];
+    const uint64_t entry_id = entries_[index].id;   // the remap can land on another entry's id: release that one
     ++entries_[index].readers;
     entries_[index].last_used_s = std::chrono::duration_cast<std::chrono::seconds>(
         std::chrono::system_clock::now().time_since_epoch()).count();
@@ -1637,7 +1647,7 @@ bool ConversationDiskTier::take(uint64_t id, int64_t tokens, SavedConversation& 
     const double ms = ms_since(t0);
     lock.lock();
     for (auto& e : entries_)
-        if (e.id == id) {
+        if (e.id == entry_id) {
             if (e.readers) --e.readers;
             if (read_at > 0 && read_at < (int64_t) e.live.ids.size())   // a damaged chain: best() claims only this
                 e.verified = e.verified ? std::min(e.verified, read_at) : read_at;
@@ -1705,6 +1715,7 @@ size_t ConversationDiskTier::clear() {
     std::unique_lock<std::mutex> lock(m_);
     const size_t queued = queue_.size();
     queue_.clear();
+    published_.clear();   // every entry this map points to is going, so the queued ids have nothing left to find
     // a read holds its entry's files: it finishes first (its fallback would otherwise read deleted blocks)
     auto readers = [&] {
         size_t n = 0;
