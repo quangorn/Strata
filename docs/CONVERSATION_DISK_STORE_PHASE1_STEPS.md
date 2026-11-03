@@ -670,6 +670,19 @@ window: the writer keeps up with one conversation per park. To read a queued ima
 write window (8 s for a full write of 36 763 tokens, 1.6 s for a 1218 MiB append): phase 15 asks for the conversation
 immediately after the park that evicts it.
 
+**Phase 15: the queued match was not caught, and it will be watched in the daily logs.** K15 was parked
+(`parked 36763 tokens` in an earlier run; in this run the cache had room, `parked=4`), one long filler did not evict
+its image, so no write was queued (`queued 36763 tokens` line absent), and the request that followed read back from
+the RAM cache: `restored 36690 tokens (checkpoint) in 81.1 ms`, `prompt 36697 tokens = 36690 reused + 7 read in
+340 ms`. Over phases 13, 14 and 15 the queued match was not caught by scripted traffic: 89 writes with 0 RAM hits
+(phase 13), 96 writes with 0 RAM hits (phase 14), and phase 15 never queued the image. Chasing the window by hand is
+not worth the traffic: the path is covered offline by the store test (the read of the queued image's id finds the
+appended entry, `conversation_disk_test` 249 checks). In normal use the log lines to watch are
+`RAM hit: N tokens back from the write queue (M MiB, no disk) in X ms`,
+`disk hit: N tokens, ..., after X ms waiting for its write` with `restored N tokens (live)`, and the refusal
+`N tokens not restored (the entry is gone (its write failed, or the budget removed it))`; every scripted run on
+`0.1.55.11` printed zero `not restored` lines.
+
 **The version rule held**: `project(strata VERSION 0.1.55)` is unchanged, the engine names itself `0.1.55-local`,
 and the build number lives only in the package folder and manifest (`0.1.55.3-...`). The index identity hash is
 built from the settings and the engine's version string (`conversation_file.cpp:891` writes the pair
