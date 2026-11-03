@@ -514,6 +514,19 @@ is the package of a build that compiled the changed file - its `strata.exe` is m
 `restored N tokens (live)` for a disk read. The `null`-content case above ends in the same line 14823, so one branch
 covers both exits.
 
+**2026-11-03, the fixed engine measured on the crash path.** The engine restarted on `0.1.55.9-windows-x86_64-cuda-cuda13`
+(manifest `ff57b9f98c1236b079a23c0149a64c31d931381879a6b9dbfc16e746db41a2ac`, `build_id f7fa6c4fcbf2`, the engine string
+`strata 0.1.55-local`) at 00:24:18. A scripted traffic run on it: one 25 458-token conversation, five 48-50k ones to
+fill the RAM cache, then a continuation whose assistant text differs from the parked one - the prompt diverges inside
+the entry's live key, so the read lands on a state below it. The log lines:
+`conversation disk: new entry: no stored conversation is a prefix of this one's 25458 tokens`,
+`conversation disk: disk hit: 25458 tokens, 557 MiB in 1 file, 596 ms (980 MB/s)`,
+`conversation cache: restored 25458 tokens (live) in 42.6 ms` - the mount the old code looked for is not there, the
+restore lands as live, the request answered (`prompt_tokens=25485`, wall 1.5 s), and its second run answered again in
+0.4 s. Zero `restoring a conversation checkpoint failed`, zero exits, `0/0 writes/reads failed, 0 reads fell back on
+damage` over the run. After the restart, every disk read in the log prints `(live)`; the last
+`the engine stopped unexpectedly` line in the server log is from 00:14, before this engine started.
+
 **The version rule held**: `project(strata VERSION 0.1.55)` is unchanged, the engine names itself `0.1.55-local`,
 and the build number lives only in the package folder and manifest (`0.1.55.3-...`). The index identity hash is
 built from the settings and the engine's version string (`conversation_file.cpp:891` writes the pair
