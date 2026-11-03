@@ -7,7 +7,7 @@ Run it from cygwin bash (any Python 3.10+), or from cmd / PowerShell with the ch
     python3 packaging/build_engine_win_local.py plan       show what it would do (nothing is built)
     python3 packaging/build_engine_win_local.py engine     only strata.exe + strata_kq.dll (pictures stay off)
     python3 packaging/build_engine_win_local.py vision     only the picture reader, into the last build
-    python3 packaging/build_engine_win_local.py package    only the package from the last build
+    python3 packaging/build_engine_win_local.py package    the engine, the picture reader and the package
 
 Needs Visual Studio 2022 Build Tools with the C++ workload, and a CUDA Toolkit (13.4 on this PC). Nothing is
 downloaded, nothing is uploaded, and nothing in the release path is changed.
@@ -265,7 +265,7 @@ def main(argv=None) -> int:
         env["PATH"] = venv_bin + ";" + env.get("PATH", "")
 
     # ---------------------------------------------------------------- engine
-    if step in ("all", "engine"):
+    if step in ("all", "engine", "package"):
         cmake = ROOT / ".venv/Scripts/cmake.exe"
         ninja = ROOT / ".venv/Scripts/ninja.exe"
         if not cmake.exists():
@@ -307,7 +307,7 @@ def main(argv=None) -> int:
             return 0
 
     # ---------------------------------------------------------------- picture reader
-    if step in ("all", "vision"):
+    if step in ("all", "vision", "package"):
         env["VISION_ARCHS"] = ";".join(str(a) for a in archs)
         bat = wpath(ROOT / "packaging/build_vision_windows.bat")
         if run(["cmd", "/c", bat, "cuda13", wpath(stage)], env=env) != 0:

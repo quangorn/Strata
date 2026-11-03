@@ -62,7 +62,7 @@ between runs, so a second run after a source edit recompiles only what changed.
 /usr/bin/python3 packaging/build_engine_win_local.py plan     # show paths, archs and versions; build nothing
 /usr/bin/python3 packaging/build_engine_win_local.py engine   # strata.exe and strata_kq.dll only
 /usr/bin/python3 packaging/build_engine_win_local.py vision   # only the picture reader, into the last build
-/usr/bin/python3 packaging/build_engine_win_local.py package  # only the package from the last build
+/usr/bin/python3 packaging/build_engine_win_local.py package  # the engine, the picture reader, then the package
 /usr/bin/python3 packaging/build_engine_win_local.py          # all three: engine, picture reader, package
 ```
 
@@ -103,6 +103,12 @@ The script removes `strata.exe` before the relink, so a binary left from an olde
 runs the new `strata.exe --version` before staging. A run config can then name that binary directly in `"exe"`; the installed
 `component:strata-engine` package is not rebuilt unless `package` (or the default `all`) writes into `OUT`. The script needs a
 Windows PC with an NVIDIA card; Linux builds use `packaging/build_cuda_linux.sh`, and the Mac uses `packaging/build_vision_mac.sh`.
+
+**2026-11-03, measured on this PC**: `package` used to skip both builds, so a run after a source edit packed the last
+build's binaries. Two packages of one commit (`0.1.55.5`, `0.1.55.6`) shipped the previous engine: the three exes of
+`0.1.55.4`, `0.1.55.5`, `0.1.55.6` were byte-identical, md5 `2d347b43a8952e6f88cc773884c585da`, and the manifest
+stamp `build_id` is the git commit, not the compiled code. `package` now runs the engine and the picture reader
+first; its own relink deletes `strata.exe` in the build folder, so an old binary cannot pass for the new build.
 
 ### Updating this PC (the fork's own routine)
 

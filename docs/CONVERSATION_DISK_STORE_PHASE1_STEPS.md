@@ -498,9 +498,21 @@ The store test now states the invariant the launch leans on: the read of the sta
 `conversation_snapshot_test` 4865, `conversation_validation_test` 972, `conversation_cache_test` 4854,
 `session_save_reclaim` 119. The engine (`--target strata`) built, exit 0.
 
-**Not yet measured on hardware**: the fix is in `0.1.55.5-windows-x86_64-cuda-cuda13` (manifest sha256
-`a7e01099a40ea8c32e2922aea92014dc987f463fd5896909c7d8a6a78dfd4e3e`), and its restart under the same traffic is not
-run. The `null`-content case above ends in the same line 14823, so one branch covers both exits.
+**A packaging finding measured on this PC, and the restarted engine.** `packaging/build_engine_win_local.py` with the
+`package` action packages the last build, as its docstring says; it does not compile. The first two packages of the
+fix (`0.1.55.5-...`, manifest `a7e01099…`, and `0.1.55.6-...`, manifest `ec3d7bf3…`, `build_id af4ea7e4585e` = the
+fix's commit) were built this way, so their `strata.exe` is the previous engine: the three exes `0.1.55.4`,
+`0.1.55.5`, `0.1.55.6` are byte-identical, md5 `2d347b43a8952e6f88cc773884c585da`. The manifest stamps the git
+commit, not the compiled code, so a `build_id` of the fix's commit does not say the fix is in the binary. The
+restart on `0.1.55.6` kept crashing with the same line (`the engine reported an error: restoring a conversation
+checkpoint failed`, `the engine stopped unexpectedly (exit code 1)`, engine starts at 00:13:05, 00:13:50, 00:14:52),
+and each of those runs logged `restored N tokens (checkpoint)` for a disk read - the old code's line. The user moved
+the two conversation files that drew these reads out of the folder, and the exits stopped. A run with the fix is
+**not yet measured**: `0.1.55.7-windows-x86_64-cuda-cuda13` (manifest `2e41b956f1b7ad2ce58514945635802b2c18f32e66ac6a4dd67b0f1487dad586`)
+is the package of a build that compiled the changed file - its `strata.exe` is md5 `dc713aa1ec3a85366c319dba0b48c3b0`
+(the staged exe, `CMakeFiles/strata.dir/src/program/generate.cpp.obj` compiled at 03:17), and its start prints
+`restored N tokens (live)` for a disk read. The `null`-content case above ends in the same line 14823, so one branch
+covers both exits.
 
 **The version rule held**: `project(strata VERSION 0.1.55)` is unchanged, the engine names itself `0.1.55-local`,
 and the build number lives only in the package folder and manifest (`0.1.55.3-...`). The index identity hash is
