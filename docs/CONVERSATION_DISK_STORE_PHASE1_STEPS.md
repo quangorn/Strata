@@ -643,6 +643,20 @@ state the prompt reaches is a checkpoint of the appended entry, it lands as live
 `0/0 writes/reads failed, 0 reads fell back on damage`, `not restored` = 0. The disk was near its budget
 (`on disk 81 (74567 MiB)` of 76800 MiB), so `40 removed for the budget` lines appear - LRU removals, not refusals.
 
+**Phase 13: three appends on one scripted chain.** A conversation is continued three times, each continuation
+replaying the answer as an assistant turn, with six fillers after each to evict the parked image. The first round
+writes a new entry (`new entry: no stored conversation is a prefix of this one's 41323 tokens`); rounds 2 and 3
+append on top of it: `wrote 49984 tokens (appended): 1218 MiB in 8 blocks (5 new kv, 74.6 MiB; 3 new state,
+337.8 MiB), index 1.1 MiB rewritten, 1 file, 1620 ms (789 MB/s)` and `wrote 58649 tokens (appended): 1518 MiB in 7
+blocks (5 new kv, 74.6 MiB; 2 new state, 225.2 MiB), index 1.5 MiB rewritten, 1 file, 3407 ms (467 MB/s)` - the
+scripted continuation is a prefix here, so the delta rule holds for it. The reads land on the entry's states as live:
+`disk hit: 41252 tokens, 693 MiB in 1 file, 569 ms (1277 MB/s)`, `restored 41252 tokens (live) in 125.4 ms`,
+`prompt 41259 tokens = 41252 reused + 7 read`; the second and third reads reuse 41252 and not the appended states
+(49 984 and 58 649 tokens), because those live states are above the prompt's length and the deepest state at or below
+the prompt is the one a read can rebuild. Over the run: `not restored` = 0, `0/0 writes/reads failed`, and the queue
+was never caught: 89 queued and 89 written with **0 RAM hits** - every read came after its write had ended, so no
+`after X ms waiting for its write` line appears. Phase 14 makes the queue deep on purpose to catch that path.
+
 **The version rule held**: `project(strata VERSION 0.1.55)` is unchanged, the engine names itself `0.1.55-local`,
 and the build number lives only in the package folder and manifest (`0.1.55.3-...`). The index identity hash is
 built from the settings and the engine's version string (`conversation_file.cpp:891` writes the pair
