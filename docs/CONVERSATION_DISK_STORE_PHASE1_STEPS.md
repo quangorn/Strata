@@ -657,6 +657,19 @@ the prompt is the one a read can rebuild. Over the run: `not restored` = 0, `0/0
 was never caught: 89 queued and 89 written with **0 RAM hits** - every read came after its write had ended, so no
 `after X ms waiting for its write` line appears. Phase 14 makes the queue deep on purpose to catch that path.
 
+**Phase 14: a deep queue, and the writer keeps up.** A 36 697-token conversation is parked (`parked 36763 tokens`,
+the cache evicted 90 parked conversations in this run), eight long conversations are asked so its image goes to the
+disk, and it is asked twice: after the fillers, and after six more. The disk lines: `queued 36763 tokens (767 MiB in
+RAM until written; queue 1, 767 MiB)`, `new entry: no stored conversation is a prefix of this one's 36763 tokens`
+(a new entry, the whole image), `wrote 36763 tokens: 767 MiB in 22 blocks (18 new kv, 316.4 MiB; 4 new state,
+450.4 MiB), index 0.5 MiB rewritten, 1 file, 8060 ms (100 MB/s)`. The first follow-up read came after the write ended:
+`disk hit: 36690 tokens, 654 MiB in 1 file, 722 ms (950 MB/s)`, `restored 36690 tokens (live) in 67.0 ms`,
+`prompt 36697 tokens = 36690 reused + 7 read in 1166 ms`. The queue stayed at 1 the whole run - 96 queued, 96
+written, **0 RAM hits**, `not restored` = 0, `0/0 writes/reads failed`. So filling the cache does not widen the
+window: the writer keeps up with one conversation per park. To read a queued image, the request must come inside its
+write window (8 s for a full write of 36 763 tokens, 1.6 s for a 1218 MiB append): phase 15 asks for the conversation
+immediately after the park that evicts it.
+
 **The version rule held**: `project(strata VERSION 0.1.55)` is unchanged, the engine names itself `0.1.55-local`,
 and the build number lives only in the package folder and manifest (`0.1.55.3-...`). The index identity hash is
 built from the settings and the engine's version string (`conversation_file.cpp:891` writes the pair
