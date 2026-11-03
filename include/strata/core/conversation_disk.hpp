@@ -41,12 +41,22 @@ struct ConversationDiskOptions {
     /// copy may still be filling the park's host buffers, and the request thread cannot wait for it there without
     /// undoing the asynchronous park.  `generate.cpp` sets it to `conversation_park_join_for`; unset: nothing waits.
     std::function<void(const SavedConversation&)> join;
+    /// Temporary, on by default, to be removed after phases 2 and 3 (docs/CONVERSATION_DISK_STORE_PHASE3.md, "the
+    /// window of state blocks").  A read asks for the payload of every block below the state it lands on, so a
+    /// conversation whose states are not bounded can ask for more RAM than the host has free, and its file is then
+    /// never read (measured: a 4897 MiB entry refused at 5391 MiB free).  When a read is refused for RAM, the entry
+    /// and its files go: a file that cannot be read is not a cache, and the bytes are free for the conversations that
+    /// can.  Phases 2 and 3 bound the states per conversation (one state per flush, a window of the newest states), so
+    /// the normal fix is there and this crutch goes.  This option is the way out: true keeps a refused entry
+    /// (`--conversation-disk-keep-on-ram-refusal`); false, the default, removes it and its files.
+    bool keep_on_ram_refusal = false;
 };
 
 /// What the tier did since it started (diagnostics).
 struct ConversationDiskStats {
     size_t queued = 0, written = 0, write_failed = 0, ram_hits = 0, disk_hits = 0, read_failed = 0;
     size_t evicted = 0, waits = 0, fallbacks = 0;   ///< fallbacks: reads that landed on an earlier state (damage)
+    size_t ram_drops = 0;   ///< entries removed from the disk when a read was refused for RAM (`keep_on_ram_refusal` off)
     uint64_t bytes_written = 0, bytes_read = 0;
     uint64_t tokens_back = 0;                 ///< prompt tokens given back (not read again) by ram or disk hits
     double write_ms = 0, read_ms = 0, wait_ms = 0;
@@ -184,7 +194,8 @@ public:
     /// Only the blocks the deepest state a read can rebuild needs are read, and a damaged chain falls back to an
     /// earlier state.  `admit(need, why)` is asked before the blocks' payloads are allocated (session_file_read's RAM
     /// preflight).  `tokens` is the prefix the request matched (diagnostics).  On failure `out` is empty and `error`
-    /// says why (the entry stays: its files are a cache).
+    /// says why.  The entry stays: its files are a cache, except on a refusal for RAM, which removes it (temporary,
+    /// `keep_on_ram_refusal`).
     bool take(uint64_t id, int64_t tokens, SavedConversation& out, std::string& error,
               const std::function<bool(uint64_t need_bytes, std::string& why)>& admit = {});
 

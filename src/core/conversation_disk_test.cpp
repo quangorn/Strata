@@ -449,15 +449,17 @@ int main() {
     }
     check(tier_files(dir) == 0, "the tier removes its files when it ends");
 
-    {   // a read the RAM preflight refuses: nothing restored, the entry and its files stay
+    {   // a read the RAM preflight refuses: nothing restored; the entry and its files are removed (the crutch, see
+        // `keep_on_ram_refusal`; with that flag they stay, tested in the crutch block below)
         ConversationDiskTier tier(opts(dir, GiB));
         check(tier.open(e) && tier.put(split_image(400, 10)), "put for a refused read");
         tier.wait_idle();
         const auto m = tier.best(prompt_of(450), {}, false);
         SavedConversation back;
         const bool ok = tier.take(m.id, m.tokens, back, e, [](uint64_t, std::string& why) { why = "no RAM"; return false; });
-        check(!ok && back.kv.empty() && back.stage_images.empty() && tier.size() == 1 && tier_files(dir) == 3,
-              "refused read: empty image, the entry and its files stay");
+        check(!ok && back.kv.empty() && back.stage_images.empty() && tier.size() == 0 && tier_files(dir) == 0 &&
+              tier.stats().ram_drops == 1 && logged("dropped 400 tokens on the RAM refusal"),
+              "refused read: empty image, the entry and its files are gone, counted and logged");
         check(tier.stats().read_failed == 1, "a failed read is counted");
     }
 
@@ -648,6 +650,42 @@ int main() {
             extra.wait_idle();
             check(extra.size() == 2 && logged("no stored conversation is a prefix of this one's 1200 tokens"),
                   "append imgs: an image key the stored chain lacks starts a new entry, not an append");
+        }
+
+        {   // the crutch: a read refused for RAM removes the entry and its files (temporary, phases 2 and 3 bound the
+            // states a conversation keeps, and this rule goes)
+            fs::remove_all(sdir);
+            fs::create_directories(sdir);
+            ConversationDiskTier first(store());
+            check(first.open(e) && first.put(image(600, 46, 1000, 0, 48, 1)), "ram drop: put 600 tokens");
+            first.wait_idle();
+            const auto m = first.best(prompt_of(700), {}, false);
+            check(m.tokens == 600 && m.id != 0 && tier_files(sdir) == 2, "ram drop: the entry is on the disk");
+
+            auto keep = store();
+            keep.keep_on_ram_refusal = true;   // --conversation-disk-keep-on-ram-refusal
+            ConversationDiskTier staying(std::move(keep));
+            check(staying.open(e) && staying.size() == 1, "ram drop: the flag keeps a refused entry");
+            auto no_ram = [](uint64_t, std::string& why) {
+                why = "not enough RAM: 1 MiB available";
+                return false;
+            };
+            const uint64_t sid1 = staying.best(prompt_of(700), {}, false).id;   // the scan renumbers the entries
+            SavedConversation out2;
+            check(!staying.take(sid1, 600, out2, e, no_ram), "ram drop: the read is refused for RAM");
+            check(staying.size() == 1 && tier_files(sdir) == 2 && staying.stats().ram_drops == 0,
+                  "ram drop: with the flag the entry and its files stay for the next start");
+
+            ConversationDiskTier dropping(store());   // the default: a read refused for RAM removes the entry
+            check(dropping.open(e) && dropping.size() == 1, "ram drop: the entry taken in by the default tier");
+            const uint64_t sid2 = dropping.best(prompt_of(700), {}, false).id;
+            SavedConversation out;
+            check(!dropping.take(sid2, 600, out, e, no_ram), "ram drop: the read is refused again");
+            check(dropping.size() == 0 && tier_files(sdir) == 0 && dropping.stats().ram_drops == 1 &&
+                  logged("dropped 600 tokens on the RAM refusal"),
+                  "ram drop: the entry and its files are gone, counted and logged");
+            check(dropping.best(prompt_of(700), {}, false).tokens == 0, "ram drop: nothing matches after the removal");
+            fs::remove_all(sdir);
         }
 
         // a stale shorter copy of the same conversation: the write appends to the longest and removes the shorter one

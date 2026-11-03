@@ -1621,6 +1621,7 @@ bool ConversationDiskTier::take(uint64_t id, int64_t tokens, SavedConversation& 
     const int64_t claimed = std::min<int64_t>(tokens > 0 ? tokens : want.tokens, want.tokens);
     const std::vector<int64_t> positions = state_positions(want, claimed);
     int64_t read_at = 0;
+    bool ram_refused = false;   // the preflight said no: see `keep_on_ram_refusal`
     if (positions.empty()) {
         error = "the entry has no restorable state at or below " + std::to_string(claimed) + " tokens";
     } else {
@@ -1628,7 +1629,8 @@ bool ConversationDiskTier::take(uint64_t id, int64_t tokens, SavedConversation& 
         uint64_t need = 0;
         for (const int64_t at : positions) need = std::max(need, read_bytes_of(want, at));
         if (admit && !admit(need, error)) {
-            error = error.empty() ? "not enough RAM" : error;   // nothing was read; the entry stays
+            error = error.empty() ? "not enough RAM" : error;   // nothing was read; the entry goes only on the crutch
+            ram_refused = true;
         } else {
             for (const int64_t at : positions) {
                 std::string why;
@@ -1656,6 +1658,21 @@ bool ConversationDiskTier::take(uint64_t id, int64_t tokens, SavedConversation& 
     cv_.notify_all();   // clear() waits for the last reader
     if (read_at <= 0) {
         ++stats_.read_failed;
+        // Temporary crutch, on by default, to be removed with phases 2 and 3 (see `keep_on_ram_refusal`): a file whose
+        // blocks no read can afford is not a cache, so the entry and its files go and the bytes free up for the
+        // conversations that can be read.
+        if (ram_refused && !options_.keep_on_ram_refusal) {
+            for (size_t i = entries_.size(); i-- > 0;)
+                if (entries_[i].id == entry_id) {
+                    const uint64_t gone = entries_[i].bytes;
+                    remove_locked(i, true);
+                    ++stats_.ram_drops;
+                    lock.unlock();
+                    log(fmt("dropped %lld tokens on the RAM refusal: %.0f MiB of files are gone (%s)",
+                            (long long) claimed, mib(gone), error.c_str()));
+                    return false;
+                }
+        }
         if (error.empty()) error = "the entry could not be read";
         lock.unlock();
         out = SavedConversation{};
@@ -1735,12 +1752,12 @@ std::string ConversationDiskTier::summary() const {
     const auto& s = stats_;
     return fmt("totals: %zu queued, %zu written (%.0f MiB, %.0f MB/s), %zu RAM hits, %zu disk hits (%.0f MiB, "
                "%.0f MB/s), %llu prompt tokens given back, %zu waits for RAM (%.0f ms), "
-               "%zu removed for the budget, %zu/%zu writes/reads failed, %zu reads fell back on damage; "
-               "on disk %zu (%.0f MiB), queue %zu",
+               "%zu removed for the budget, %zu/%zu writes/reads failed, %zu reads fell back on damage, "
+               "%zu dropped on RAM refusals; on disk %zu (%.0f MiB), queue %zu",
                s.queued, s.written, mib(s.bytes_written), mbps(s.bytes_written, s.write_ms), s.ram_hits, s.disk_hits,
                mib(s.bytes_read), mbps(s.bytes_read, s.read_ms), (unsigned long long) s.tokens_back, s.waits,
-               s.wait_ms, s.evicted, s.write_failed, s.read_failed, s.fallbacks, entries_.size(), mib(bytes_),
-               queue_.size() + (writing_ ? 1 : 0));
+               s.wait_ms, s.evicted, s.write_failed, s.read_failed, s.fallbacks, s.ram_drops, entries_.size(),
+               mib(bytes_), queue_.size() + (writing_ ? 1 : 0));
 }
 
 }  // namespace strata::core

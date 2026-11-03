@@ -694,6 +694,25 @@ So in the daily logs, `not restored (not enough RAM ...)` is the preflight's rul
 path are `not restored (the entry is gone ...)` (should stay absent), `RAM hit: ...`, and
 `disk hit: ..., after X ms waiting for its write`.
 
+**The crutch for that refusal, on by default, to be removed with phases 2 and 3.** A read of a conversation whose
+state list is long asks for more RAM than the host has free, and the entry then never gets read: its bytes sit on the
+disk and give nothing back. The cheap fix: a read refused for RAM removes the entry and its files, so the bytes are
+free for the conversations that can be read. In the code this is `ConversationDiskOptions::keep_on_ram_refusal`
+(default false = remove; the flag `--conversation-disk-keep-on-ram-refusal` keeps the entry), the branch is
+`ConversationDiskTier::take` after the preflight (`ram_refused`), the count is the stat `ram_drops`, the line is
+`dropped N tokens on the RAM refusal: X MiB of files are gone (why)`, and the totals line ends with
+`N dropped on RAM refusals`. The removal runs only on a preflight refusal, not on a damaged block (a read that falls
+back on an earlier state keeps the entry). The store test checks both paths: the default tier removes the entry, its
+files and counts it (`ram drop: the entry and its files are gone, counted and logged`), and the flag keeps them
+(`ram drop: with the flag the entry and its files stay for the next start`); `conversation_disk_test` is 258 checks.
+The old check "the entry and its files stay" on a refused read now asserts the removal (the refusal test at
+`conversation_disk_test.cpp` and the totals term). Phases 2 and 3 make every file affordable to a read (one state per
+flush, a window of the newest states plus the root), so the crutch has nothing left to fix and is deleted; the list of
+what to take out is in [CONVERSATION_DISK_STORE_PHASE3.md](CONVERSATION_DISK_STORE_PHASE3.md), section 6. **Not
+measured live**: the running engine (`0.1.55.11`) does not have this code, so the `dropped N tokens on the RAM
+refusal` line and the totals term are to be checked in the daily logs after the next package build and restart; the
+163 466-token entry measured above is the one the crutch is for.
+
 **The version rule held**: `project(strata VERSION 0.1.55)` is unchanged, the engine names itself `0.1.55-local`,
 and the build number lives only in the package folder and manifest (`0.1.55.3-...`). The index identity hash is
 built from the settings and the engine's version string (`conversation_file.cpp:891` writes the pair

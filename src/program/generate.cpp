@@ -869,6 +869,11 @@ struct Options {
     /// --conversation-disk-persist: off = the files end with the engine; on = they outlive it and QUIT writes the
     /// current and the parked conversations; exit-only = the same, but nothing is written while the engine runs
     std::string conversation_disk_persist = "off";
+    /// --conversation-disk-keep-on-ram-refusal: keep a conversation whose read was refused for RAM.  By default such
+    /// a conversation and its files are removed: a file no read can afford is not a cache.  Temporary, to be removed
+    /// with phases 2 and 3 (docs/CONVERSATION_DISK_STORE_PHASE3.md, "the window of state blocks"): bounded states make
+    /// every file affordable, and this crutch has nothing left to fix.
+    bool conversation_disk_keep_on_ram = false;
     /// --serve: park only after the conversation has advanced this many tokens past the copy it would supersede.
     /// A conversation that moved a few hundred tokens writes a full snapshot again, and the turn after that drops it
     /// (drop_superseded) after writing the same bytes once more, so on a long single conversation every turn pays a
@@ -1040,6 +1045,10 @@ void usage() {
                  "                       off (default) removes them at the end; on keeps them and QUIT writes the\n"
                  "                       current and the parked ones there first; exit-only writes at QUIT alone,\n"
                  "                       nothing while the engine runs (an eviction drops a conversation)\n"
+                 "  --conversation-disk-keep-on-ram-refusal  --serve: keep a conversation whose read was refused for RAM.\n"
+                 "                       By default it and its files are removed: a file no read can afford is not a cache.\n"
+                 "                       Temporary: phases 2 and 3 bound the state blocks a conversation keeps\n"
+                 "                       (docs/CONVERSATION_DISK_STORE_PHASE3.md), and this crutch goes with them\n"
                  "  --conversation-cache-min-tokens N  --serve: park only conversations of at least N tokens, so\n"
                  "                       short side requests do not take the slots a long one needs (default 0 = park any)\n"
                  "  --conversation-cache-park-gain N  --serve: park only after the conversation advanced N tokens past\n"
@@ -3269,6 +3278,7 @@ int main(int argc, char** argv) {
         }
         else if (a == "--conversation-disk-dir") o.conversation_disk_dir = next("--conversation-disk-dir");
         else if (a == "--conversation-disk-persist") o.conversation_disk_persist = next("--conversation-disk-persist");
+        else if (a == "--conversation-disk-keep-on-ram-refusal") o.conversation_disk_keep_on_ram = true;
         else if (a == "--prompt-cache-tail") o.prompt_cache_tail = true;
         else if (a == "--prompt-cache-spread") o.prompt_cache_spread = true;
         else if (a == "--prompt-cache-every") o.prompt_cache_every = std::max(0LL, std::atoll(next("--prompt-cache-every")));
@@ -10557,6 +10567,7 @@ int main(int argc, char** argv) {
         disk_opts.dir = conversations.enabled() ? o.conversation_disk_dir : std::string();
         disk_opts.budget_bytes = (uint64_t) o.conversation_disk_mib << 20;
         disk_opts.min_free_bytes = (uint64_t) o.session_min_free_mib << 20;
+        disk_opts.keep_on_ram_refusal = o.conversation_disk_keep_on_ram;   // by default a read refused for RAM drops the entry
         // STRATA_PARK_ASYNC: the writer waits on its own thread for the background copy of the park that produced
         // an image; waiting here, in the request thread, would undo the asynchronous park
         disk_opts.join = [](const strata::core::SavedConversation& image) {

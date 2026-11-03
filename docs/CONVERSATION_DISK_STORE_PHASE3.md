@@ -125,6 +125,27 @@ Same order as phase 1: block bytes first, the store index second, the conversati
 crash can leave a block no index names (dead bytes, collected by compaction) and never an index naming
 bytes that are not there.
 
+### 6. Removing the phase-1 crutch
+
+A read asks for the payload of every block below the state it lands on, so a conversation whose states
+are not bounded can ask for more RAM than the host has free, and its file is then never read (measured
+2026-11-03: a 4897 MiB entry with 31 states refused at 5391 MiB free, `not restored (not enough RAM)`,
+the prompt read in 67 s). Phase 1 carries the crutch for that: a read refused for RAM removes the entry
+and its files by default; `ConversationDiskOptions::keep_on_ram_refusal` (off by default, set by the flag
+`--conversation-disk-keep-on-ram-refusal`) keeps the entry instead. The stat `ram_drops` counts the
+removals, the log line says `dropped N tokens on the RAM refusal`.
+
+This phase deletes the crutch, not fixes it: with one state per flush (phase 2) and the window of the
+newest states plus the root (section 4), a read asks for its K/V plus at most 7 states, so the preflight
+fits the host on this PC (the same entry: 1406.9 MiB of K/V plus 788.2 MiB of states = 2195.1 MiB plus
+the 512 MiB floor, against 5391 MiB free). What to take out in one change: the `ram_refused` branch in
+`ConversationDiskTier::take`, the option, the flag and its help line, the `ram_drops` stat and its term
+in the totals line, the store test's "ram drop" checks, and the paragraphs in
+[CONVERSATION_DISK_STORE_PHASE1_STEPS.md](CONVERSATION_DISK_STORE_PHASE1_STEPS.md). Removing it leaves
+the refusal as a plain read failure: the entry stays, the prompt is read, the bytes are not freed. A
+refusal left standing after the window is a sign the window is too big, and the answer is the window,
+not a deletion.
+
 ## Expected effect
 
 From the measurement: 14 429 MiB of 21 118 MiB, mostly one growing conversation written again (the
