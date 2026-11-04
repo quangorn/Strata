@@ -1074,7 +1074,17 @@ class StrataEngine:
                   "STRATA_ENGINE_NICE=0 turns it off)", flush=True)
         # --conversation-disk-persist on|exit-only: at QUIT the engine first writes its conversations to the disk (GBs)
         persist = args[args.index("--conversation-disk-persist") + 1] if "--conversation-disk-persist" in args else "off"
+        # --conversation-disk-flush-seconds N: a parked conversation is written N seconds after quiet (0 = at eviction
+        # and QUIT only).  QUIT collapses every due time, so a pending debounce is inside the 300 s bound below and is
+        # not a timer of its own.
+        flush = "0"
+        if "--conversation-disk-flush-seconds" in args:
+            at = args.index("--conversation-disk-flush-seconds") + 1
+            flush = args[at] if at < len(args) else "0"
         self.quit_s = ENGINE_QUIT_WAIT_S if persist == "off" else 300
+        if persist != "off" or flush not in ("", "0"):
+            when = "at eviction and QUIT only" if flush in ("", "0") else f"{flush} s after quiet"
+            print(f"[strata] conversation disk: persist {persist}, a park is written {when}", flush=True)
         end_leftover_engines(exe)                        # one an earlier run lost still holds the GPU and the memory
         spawned_at = time.monotonic()
         try:

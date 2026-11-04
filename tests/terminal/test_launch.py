@@ -916,6 +916,22 @@ class FlagsCommand(unittest.TestCase):
         self.assertEqual(a, {"--conversation-disk-persist": "on"})
         self.assertEqual(S.as_argv_changes({"--conversation-disk-persist": ""}, tune_knobs.BOOL_FLAGS)[0], {})
 
+    def test_conversation_disk_flush_seconds_survives_the_round_trip(self):
+        # the debounce is a number, so it needs no WORD_VALUE_FLAGS entry and goes through as a value; 0 is a real
+        # value (the engine's off switch), so a launcher that dropped it would turn the debounce back on silently
+        from strata_cli.launch import settings as S
+        from strata_control import tune_knobs
+        base = ["--pack", "p", "--conversation-disk-dir", "D:\\tmp\\conv"]
+        for value in ("5", "0"):
+            a, _ = S.as_argv_changes({"--conversation-disk-flush-seconds": value}, tune_knobs.BOOL_FLAGS)
+            self.assertEqual(a, {"--conversation-disk-flush-seconds": value})
+            out = tune_knobs.apply_to_argv(base, a)
+            self.assertEqual(out[-2:], ["--conversation-disk-flush-seconds", value], value)
+        for value in ("5", "0"):
+            p = self.plan("--model", "q2_0", "--set", f"conversation-disk-flush-seconds={value}")
+            self.assertEqual(p["settings"]["extra"], {"--conversation-disk-flush-seconds": value})
+            self.assertIn(f"--set conversation-disk-flush-seconds={value}", p["flags"])
+
     def test_api_key_flags(self):
         p = self.plan("--model", "q2_0", "--access", "lan", "--api-key", "sk-mine")
         self.assertEqual(p["settings"]["api_key"], "set")
