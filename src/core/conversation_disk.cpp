@@ -22,6 +22,15 @@
 #include <sys/syscall.h>
 #include <unistd.h>
 #endif
+#if defined(_WIN32)
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
 
 namespace strata::core {
 namespace {
@@ -1333,6 +1342,11 @@ void ConversationDiskTier::writer() {
 #if defined(__linux__)
     // below the serving threads: the write is background work, decode and prompt reading come first
     setpriority(PRIO_PROCESS, (id_t) syscall(SYS_gettid), 10);
+#endif
+#if defined(_WIN32)
+    // the same on Windows: below normal is deprioritized against decode without starving on a busy system, which
+    // THREAD_PRIORITY_IDLE would do once the scheduler has other work to run
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
 #endif
     for (;;) {
         Job job;
