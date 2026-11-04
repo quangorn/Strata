@@ -146,6 +146,12 @@ bool conversation_disk_index_write(const std::string& path, const ConversationDi
 bool conversation_disk_index_read(const std::string& path, const SessionFileIdentity& identity,
                                   ConversationDiskEntry& entry);
 
+/// The bytes a read of `entry` lands on reads: it rebuilds the deepest `state` block at or below `limit`, and that needs
+/// the K/V below it and every state block at or below it - not the entry's whole `.bin`, whose blocks past the state no
+/// read touches yet.  `Match::bytes` is this number, because the "read the tokens or read the file" estimate divides it
+/// by the mean read speed.  0 when the entry holds no such state.
+uint64_t conversation_disk_read_bytes(const ConversationDiskEntry& entry, int64_t limit);
+
 class ConversationDiskTier {
 public:
     explicit ConversationDiskTier(ConversationDiskOptions options);
@@ -183,7 +189,9 @@ public:
         uint64_t id = 0;        ///< the entry (stable while the writer runs; 0 = none)
         int64_t tokens = 0;
         bool live = false;
-        uint64_t bytes = 0;     ///< the entry's files (queued: the image's estimate)
+        /// What a read of this match lands on reads, not the entry's file: the blocks below the deepest `state` block
+        /// a read can rebuild (queued: the image's estimate in RAM).
+        uint64_t bytes = 0;
         bool queued = false;    ///< still in RAM: take() hands it back without reading a file
         /// The tokens a read of this match lands on: the deepest `state` block a read can rebuild (a read that fell
         /// back on damage lowers it).  The "read the file or read the tokens" estimate uses this one.
@@ -200,8 +208,11 @@ public:
             auto consider = [&](const ConversationCheckpoint& c, bool live) {
                 const int64_t n = conversation_prefix(c, prompt, images);
                 const int64_t at = e.verified > 0 ? std::min(n, e.verified) : n;   // the deepest state a read got
+                // The blocks that read needs, not the entry's file: the K/V and states below the state it lands on, and
+                // the K/V a phase 2 debounced flush appended past them is not part of the estimate
+                const uint64_t need = queued ? e.bytes : conversation_disk_read_bytes(e, at);
                 if (n > best.tokens || (n == best.tokens && n > 0 && e.id > best.id))
-                    best = {e.id, n, live, e.bytes, queued, at};
+                    best = {e.id, n, live, need ? need : e.bytes, queued, at};
             };
             consider(e.live, true);
             for (const auto& c : e.checkpoints) consider(c, false);

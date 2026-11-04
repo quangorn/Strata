@@ -827,9 +827,21 @@ one) when the disk holds a longer prefix than the session, a `--batch` slot or t
   index and `.bin` together; a park that does not fit the cache's byte budget goes to the disk too (`sent to the disk`
   in the log) instead of being dropped, and a write needs its blocks plus `--session-min-free-mib` free on the volume,
   as a session file's write does (`not enough disk space` in the log, nothing written);
-- a background thread (CPU nice 10 on Linux) writes the blocks, so a switch never waits for the disk; a conversation
-  asked for again before its write ends comes back from the write queue (a "RAM hit"). A queued image holds its RAM
-  until it is written: when RAM is short, parking and a read back wait for the queue before they evict more;
+- a background thread (CPU nice 10 on Linux, below normal priority on Windows) writes the blocks, so a switch never
+  waits for the disk; a conversation asked for again before its write ends comes back from the write queue (a "RAM hit").
+  A queued image holds its RAM until it is written: when RAM is short, parking and a read back wait for the queue before
+  they evict more. A write a `--conversation-disk-flush-seconds` park delayed is not RAM pressure: its bytes are still
+  the cache's (or an evicted image the writer already holds), so a "make room" or QUIT collapses its due time instead of
+  waiting the timer out;
+- **when the disk is written: `--conversation-disk-flush-seconds N`** (default `0`). With `0`, nothing is written at
+  park time: the disk is written when a conversation is evicted and at QUIT, as phase 1 did. With `N`, a park arms a
+  write `N` seconds out, and a second park of the same conversation replaces the first and moves the deadline (the newer
+  image wins). `1` is "write at every park"; the debounce is how long the conversation must be quiet first. An eviction
+  and QUIT ignore the debounce and write at once. A debounced flush is cheap: it appends the K/V past the last stored
+  block and **at most one end state**, and only when the end is at least `--prompt-cache-every` tokens (default 16,384)
+  past the deepest stored state, or the conversation has no state yet - never a checkpoint chain. An evicted
+  conversation and the QUIT save write the whole image, chain included, as phase 1 did. The tier's files and format do
+  not change: a debounced flush just appends fewer blocks;
 - a read back needs RAM for the whole image above `--conversation-cache-min-free-mib`, as a park does; without it the
   prompt is read again (`not restored (not enough RAM ...)`). A read keeps the conversation on the disk (the next
   eviction of it appends to the same entry) and reads only the blocks its deepest stored state needs. Every block is
@@ -839,17 +851,22 @@ one) when the disk holds a longer prefix than the session, a `--batch` slot or t
   prompt speed (the prompt path's parts of 2,048 tokens or more): a new conversation that shares only the system prompt
   with a saved one no longer reads the saved one's whole file (on the box below 6,033 MiB for 16,384 tokens, 11.4 s
   from its NVMe against ~8 s to read the tokens). Until both speeds are measured the file is read; a skip is logged
-  (`not read`, with both estimates). The tokens counted are the ones a read lands on - the deepest state the file
-  holds, and less after a fallback on damage - not what the index claims;
+  (`not read`, with both estimates). The file estimate is the blocks that read needs - the K/V below the deepest state
+  it lands on and the states at or below it - not the entry's whole file, which a debounced flush may have grown past
+  that state. The tokens counted are the ones a read lands on - the deepest state the file holds, and less after a
+  fallback on damage - not what the index claims;
 - `--conversation-disk-mib N` (default 32768): the files' total, the least recently used conversation out first (a read
   and a write both stamp it; a conversation holding a pinned shared prefix is left while another one can go, and the
   budget goes over rather than trade the pin). Without `--conversation-disk-persist` the files' identity is a random
   number of the run: only this engine reads them, and its files (`strata-conv-*`) are removed at start and when it
   ends;
-- the log has a line for each new block of a write (kind, tokens, MiB, offset), the write's summary (new K/V and new
-  states in MiB, and the size of the index it rewrote - the first time the log can tell a new block from a rewrite),
-  a line for every queue, hit and wait (MiB, ms, MB/s) and a totals line (`strata serve: conversation disk: ...`); a
-  request reused from the disk says so at the end of its line.
+- the log has a line for each new block of a write (kind, tokens, MiB, offset), a line per flush with its shape
+  (`forced` or `debounced`), the K/V and state MiB it appended, the size of the index it rewrote and how many tokens
+  past the deepest stored state it wrote (the numbers a "bytes per day, split by K/V and states" count is made of), a
+  line for every queue, hit and wait (MiB, ms, MB/s) and a totals line (`strata serve: conversation disk: ...`). The
+  MiB and MB/s count the bytes this write appended, not the conversation's whole file: an append of 122 MiB says
+  122 MiB, where phase 1's line added up every block the file held (measured on this PC: 1666 MiB for a 122.2 MiB
+  append). A request reused from the disk says so at the end of its line.
 
 `--conversation-disk-persist on|exit-only` (default `off`): the conversations outlive the engine, for whoever stops
 Strata between sessions or restarts it (an update, a settings change, a reboot). The files are bound to the session
@@ -859,7 +876,8 @@ engine version or settings, a damaged index and leftovers of an interrupted writ
 previous build wrote (its index is the older format) is refused and removed too: the store reads only the current
 format, and the worst case is one longer prompt read. A `.bin` longer than its table says (an interrupted append) is
 kept and the excess ignored until the next append cuts it back. On QUIT the
-engine parks the current conversation, moves every parked one to the disk and waits for the writes; the server waits
+engine parks the current conversation, moves every parked one to the disk and waits for the writes (a debounce still
+pending is made due at once, so it adds no timer of its own); the server waits
 up to 300 s for that (20 s otherwise). While persist is on, the engine ignores SIGINT, SIGTERM and SIGHUP and ends only
 through its stdin (the server's QUIT, or EOF when the server is gone), so Ctrl+C in the server's terminal and the
 SIGTERM a shutdown sends to every process do not cut the save short. A crash or `kill -9` keeps what was already

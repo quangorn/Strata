@@ -539,6 +539,73 @@ Measured on this PC (build folder `build-c13-gate`, Release, the serving model r
 Step 6 is next: the Windows writer priority (`THREAD_PRIORITY_BELOW_NORMAL` beside the Linux
 `PRIO_PROCESS 10`).
 
+2026-11-04. **Steps 6, 7, 8 and 9 are done, and they are green.** The writer is below normal priority on
+Windows as it is on Linux; the launcher and the server carry the debounce flag through; the plan's ten
+tests are all in; and the tier's section, its log line and the two numbers the log got wrong are fixed.
+Nothing in this block changes what is written or when: a forced write is still phase 1's whole image and
+a debounced one still appends K/V plus at most one end state.
+
+What landed:
+
+- **step 6**: in `writer()` (`conversation_disk.cpp`), `#if defined(_WIN32)` sets
+  `SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL)` beside the Linux
+  `setpriority(PRIO_PROCESS, ..., 10)`. `#include <windows.h>` sits in the file's `_WIN32` block with
+  `WIN32_LEAN_AND_MEAN` and `NOMINMAX`, as the rest of the tree does. Not `THREAD_PRIORITY_IDLE`: below
+  normal is deprioritized against decode without starving on a busy system.
+- **step 7**: `serve/server.py` reads `--conversation-disk-flush-seconds` beside
+  `--conversation-disk-persist` and logs one line with the mode the engine was started with
+  (`a park is written at eviction and QUIT only` or `N s after quiet`). The QUIT wait is unchanged at
+  300 s: QUIT collapses every due time, so a pending debounce is inside that bound and is not a timer of
+  its own. `tests/terminal/test_launch.py` has the round-trip case: `--set conversation-disk-flush-seconds=5`
+  and `=0` both become `--conversation-disk-flush-seconds <value>` on the engine line and survive the
+  plan's `extra` and `flags`; `0` stays a value, because the engine's `0` is the off switch.
+  `WORD_VALUE_FLAGS` is untouched: the flag is numeric.
+- **step 8**: the plan's ten tests are all in `conversation_disk_test.cpp` (they landed with steps 2-5,
+  one block each; test 8's cache half is in `conversation_cache_test.cpp`), and the file's header says
+  which block is which plan test.
+- **step 9**, docs: `docs/DETAILS.md`'s tier section gains the park-time write and the debounce
+  (`--conversation-disk-flush-seconds`, `0` default = phase 1's behaviour), the two write shapes (a
+  debounced flush = the K/V past the last stored block and at most one end state per
+  `--prompt-cache-every`, no chain; eviction and QUIT = the whole image), the rule that a deferred job is
+  not RAM pressure, the Windows priority, and the two corrected numbers.
+- **step 9**, the write line (`conversation_disk.cpp`): the MiB and MB/s of `wrote ...` and
+  `stats_.bytes_written` now count the bytes this write appended - the new blocks and the header of a
+  file it creates - not the entry's published size. Phase 1 summed every block of the entry, so an append
+  of 122.2 MiB logged 1666 MiB and the totals over a day's runs said 383 782 MiB where 323 955 MiB went
+  to the disk. The line also ends with the tokens past the deepest stored state (or "the entry held no
+  state before"), which is the number "one state per flush" is checked against, and the shape
+  (`forced`/`debounced`) was already there.
+- **step 9**, the `not read` estimate (`conversation_disk.{hpp,cpp}`, `generate.cpp`):
+  `conversation_disk_read_bytes(entry, limit)` returns what a read of the entry lands on reads - the
+  deepest `state` block at or below `limit`, the K/V below it and the states at or below it - and
+  `Match::bytes` is that number, not `Entry::bytes` (the `.bin` plus its index). A phase 2 entry whose
+  debounced flushes appended K/V past its deepest stored state no longer looks bigger than the blocks a
+  read needs, so the comparison against `ds.read_ms / ds.bytes_read` in `generate.cpp` weighs the blocks
+  the read actually touches; the refusal's line says "the blocks that read needs" instead of "its file".
+  A queued image keeps the image's in-RAM estimate.
+
+Measured on this PC (build folder `build-c13-gate` in the session's worktree, Release, the serving model
+running, no restart; configured with `-DFETCHCONTENT_SOURCE_DIR_STRATA_LLAMACPP` pointed at the main
+checkout's populated llama.cpp, so nothing was downloaded):
+
+- `conversation_disk_test`: **313 checks, exit 0** (311 from step 5 plus step 9's two: an append's total
+  is the appended bytes and not the entry's file, and `best().bytes` is below the file for an entry with
+  a K/V tail past its stored state).
+- `conversation_cache_test`: **4 862 checks, exit 0**; `conversation_file_test`: **183 checks, exit 0**;
+  `conversation_validation_test`: **972 host-only checks, exit 0**; `session_save_reclaim_test`:
+  **119 checks, exit 0**.
+- the engine: `--target strata` built, exit 0.
+- `pytest tests/terminal -q`: **2 041 passed, 62 skipped, 7 failed** in 32 min. The 7 are exactly the
+  ones `docs/LOCAL_FORK_CHECKS.md` lists as this PC's known failures (four `test_launch_dsv41` plan
+  cases, `test_private_files`' locked file, `test_bundle_imports`' missing `third_party/llama.cpp`,
+  `test_launch_tui`'s `FolderStep`); `test_launch.py` passes, the new round-trip case included.
+
+Still not measured: the park's duration and the debounce's effect on live traffic. Both need the serving
+model restarted on this build, and a restart is the owner's call - the serving model was left running
+through every step.
+
+Phase 2's steps, 1-9, are complete in code and tests.
+
 ## Risks and open questions
 
 - **The hot path.** `shared_ptr` in `ConversationCache` touches every park, take and admission. Any

@@ -980,6 +980,12 @@ std::string fmt(const char* f, ...) {
 
 }  // namespace
 
+uint64_t conversation_disk_read_bytes(const ConversationDiskEntry& entry, int64_t limit) {
+    // the deepest state every stage holds at or below `limit` is the one a read of that match lands on
+    const std::vector<int64_t> positions = state_positions(entry, limit);
+    return positions.empty() ? 0 : read_bytes_of(entry, positions.front());
+}
+
 // ---- container v2 (conversation_disk.hpp): the `.bin` header, the index's writer and reader.
 
 void conversation_disk_bin_header_write(uint8_t* out, const ConversationDiskBinHeader& header) {
@@ -1537,6 +1543,10 @@ void ConversationDiskTier::write(Job& job) {
     size_t blocks_written = 0;
     size_t kv_written = 0, state_written = 0;
     uint64_t kv_bytes_written = 0, state_bytes_written = 0;
+    // What this write puts on the disk: the blocks it appends and the header of a file it creates - not the entry's
+    // published size, which counts every block it has held since its first write (phase 1's log counted that, and an
+    // append of 122 MiB reported 1666 MiB; docs/CONVERSATION_DISK_STORE_PHASE2_STEPS.md, step 9)
+    uint64_t appended_bytes = 0;
     for (size_t s = 0; s < images.size() && error.empty(); ++s) {
         const SavedConversation& img = *images[s];
         ConversationDiskStage& stage = updated.stages[s];
@@ -1553,6 +1563,7 @@ void ConversationDiskTier::write(Job& job) {
             stage.file = (fs::path(options_.dir) / name).string();
             created.push_back(stage.file);
             if (!file.open_new(stage.file, header, error)) break;
+            appended_bytes += kConversationDiskBinHeader;
         } else {
             const auto& last = stage.blocks.back();
             if (!file.open_append(stage.file, header, last.offset + last.size, error)) break;
@@ -1601,6 +1612,7 @@ void ConversationDiskTier::write(Job& job) {
         }
         if (error.empty() && !file.close(error)) break;
     }
+    appended_bytes += kv_bytes_written + state_bytes_written;
 
     // 5. publish the index: the blocks are on disk, the index names them
     uint64_t bin_bytes = 0, index_bytes = 0;
@@ -1675,7 +1687,7 @@ void ConversationDiskTier::write(Job& job) {
             }
         }
         ++stats_.written;
-        stats_.bytes_written += bin_bytes;
+        stats_.bytes_written += appended_bytes;
         stats_.write_ms += ms;
         on_disk = entries_.size();
         disk_bytes = bytes_;
@@ -1684,17 +1696,21 @@ void ConversationDiskTier::write(Job& job) {
     std::string state_note;
     if (job.forced) state_note = "the whole image";
     else if (write_state) state_note = "the end state written";
-    else
-        state_note = "no end state (" + std::to_string((int64_t) tokens - deepest_state) +
-                     " tokens past the deepest stored state, under --prompt-cache-every)";
+    else state_note = "no end state (under --prompt-cache-every)";
+    // what the validation of "one state per flush" counts: the growth since the deepest state the entry stored
+    const int64_t past = (int64_t) tokens - deepest_state;
+    const std::string past_note =
+            target ? std::to_string(past) + " tokens past the deepest stored state"
+                   : std::to_string(past) + " tokens, the entry held no state before";
     images.clear();
     job.image.reset();   // the RAM goes back now, written or not (the cache may hold the same allocation)
-    log(fmt("wrote %zu tokens%s: %.0f MiB in %zu blocks (%zu new kv, %.1f MiB; %zu new state, %.1f MiB), index "
+    log(fmt("wrote %zu tokens%s: %.1f MiB appended in %zu blocks (%zu new kv, %.1f MiB; %zu new state, %.1f MiB), index "
             "%.1f MiB rewritten, %zu file%s, %.0f ms (%.0f MB/s); on disk %zu, %.0f MiB; "
-            "%zu removed for the budget, %zu superseded; %s write, %s", tokens, target ? " (appended)" : "", mib(bin_bytes),
-            blocks_written, kv_written, mib(kv_bytes_written), state_written, mib(state_bytes_written), mib(index_bytes),
-            nstages, nstages == 1 ? "" : "s", ms, mbps(bin_bytes, ms), on_disk, mib(disk_bytes), made_room, superseded,
-            shape, state_note.c_str()));
+            "%zu removed for the budget, %zu superseded; %s write, %s; %s", tokens, target ? " (appended)" : "",
+            mib(appended_bytes), blocks_written, kv_written, mib(kv_bytes_written), state_written,
+            mib(state_bytes_written), mib(index_bytes), nstages, nstages == 1 ? "" : "s", ms,
+            mbps(appended_bytes, ms), on_disk, mib(disk_bytes), made_room, superseded, shape, state_note.c_str(),
+            past_note.c_str()));
     if (pins)
         log(fmt("on disk %.0f MiB is over the budget of %.0f MiB: %zu pinned conversation%s kept, a pin is never "
                 "traded for room", mib(disk_bytes), mib(options_.budget_bytes), pins, pins == 1 ? "" : "s"));

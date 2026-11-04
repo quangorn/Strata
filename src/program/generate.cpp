@@ -14426,8 +14426,8 @@ int main(int argc, char** argv) {
                     if (file_s >= tokens_s) {
                         from_disk = false;
                         std::fprintf(stderr, "strata serve: conversation disk: not read: its %lld more tokens read in "
-                                             "~%.1f s, its file (%.0f MiB) in ~%.1f s\n", (long long) added, tokens_s,
-                                     (double) on_disk.bytes / (1024.0 * 1024.0), file_s);
+                                             "~%.1f s, the blocks that read needs (%.0f MiB) in ~%.1f s\n",
+                                     (long long) added, tokens_s, (double) on_disk.bytes / (1024.0 * 1024.0), file_s);
                     }
                 }
                 if (from_disk) {

@@ -10,7 +10,8 @@
 // bypass, QUIT bypass) are the four "debounce"/"reset"/"eviction"/"quit" blocks, written with step 3; 6 and 7 (one end
 // state per --prompt-cache-every, a flush under it writes K/V and no state) are the "shape" block, with step 4; 3, 8
 // and 9 (a read cancels a queued write, the same allocation comes back, a take during a write waits) are the "cancel"
-// and "take-writing" blocks, with step 5.
+// and "take-writing" blocks, with step 5.  Step 9's two log fixes are in the "shape" block too: an append's totals count
+// the bytes appended, not the entry's published size, and best().bytes is the blocks a read lands on, not the file.
 #include "strata/core/conversation_disk.hpp"
 
 #include <algorithm>
@@ -399,7 +400,8 @@ int main() {
         check(logged("wrote 600 tokens") && logged("2 files"), "the write is logged");
         const auto live = tier.best(prompt_of(700), {}, false);
         check(live.tokens == 600 && live.live && live.id != 0, "best: the live state as a prefix");
-        check(!live.queued && live.bytes == tier.bytes() && live.bytes > 0, "best: a written entry, its files' bytes");
+        check(!live.queued && live.bytes > 0 && live.bytes <= tier.bytes(),
+              "best: the blocks a read lands on, inside the entry's file");
         const auto ck = tier.best([] { auto p = prompt_of(300); p.push_back(7); return p; }(), {}, false);
         check(ck.tokens == 300 && !ck.live, "best: the deepest checkpoint as a prefix");
         check(tier.best([] { auto p = prompt_of(150); p.push_back(7); return p; }(), {}, false).tokens == 150,
@@ -664,6 +666,7 @@ int main() {
                   after2.live.ids.size() == 1200,
               "shape: its keys are only the states it has blocks for");
         // 100 tokens past the stored state (< 512): K/V only, no state
+        const auto written_before_kv_only = tier.stats().bytes_written;
         tier.park(1, std::make_shared<SavedConversation>(image(1300, 72)));
         check(wait_until([&] { return tier.stats().written == 3; }), "shape: the third debounced flush");
         ConversationDiskEntry after3;
@@ -671,10 +674,22 @@ int main() {
         check(states_of(after3) == 2 && after3.tokens == 1200 && after3.live.ids.size() == 1200,
               "shape: 100 tokens past the stored state: the K/V is written, no end state");
         check(kv_end_of(after3) == 1300 && kv_end_of(after3) > kv_end1, "shape: the K/V past the stored state is on the disk");
+        // step 9: the totals count the bytes this write appended, not the entry's published size (phase 1's log reported
+        // the whole file for every append: 1666 MiB for a 122 MiB write)
+        const auto written_after_kv_only = tier.stats().bytes_written;
+        check(written_after_kv_only > written_before_kv_only &&
+                  written_after_kv_only - written_before_kv_only < tier.bytes() / 4,
+              "shape: an append counts what it appended, not the entry's whole file");
         check(tier.best(prompt_of(1300, 1000), {}, false).tokens == 1200,
               "shape: best() claims the stored state, not the K/V tail");
+        // step 9: the "read the tokens or read the file" estimate weighs the blocks a read of that state lands on, not
+        // the entry's whole file: the 100-token K/V tail the entry appended and no state covers is not counted
+        const auto near = tier.best(prompt_of(1300, 1000), {}, false);
+        check(near.bytes > 0 && near.bytes < tier.bytes(),
+              "shape: best() bytes is the blocks below the stored state, under the entry's file");
         check(logged("debounced write, the end state written") &&
-                  logged("debounced write, no end state (100 tokens past the deepest stored state"),
+                  logged("debounced write, no end state (under --prompt-cache-every)") &&
+                  logged("100 tokens past the deepest stored state"),
               "shape: the write says which shape it was and why a state was skipped");
         SavedConversation back;
         const auto m = tier.best(prompt_of(1300, 1000), {}, false);
