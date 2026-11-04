@@ -282,6 +282,7 @@ def focused_recovery_prompt(tok, ids, generated):
 
 LOOPBACK_NAMES = ("localhost", "127.0.0.1", "::1")
 QUEUE_BEAT_S = 10.0         # a request waiting for the single turn sends a keep-alive this often (#1619)
+TURN_WAIT_REPORT_S = 30.0   # a request waiting for the turn this long reports its holder and the stacks, once
 KEEPALIVE_S = 10.0          # a held-back tool argument leaves the stream quiet: ping at least this often
 # Anthropic clients add /v1/messages to their base URL themselves. A base URL that already ends in /v1 (copied from an OpenAI-style
 # setup) makes them post /v1/v1/messages; these two paths mean the same as the real ones. Nothing else is aliased.
@@ -4192,6 +4193,12 @@ class Service:
         self.config_effort = None                     # #1641: the config's "reasoning_effort": the level for requests with none
         self.keep_awake = None                        # #1727 (opt-in): serve.keepawake.KeepAwake, the config's "prevent_sleep"
         self.fifo = threading.Lock()
+        # who holds the single turn, and which taking of it (a token): a request that left without closing its
+        # generator used to keep the turn silently until the GC freed it, and every later request queued for minutes
+        # with busy=false and nothing in the log.  See Service._turn_take / turn_wait_report.
+        self.turn_owner: int | None = None
+        self.turn_token: int | None = None
+        self.turn_seq = 0
         self.slot_save_path = None                    # --slot-save-path: /slots/0?action=save|restore (off when None)
         self.embeddings = threading.local()           # the current request's image embeddings file (GENI)
         self.api_key = ""                              # when set, /v1/* needs it (Bearer or x-api-key)
@@ -4381,6 +4388,55 @@ class Service:
             yield
         finally:
             self.fifo.release()
+
+    def _turn_take(self, timeout: float | None = None) -> int | None:
+        """Take the engine's single turn, remembered with the thread that holds it (a token names this taking).
+        A request whose client went away could otherwise leave the turn to a generator the GC frees later: the
+        queue then waits for minutes with busy=false and not one line in the log."""
+        got = self.fifo.acquire() if timeout is None else self.fifo.acquire(timeout=timeout)
+        if not got:
+            return None
+        with self.status_lock:
+            self.turn_seq += 1
+            self.turn_owner = threading.get_ident()
+            self.turn_token = self.turn_seq
+            return self.turn_token
+
+    def _turn_give(self, token: int | None = None) -> None:
+        """Release the turn taken by `token` (None: whoever holds it now, a forced take-back).  A request that was
+        forced out and later closes its generator only passes its own old token, so it never frees another one's turn;
+        an untracked holder (an image encode, a session save) leaves turn_owner None and is left alone."""
+        with self.status_lock:
+            if self.turn_owner is None:
+                return
+            if token is not None and token != self.turn_token:
+                return
+            self.turn_owner, self.turn_token = None, None
+        try:
+            self.fifo.release()
+        except RuntimeError:                    # already released by a forced take-back
+            pass
+
+    def turn_wait_report(self, request_id: str, waited_s: float) -> None:
+        """A request that waited for the turn this long says who holds it, once, with every thread's stack in the
+        log; if the holder's thread is gone (an abandoned request), the turn is taken back so the queue moves on."""
+        with self.status_lock:
+            owner, queued = self.turn_owner, self.status.get("queued")
+        if owner is None:
+            print(f"[strata] request {request_id} has waited {waited_s:.0f} s for the engine's turn, which no "
+                  f"generation holds (an image encode or a session save), queued {queued}", flush=True)
+        else:
+            alive = owner in {t.ident for t in threading.enumerate()}
+            print(f"[strata] request {request_id} has waited {waited_s:.0f} s for the engine's turn: the holder is "
+                  f"thread {owner}, {'alive' if alive else 'GONE'}, queued {queued}", flush=True)
+            if not alive:
+                print(f"[strata] the holder thread {owner} of the engine's turn is gone (a request left without "
+                      "closing its generator): taking the turn back so the queue moves", flush=True)
+                self._turn_give()
+                return
+        import faulthandler
+        faulthandler.dump_traceback(file=sys.stderr)
+        sys.stderr.flush()
 
     def begin_drain(self) -> int:
         """Stop new inference admission and return the number of owned calls to drain."""
@@ -5596,23 +5652,26 @@ class Service:
                 # #1619: a request waiting for the single turn sends a keep-alive every QUEUE_BEAT_S, so a client with
                 # a stream idle timeout does not abort a healthy queued request (and its retry read the prompt again);
                 # a client that left while queued gives its place up instead of taking the turn only to cancel there
-                got = False
-                while not got:
+                got, waited_from, reported = None, time.monotonic(), False
+                while got is None:
                     if cancel.is_set():
                         raise QueueCancelled("the client disconnected while waiting for the engine")
                     left = deadline - time.monotonic() if deadline is not None else QUEUE_BEAT_S
                     if left <= 0:
                         raise QueueWaitExpired("the inference queue wait deadline expired; retry later")
-                    got = self.fifo.acquire(timeout=min(QUEUE_BEAT_S, left))
-                    if got:
+                    got = self._turn_take(min(QUEUE_BEAT_S, left))
+                    if got is not None:
                         if cancel.is_set():
-                            self.fifo.release()
+                            self._turn_give(got)
                             raise QueueCancelled("the client disconnected while waiting for the engine")
                         if deadline is not None and time.monotonic() >= deadline:
-                            self.fifo.release()
+                            self._turn_give(got)
                             raise QueueWaitExpired("the inference queue wait deadline expired; retry later")
-                        turn.callback(self.fifo.release)
+                        turn.callback(self._turn_give, got)
                     else:
+                        if not reported and time.monotonic() - waited_from >= TURN_WAIT_REPORT_S:
+                            reported = True
+                            self.turn_wait_report(request_id, time.monotonic() - waited_from)
                         yield "ping", None
             with turn:
                 try:
