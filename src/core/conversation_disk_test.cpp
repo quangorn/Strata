@@ -12,6 +12,10 @@
 // and 9 (a read cancels a queued write, the same allocation comes back, a take during a write waits) are the "cancel"
 // and "take-writing" blocks, with step 5.  Step 9's two log fixes are in the "shape" block too: an append's totals count
 // the bytes appended, not the entry's published size, and best().bytes is the blocks a read lands on, not the file.
+// A review after step 9 added three blocks: "superseded" (a superseded conversation cancels without waiting for its
+// running write - the wait is take-only), "cancel-deferred" (the cache's cancel of a still-queued write leaves no file)
+// and test 10's second half in "the cache's events drive the disk tier" (a forced write keeps the checkpoint chain and
+// says so).
 #include "strata/core/conversation_disk.hpp"
 
 #include <algorithm>
@@ -517,7 +521,7 @@ int main() {
             case CacheEvent::parked: ++parked_events; tier.park(serial, std::move(image)); break;
             case CacheEvent::evicted: ++evicted_events; tier.force(serial, std::move(image)); break;
             case CacheEvent::taken: ++taken_events; tier.dropped(serial); break;
-            case CacheEvent::superseded: tier.dropped(serial); break;
+            case CacheEvent::superseded: tier.dropped(serial, false); break;
             case CacheEvent::cleared: tier.cancel_all(); break;
             }
         });
@@ -525,10 +529,15 @@ int main() {
         tier.wait_idle();
         check(parked_events == 1 && tier.stats().written == 0 && tier.size() == 0 && tier_files(dir) == 0,
               "flush 0: a park queues no write and creates no file");
+        lines_clear();   // the forced write below must be the one that says so
         check(cache.put(image(400, 12, 8000)), "park b: a leaves RAM");
         tier.wait_idle();
         check(evicted_events == 1 && cache.size() == 1 && cache.evictions() == 1 && tier.size() == 1, "a is on the disk");
         check(tier.best(prompt_of(450), {}, false).tokens == 400, "a matches on the disk");
+        // plan test 10's other half: the eviction wrote the WHOLE image - the checkpoint chain too, and it says so
+        const auto chain = tier.best(prompt_of(300), {}, false);
+        check(chain.tokens == 200 && !chain.live, "flush 0: the evicted image's checkpoints are on the disk (forced shape)");
+        check(logged("forced write, the whole image"), "flush 0: the write says it took the forced shape");
         check(cache.best(prompt_of(450, 8000), {}, false).tokens == 400, "b stays in RAM");
         // the event comes before take() hands the image over (its queued write is cancelled, step 5)
         auto b_image = cache.take(cache.best(prompt_of(450, 8000), {}, false).index);
@@ -751,6 +760,55 @@ int main() {
               "take-writing: the reader keeps the image, the tier's handle is gone");
         check(tier.stats().written == 1 && tier.size() == 1, "take-writing: the write finished and published the entry");
         fs::remove_all(wdir);
+    }
+
+    {   // a superseded conversation does not wait for its write (review fix): the cache drops its own copy and nothing
+        // moves out of the image, so the parking thread must not stall on a whole background write
+        const fs::path adir = dir / "superseded-nowait";
+        fs::remove_all(adir);
+        fs::create_directories(adir);
+        auto o = opts(adir, GiB);
+        std::promise<void> started, release;
+        o.before_write = [&] {
+            started.set_value();
+            release.get_future().wait();
+        };
+        ConversationDiskTier tier(std::move(o));
+        check(tier.open(e), "superseded: open");
+        lines_clear();   // an earlier block's take logged its wait
+        auto img = std::make_shared<SavedConversation>(image(400, 82));
+        check(tier.force(9, img), "superseded: the forced write is queued");
+        started.get_future().wait();   // the writer holds the job now
+        std::future<void> superseded = std::async(std::launch::async, [&] { tier.dropped(9, false); });
+        check(superseded.wait_for(std::chrono::milliseconds(100)) == std::future_status::ready,
+              "superseded: the cancel returns while the write still runs (no wait on the park path)");
+        superseded.get();
+        release.set_value();
+        tier.wait_idle();
+        check(tier.stats().written == 1 && tier.size() == 1, "superseded: the running write finished on its own");
+        check(!logged("the cache took the image back"), "superseded: and nothing was waited for");
+        fs::remove_all(adir);
+    }
+
+    {   // the cache cancels a deferred write (plan test 3 through the tier's own seam): a park whose conversation is
+        // then taken/superseded leaves no file at all, and its RAM is the caller's again
+        const fs::path ddir = dir / "cancel-deferred";
+        fs::remove_all(ddir);
+        fs::create_directories(ddir);
+        auto o = opts(ddir, GiB);
+        o.flush_seconds = 1;
+        ConversationDiskTier tier(std::move(o));
+        check(tier.open(e), "cancel-deferred: open");
+        auto img = std::make_shared<SavedConversation>(image(400, 83));
+        tier.park(5, img);
+        check(img.use_count() == 2, "cancel-deferred: the queued job shares the allocation");
+        tier.dropped(5, false);
+        check(img.use_count() == 1, "cancel-deferred: the cancel let the image go");
+        std::this_thread::sleep_for(std::chrono::milliseconds(1300));   // well past the deadline
+        check(tier.stats().written == 0 && tier.size() == 0 && tier_files(ddir) == 0,
+              "cancel-deferred: the cancelled job is never written and creates no file");
+        check(tier.stats().queued == 1, "cancel-deferred: it was queued once and never written");
+        fs::remove_all(ddir);
     }
 
     {   // the block store's write path: append (across runs), page-aligned kv blocks, a torn tail cut back

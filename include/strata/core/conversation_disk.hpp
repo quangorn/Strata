@@ -171,9 +171,11 @@ public:
     /// behaviour byte for byte.  With `--conversation-disk-flush-seconds N` a park arms a write due in `N` seconds
     /// (a second park of the same entry replaces it, keeping its id), and eviction or QUIT forces the write at once.
     void park(uint64_t serial, std::shared_ptr<const SavedConversation> image);
-    /// The conversation `serial` left the cache (taken or superseded): a queued write of it is cancelled, and a write
-    /// already running for it is waited for (the caller moves sub-objects out of the shared image next).
-    void dropped(uint64_t serial);
+    /// The conversation `serial` left the cache: a queued write of it is cancelled.  `wait_running` (the cache's
+    /// `taken` event) also waits for a write already running for that serial, because the restore path moves sub-objects
+    /// out of the shared image next; the cache's `superseded` event must pass false - nothing moves out of that image,
+    /// and the caller is the parking thread, which would wait a whole write on the hot path.
+    void dropped(uint64_t serial, bool wait_running = true);
     /// Writes `image` whole (eviction or QUIT), now: phase 1's put(), with the cache entry's serial.  Its RAM is freed
     /// when the write ends, stored or not.
     bool force(uint64_t serial, std::shared_ptr<const SavedConversation> image);

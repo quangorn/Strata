@@ -981,9 +981,11 @@ std::string fmt(const char* f, ...) {
 }  // namespace
 
 uint64_t conversation_disk_read_bytes(const ConversationDiskEntry& entry, int64_t limit) {
-    // the deepest state every stage holds at or below `limit` is the one a read of that match lands on
+    // the deepest state every stage holds at or below `limit` is the one a read of that match lands on; the read also
+    // charges each stage's `.bin` header, as read_entry_image() does
     const std::vector<int64_t> positions = state_positions(entry, limit);
-    return positions.empty() ? 0 : read_bytes_of(entry, positions.front());
+    if (positions.empty()) return 0;
+    return read_bytes_of(entry, positions.front()) + kConversationDiskBinHeader * entry.stages.size();
 }
 
 // ---- container v2 (conversation_disk.hpp): the `.bin` header, the index's writer and reader.
@@ -1245,21 +1247,29 @@ void ConversationDiskTier::remove_locked(size_t index, bool delete_files) {
     entries_.erase(entries_.begin() + (std::ptrdiff_t) index);
 }
 
-void ConversationDiskTier::dropped(uint64_t serial) {
+void ConversationDiskTier::dropped(uint64_t serial, bool wait_running) {
     if (!open_ || serial == 0) return;
     std::unique_lock<std::mutex> lock(m_);
+    bool cancelled = false;
     for (auto it = queue_.begin(); it != queue_.end();)
-        it = it->second.serial == serial ? queue_.erase(it) : std::next(it);
+        if (it->second.serial == serial) {
+            it = queue_.erase(it);
+            cancelled = true;
+        } else {
+            ++it;
+        }
+    if (cancelled) cv_.notify_all();   // wait_idle() may be waiting on the queue this just emptied
+    if (!wait_running) return;
     // A write already running for this entry reads the same allocation, and the caller is about to move sub-objects
-    // out of it (the restore path): wait for that write, on this serial only (bounded by one write).
+    // out of it (the restore path): wait for that write, on this serial only (bounded by one write).  Only `taken`
+    // asks for this: a superseded image is not moved out of, and this path runs on the parking thread.
     if (writing_ && writing_serial_ == serial) {
         const auto t0 = std::chrono::steady_clock::now();
         const size_t tokens = writing_entry_.live.ids.size();
         cv_.wait(lock, [&] { return !(writing_ && writing_serial_ == serial); });
         const double ms = ms_since(t0);
         lock.unlock();
-        log(fmt("cancelled the write of %zu tokens after waiting %.0f ms for it: the cache took the image back", tokens,
-                ms));
+        log(fmt("waited %.0f ms for the write of %zu tokens to end: the cache took the image back", ms, tokens));
     }
 }
 
@@ -1729,6 +1739,7 @@ bool ConversationDiskTier::take(uint64_t id, int64_t tokens, std::shared_ptr<Sav
             const uint64_t b = it->second.entry.bytes;
             out = std::move(it->second.image);
             queue_.erase(it);
+            cv_.notify_all();   // wait_idle() may be waiting on the queue this just emptied
             ++stats_.ram_hits;
             stats_.tokens_back += (uint64_t) std::max<int64_t>(tokens, 0);
             lock.unlock();

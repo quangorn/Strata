@@ -3267,7 +3267,7 @@ int main(int argc, char** argv) {
             int64_t number = 0;
             const auto result = std::from_chars(value.data(), value.data() + value.size(), number);
             const int64_t limit = (a == "--conversation-cache-slots" || a == "--conversation-cache-min-tokens" ||
-                                   a == "--conversation-cache-park-gain")
+                                   a == "--conversation-cache-park-gain" || a == "--conversation-disk-flush-seconds")
                                       ? INT32_MAX : INT64_MAX / (1024 * 1024);
             if (result.ec != std::errc{} || result.ptr != value.data() + value.size() || number < 0 || number > limit) {
                 std::fprintf(stderr, "%s needs a nonnegative integer within range\n", a.c_str());
@@ -10616,8 +10616,12 @@ int main(int argc, char** argv) {
                     if (disk_writes) conv_disk.park(serial, std::move(image));
                     break;
                 case strata::core::CacheEvent::taken:
+                    conv_disk.dropped(serial);   // the cache hands the image out: cancel, and wait for a running write
+                    break;
                 case strata::core::CacheEvent::superseded:
-                    conv_disk.dropped(serial);   // the cache handed the image out: a queued write of it must not run
+                    // the cache dropped its copy and nothing moves out of the image: cancel the queued write and go on -
+                    // waiting here would stall the parking thread for a whole write (the spec's wait is take-only)
+                    conv_disk.dropped(serial, false);
                     break;
                 case strata::core::CacheEvent::evicted:
                     if (disk_writes) conv_disk.force(serial, std::move(image));   // queued; a refusal is in its log
