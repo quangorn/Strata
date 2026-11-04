@@ -632,15 +632,28 @@ asked to read phase 2 against the spec (its report is not in the repo). What it 
   of a still-queued write leaves no file at all), and test 10's second half (a forced write keeps the
   checkpoint chain and says `forced`), which the review called out as only half-checked.
 
-Not fixed, recorded here as the reviewer's remaining points:
+Decided on 2026-11-04 — the review's QUIT point, **kept as it is**:
 
 - **QUIT and persist do not write a pinned conversation as the whole image.** `evict_oldest()` skips an
   entry holding a pinned shared prefix (and the guarded donor), so the QUIT loop never forces it: with
   flush `N` its deferred job is collapsed by `wait_idle()` and written in the debounced shape, and with
   flush `0` it is not written at all. This is phase 1's behaviour for flush `0`; the debounced shape is
   the new part, and it contradicts "the QUIT save writes the whole image" for a conversation the budget
-  keeps for its pin. Fixing it means a QUIT-time pass over the cache's entries rather than an eviction
-  loop, which changes the QUIT path - a decision for the owner, not a review fix.
+  keeps for its pin. **No QUIT-time pass over the cache's entries.** That fix changes the one path where
+  the engine waits for the disk synchronously at the end of its life, it sits inside the server's 300 s
+  QUIT bound (`serve/server.py:1084`), and it breaks "the default path stays byte-identical"
+  (CONTRIBUTING). The store is a cache and a pin is part of it: a crash costs one longer prompt read, so
+  buying a whole-image write at QUIT for a prefix the budget refuses to trade is not worth changing the
+  shutdown path. The behaviour is now tested, not only written: the blocks "pinned quit debounced" (the
+  pinned conversation gets one end state and no chain, the evicted one gets the forced whole image) and
+  "pinned quit off" (the pinned conversation is not written at all) in
+  [src/core/conversation_disk_test.cpp](../src/core/conversation_disk_test.cpp); [DETAILS.md](DETAILS.md)
+  names the exception in the text. Run on this PC (Windows 10, CPU-only test, `build-c13-gate` with
+  `-DSTRATA_BUILD_CONVERSATION_TESTS=ON`) the same day: `conversation_disk_test` **341 checks passed**
+  (the two blocks add 16 `check()`s), `conversation_cache_test` **4862 checks passed**.
+
+Not fixed, recorded here as the reviewer's remaining points:
+
 - **`published_` grows for the whole run** (one pair per append, pruned only by `clear()`), and `take()`
   scans it linearly. Small, but unbounded.
 - **`write()` calls `chain_prefix()` for every entry under the tier's mutex**, and that recomputes the
@@ -649,6 +662,89 @@ Not fixed, recorded here as the reviewer's remaining points:
   number the restart is for.
 - the queued-image handback still relies on the caller not moving sub-objects out of an image the cache
   also holds (today `added > 0` keeps that path unreachable); the invariant lives in `generate.cpp`.
+
+## The first hardware numbers (2026-11-04)
+
+`tools/agent_turns_bench.py` ran the scripted coding-agent traffic (5 sessions, 23 turns, prompts from
+2 199 to 53 668 tokens, the same requests on both arms) on this PC (RTX 4080 16 GB, 48 GB RAM,
+Windows 10, engine `0.1.55.13-windows-x86_64-cuda-cuda13`, base config `strata-swift-iq2_xs.json`,
+cache 6144 MiB / 8 slots / park minimum 16384 tokens), one round, each arm on a fresh store folder with
+the same budget:
+
+| arm | flush | writes | shapes | K/V | states | index | park median | park p95 | park max | queue waits | decode median |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| A | `0` | 1 | 1 forced whole image | 1064 MiB | 788 MiB | 2 MiB | 313.4 ms | 797.0 ms | 4500.4 ms | 1 wait, 4297 ms | 133.1 tok/s |
+| B | `5` | 10 | 9 debounced (9 wrote a state), 1 forced | 4796 MiB | 1689 MiB | 5 MiB | 305.2 ms | 1523.7 ms | 1636.8 ms | 1 wait, 679 ms | 133.8 tok/s |
+
+- **the gate the plan sets for `shared_ptr` passes:** 16 parks in each arm (the same turns park the same
+  conversations), and the park's median is the same on both arms — 313.4 ms against 305.2 ms;
+- **the request path did not slow down:** B is x1.016 against A on the per-turn decode median
+  (12 of 23 turns faster), inside the run-to-run movement this harness reports;
+- A wrote once because exactly one conversation was evicted; B wrote ten because every park gets its own
+  debounced flush. The bytes are K/V-dominated: 4796 MiB K/V against 1689 MiB states. The growth past the
+  deepest stored state was 52 573 tokens (median), max 123 621 — far over `--prompt-cache-every` 16384,
+  which is why 9 of the 10 flushes wrote a state;
+- B's park p95 is worse (1523.7 ms against 797.0 ms), from one long park. One round cannot tell that from
+  noise: the same run needs more rounds before this number means anything;
+- **this traffic does not cover the read path: 0 disk hits, 0 `not read`, 0 RAM hits in both arms.** The
+  23 turns never ask for a conversation the cache has given up, so the queue's RAM hits, `not read`,
+  waits for RAM and supersede are untouched. The read gates need traffic that fills the cache with several
+  conversations and then continues an evicted one, as phase 1's scripted runs did;
+- QUIT is not in these numbers: the harness ends the server with `terminate()`, which sends no QUIT. QUIT's
+  own duration comes from stopping the serving profile (this PC: 1.5 s and 16.8 s on the two restarts of
+  this day, in [CONVERSATION_DISK_STORE_MEASUREMENTS.md](CONVERSATION_DISK_STORE_MEASUREMENTS.md) the
+  earlier numbers are 3.9 s for 13 entries and 17.0 s on the 2x CMP box).
+
+The table is what `tools/phase2_disk_ab.py` reads out of the engine's own log: it splits a log at each
+`engine started:` line, takes the flags that run started with, and counts the shapes, the bytes split, the
+park durations, the waits, the reads and refusals, and the QUIT line. `--csv` writes one row per run.
+
+### The read path, measured on purpose-built traffic (2026-11-04)
+
+The same two arms, on traffic made to exercise the read gates: `tools/phase2_disk_traffic.py` grows 4
+conversations to ~100 000 prompt tokens each (one request per ~8000-character tool result, so the RAM cache
+fills and gives conversations up), asks for the first grown conversation by its stored prefix, continues it
+with one new tool result, sends a conversation the tier never held, and asks for the first conversation
+again after the append. 242 parks, ~380 requests per arm, prompts 137 to 105 227 tokens, on this PC and the
+same engine, cache 6144 MiB / 8 slots, each arm on its own fresh store folder with a 60000 MiB budget:
+
+| arm | flush | writes | shapes | K/V | states | index | disk hits | 'not read' | RAM hits | park median | park p95 |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| A | `0` | 2 | 2 forced whole image | 1737 MiB | 1576 MiB | 4 MiB | 1 (1544 MiB, 100 860 tokens) | 1 refusal, 132 tokens | 0 | 286.0 ms | 409.4 ms |
+| B | `5` | 8 (3 appended) | 3 forced, 5 debounced (5 wrote a state) | 4381 MiB | 2590 MiB | 9 MiB | 1 (1545 MiB, 100 912 tokens) | 1 refusal, 132 tokens | 0 | 281.4 ms | 389.1 ms |
+
+- **the debounced flush is where an append lives:** B appended to entries the disk already held 3 times, A
+  never appended (its writes were the evictions). The bytes a debounced run moves are bigger than the
+  evictions-only run's — 6971 MiB against 3313 MiB — because it writes the K/V delta at every quiet period;
+  5 of B's 8 writes wrote a state, and the growth past the deepest stored state was ~100 900 tokens median
+  (max 105 274), far over `--prompt-cache-every`;
+- **the queue stays shallow under the debounce.** The reviewer's worry that a debounce writes far more often
+  is right about the count, not the depth: 242 parks queued 219 jobs (`queued` is a counter, not a depth),
+  and every park line reported `queue 1`, because a new park of the same conversation replaces its queued job.
+  The writer never fell behind a depth of 1, which is the number measured on 0.1.55.11 before this;
+- **the park duration does not get worse with the debounce**: median 281.4 ms against 286.0 ms, p95 389.1
+  against 409.4 (the single worst park is B's, 452.9 ms against A's 1049.8 ms; the same traffic parks the
+  same conversations);
+- reuse is the same on both arms: 17.88M tokens reused against 18.04M, 466 976 tokens read again against
+  467 341, over ~380 requests;
+- **two gates are still not covered by any scripted traffic: RAM hits (0 on both arms) and supersede (0
+  writes reporting a superseded entry).** A RAM hit needs the tier's queue to hold a conversation the cache
+  has already given up, so the disk's queue must carry a longer prefix than the cache — and in this traffic
+  losing a conversation from the cache is always an eviction, which forces its write. So a queued
+  (deferred) image can be taken back only when the request arrives inside the quiet window before the
+  writer starts; these runs never arranged that ordering, which is why B's 242 deferred parks gave 0 RAM
+  hits. The same allocation handback and the "a take during a write waits for that write" are covered by
+  the offline blocks `conversation_disk_test` ("take-writing", "cancel"); the hardware numbers for them need
+  traffic that parks a conversation, evicts it without forcing, and re-asks its prefix inside the window.
+  A supersede needs a continuation whose image keys change, which the phase 1 run produced by giving the
+  assistant text of a turn that differs from the parked one. QUIT is outside these runs: the harness ends
+  the server with `terminate()`, which sends no QUIT.
+
+The tool that grew this traffic records `usage.prompt_tokens` for every request. The first version tracked
+the size by `timings.prompt_n`, which counts only the tokens a request prefilled (the reused KV is not in
+it); on this PC such a loop grew one conversation to 259 886 tokens and the server answered the next request
+with "request exceeds the context window: prompt (262165 tokens) leaves no room to answer in the context
+(262144)". The engine was fine; the loop was wrong, and the fix tracks the whole prompt.
 
 ## Risks and open questions
 

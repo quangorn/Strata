@@ -16,6 +16,9 @@
 // running write - the wait is take-only), "cancel-deferred" (the cache's cancel of a still-queued write leaves no file)
 // and test 10's second half in "the cache's events drive the disk tier" (a forced write keeps the checkpoint chain and
 // says so).
+// The review's open QUIT point is decided on 2026-11-04: the QUIT path stays the eviction loop, with no pass over the
+// cache's entries.  The two "pinned quit" blocks record what that means: a pinned conversation is never evicted, so QUIT
+// forces nothing for it - the debounced shape (one end state, no chain) at flush N, and no write at all at flush 0.
 #include "strata/core/conversation_disk.hpp"
 
 #include <algorithm>
@@ -622,6 +625,85 @@ int main() {
         const double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
         check(tier.stats().written == 2 && tier.size() == 2, "quit: wait_idle() wrote both deferred parks");
         check(secs < 60.0, "quit: it collapsed the due times instead of waiting an hour");
+        fs::remove_all(qdir);
+    }
+
+    {   // QUIT and a pinned conversation (the review after step 9, decided 2026-11-04 to keep as it is): `evict_oldest`
+        // skips an entry holding a pinned shared prefix, so the QUIT eviction loop never forces it.  With the debounce on,
+        // its queued park is collapsed by `wait_idle()` and written in the debounced shape - one end state, no chain.
+        const fs::path qdir = dir / "pinned-quit-debounced";
+        fs::remove_all(qdir);
+        fs::create_directories(qdir);
+        auto o = opts(qdir, GiB);
+        o.flush_seconds = 3600;
+        ConversationDiskTier tier(std::move(o));
+        check(tier.open(e), "pinned quit: open");
+        ConversationCache cache(GiB, 2);
+        size_t evicted_events = 0;
+        cache.set_on_change([&](CacheEvent event, uint64_t serial, std::shared_ptr<const SavedConversation> image) {
+            switch (event) {
+            case CacheEvent::parked: tier.park(serial, std::move(image)); break;
+            case CacheEvent::evicted: ++evicted_events; tier.force(serial, std::move(image)); break;
+            case CacheEvent::taken: tier.dropped(serial); break;
+            case CacheEvent::superseded: tier.dropped(serial, false); break;
+            case CacheEvent::cleared: tier.cancel_all(); break;
+            }
+        });
+        SavedConversation pinned_image = image(400, 130);
+        pinned_image.checkpoints[0].pinned = true;   // the shared prefix the queries come back to
+        check(cache.put(std::move(pinned_image)), "pinned quit: the pinned conversation is parked");
+        SavedConversation unpinned = image(400, 131, 5000);
+        check(cache.put(std::move(unpinned)), "pinned quit: an unpinned one is parked too");
+        check(tier.stats().written == 0 && !tier.pending(), "pinned quit: both parks wait, neither is RAM pressure");
+        lines_clear();
+        const auto t0 = std::chrono::steady_clock::now();
+        while (cache.evict_oldest()) {}   // the QUIT loop: trade every entry the budget can
+        check(evicted_events == 1 && cache.size() == 1,
+              "pinned quit: the unpinned entry leaves, `evict_oldest` skips the pinned one and the loop ends");
+        tier.wait_idle();
+        check(std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count() < 60.0,
+              "pinned quit: the QUIT wait did not run into the debounce");
+        check(tier.stats().written == 2 && tier.size() == 2, "pinned quit: both conversations end on the disk");
+        check(logged("forced write, the whole image"), "pinned quit: the evicted one takes the forced shape");
+        check(logged("debounced write, the end state written"),
+              "pinned quit: the pinned one is written in the debounced shape, as the debounce defines it");
+        const auto pinned_state = tier.best(prompt_of(450), {}, false);
+        check(pinned_state.tokens == 400, "pinned quit: the pinned entry's end state is on the disk");
+        check(tier.best(prompt_of(200), {}, false).tokens == 0,
+              "pinned quit: its checkpoint chain is not on the disk, so a read of 200 tokens finds nothing");
+        fs::remove_all(qdir);
+    }
+
+    {   // the same conversation at flush 0: there is no queued job to collapse, and nothing is evicted, so QUIT writes
+        // nothing for it.  Phase 1's behaviour, recorded as the decided shape.
+        const fs::path qdir = dir / "pinned-quit-off";
+        fs::remove_all(qdir);
+        fs::create_directories(qdir);
+        ConversationDiskTier tier(opts(qdir, GiB));   // flush 0, the default: phase 1's triggers
+        check(tier.open(e), "pinned quit off: open");
+        ConversationCache cache(GiB, 2);
+        size_t evicted_events = 0;
+        cache.set_on_change([&](CacheEvent event, uint64_t serial, std::shared_ptr<const SavedConversation> image) {
+            switch (event) {
+            case CacheEvent::parked: tier.park(serial, std::move(image)); break;
+            case CacheEvent::evicted: ++evicted_events; tier.force(serial, std::move(image)); break;
+            case CacheEvent::taken: tier.dropped(serial); break;
+            case CacheEvent::superseded: tier.dropped(serial, false); break;
+            case CacheEvent::cleared: tier.cancel_all(); break;
+            }
+        });
+        SavedConversation pinned_image = image(400, 132);
+        pinned_image.checkpoints[0].pinned = true;
+        check(cache.put(std::move(pinned_image)), "pinned quit off: the pinned conversation is parked");
+        SavedConversation unpinned = image(400, 133, 5000);
+        check(cache.put(std::move(unpinned)), "pinned quit off: an unpinned one is parked too");
+        lines_clear();
+        while (cache.evict_oldest()) {}
+        tier.wait_idle();
+        check(evicted_events == 1 && tier.stats().written == 1 && tier.size() == 1,
+              "pinned quit off: only the evicted conversation is written");
+        check(tier_files(qdir) == 2 && tier.best(prompt_of(450), {}, false).tokens == 0,
+              "pinned quit off: the pinned conversation is not on the disk at all (its files are the evicted one's)");
         fs::remove_all(qdir);
     }
 
