@@ -212,14 +212,14 @@ public:
         return best;
     }
 
-    /// Hands entry `id` back in `out` (its stage images included); the entry stays in the tier either way: a queued
-    /// image leaves RAM for the caller, a written one is read and kept on the disk (its next eviction appends to it).
-    /// Only the blocks the deepest state a read can rebuild needs are read, and a damaged chain falls back to an
-    /// earlier state.  `admit(need, why)` is asked before the blocks' payloads are allocated (session_file_read's RAM
-    /// preflight).  `tokens` is the prefix the request matched (diagnostics).  On failure `out` is empty and `error`
-    /// says why.  The entry stays: its files are a cache, except on a refusal for RAM, which removes it (temporary,
-    /// `keep_on_ram_refusal`).
-    bool take(uint64_t id, int64_t tokens, SavedConversation& out, std::string& error,
+    /// Hands entry `id` back in `out`; the entry stays in the tier either way.  A queued image is the same allocation,
+    /// moved out of the queue (a "RAM hit", no copy); a written one is read into a new image, its stage images
+    /// included.  Only the blocks the deepest state a read can rebuild needs are read, and a damaged chain falls back
+    /// to an earlier state.  `admit(need, why)` is asked before the blocks' payloads are allocated (session_file_read's
+    /// RAM preflight).  `tokens` is the prefix the request matched (diagnostics).  On failure `out` is empty and
+    /// `error` says why.  The entry stays: its files are a cache, except on a refusal for RAM, which removes it
+    /// (temporary, `keep_on_ram_refusal`).
+    bool take(uint64_t id, int64_t tokens, std::shared_ptr<SavedConversation>& out, std::string& error,
               const std::function<bool(uint64_t need_bytes, std::string& why)>& admit = {});
 
     /// Whether an image is being written or a queued write is due (their RAM is not back yet).  A job waiting for its

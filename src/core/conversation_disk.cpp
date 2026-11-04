@@ -1687,18 +1687,17 @@ void ConversationDiskTier::write(Job& job) {
 }
 
 
-bool ConversationDiskTier::take(uint64_t id, int64_t tokens, SavedConversation& out, std::string& error,
-                                const std::function<bool(uint64_t, std::string&)>& admit) {
-    out = SavedConversation{};
+bool ConversationDiskTier::take(uint64_t id, int64_t tokens, std::shared_ptr<SavedConversation>& out,
+                                std::string& error, const std::function<bool(uint64_t, std::string&)>& admit) {
+    out.reset();
     const auto t0 = std::chrono::steady_clock::now();
     std::unique_lock<std::mutex> lock(m_);
     if (!open_) { error = "the disk tier is off"; return false; }
-    // still queued (due or deferred): back from RAM, no disk at all
+    // still queued (due or deferred): back from RAM, no disk at all, and the allocation itself (no copy)
     for (auto it = queue_.begin(); it != queue_.end(); ++it)
         if (it->second.entry.id == id) {
             const uint64_t b = it->second.entry.bytes;
-            std::shared_ptr<SavedConversation> back = std::move(it->second.image);   // the same allocation, no copy
-            out = std::move(*back);
+            out = std::move(it->second.image);
             queue_.erase(it);
             ++stats_.ram_hits;
             stats_.tokens_back += (uint64_t) std::max<int64_t>(tokens, 0);
@@ -1739,6 +1738,7 @@ bool ConversationDiskTier::take(uint64_t id, int64_t tokens, SavedConversation& 
     lock.unlock();
     uint64_t bytes = 0;
     const size_t nfiles = want.stages.size();
+    SavedConversation image;   // the read builds a new image: a queued one was handed back above, this one is on disk
     // the deepest state the match can rebuild, then the ones before it when a block is damaged
     const int64_t claimed = std::min<int64_t>(tokens > 0 ? tokens : want.tokens, want.tokens);
     const std::vector<int64_t> positions = state_positions(want, claimed);
@@ -1756,12 +1756,12 @@ bool ConversationDiskTier::take(uint64_t id, int64_t tokens, SavedConversation& 
         } else {
             for (const int64_t at : positions) {
                 std::string why;
-                if (read_entry_image(want, at, out, bytes, {}, why)) {
+                if (read_entry_image(want, at, image, bytes, {}, why)) {
                     read_at = at;
                     error.clear();
                     break;
                 }
-                out = SavedConversation{};
+                image = SavedConversation{};
                 error = why;   // the last failure is the one reported
                 log(fmt("read of %lld tokens: the state at %lld could not be read (%s)", (long long) claimed,
                         (long long) at, why.c_str()));
@@ -1797,10 +1797,11 @@ bool ConversationDiskTier::take(uint64_t id, int64_t tokens, SavedConversation& 
         }
         if (error.empty()) error = "the entry could not be read";
         lock.unlock();
-        out = SavedConversation{};
+        out.reset();
         log(fmt("read of %lld tokens failed after %.0f ms (%s)", (long long) claimed, ms, error.c_str()));
         return false;
     }
+    out = std::make_shared<SavedConversation>(std::move(image));
     ++stats_.disk_hits;
     if (read_at < claimed) ++stats_.fallbacks;
     stats_.bytes_read += bytes;

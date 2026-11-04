@@ -504,6 +504,41 @@ the same allocation, the id map keeps a match valid across an append, and tests 
 running-write wait and the no-copy queued handback are already in (steps 2 and 3), so step 5 is mostly
 its tests and the id-map check.
 
+2026-11-04. **Step 5 is done, and it is green.** A read that lands on a still-queued image now gets that
+allocation itself - `take()` returns a `std::shared_ptr<SavedConversation>` and moves the queued pointer
+out, so generate.cpp's `incoming` is the cache's image, not a second object. A queued write is cancelled
+by `taken`/`superseded`, a write already running for that entry is waited for (step 3's
+`writing_serial_`), and a read before the deadline leaves no file.
+
+What landed:
+
+- `conversation_disk.hpp` / `conversation_disk.cpp`: `take(id, tokens, std::shared_ptr<SavedConversation>&
+  out, error, admit)`. `out` is reset first. A queued job hands its own `shared_ptr` over (no copy, the
+  same allocation the cache parked); a written entry is read into a fresh image, which is moved into a
+  `shared_ptr` (one small allocation, the payload is moved). Every failure path leaves `out` empty.
+- `src/program/generate.cpp`: the disk restore path passes `incoming` to `take()` directly and drops the
+  `make_shared` that wrapped the read. `parked.tokens` comes from `incoming->live.ids.size()`.
+- `src/core/conversation_disk_test.cpp`: a `take_image` helper keeps the older blocks readable (it moves
+  the payload out of the shared image), so the twenty-odd call sites did not turn into allocation
+  assertions. Plan tests 3 and 8 are the "cancel" block: a park shares the allocation (`use_count 2`), a
+  read before the deadline returns the same pointer, no file appears, `ram_hits` counts it, and the image
+  is held once afterwards. Test 9 is the "take-writing" block: the writer is held inside `before_write`,
+  `dropped(serial)` waits for exactly that write instead of letting the reader gut the image, and when it
+  returns the writer has published the entry and the tier's handle is gone (`use_count 1`).
+  The id map across an append is phase 1's test ("append id"), unchanged and still green.
+
+Measured on this PC (build folder `build-c13-gate`, Release, the serving model running, no restart):
+
+- `conversation_disk_test`: **311 checks, exit 0** (296 from step 4 plus the 15 of tests 3, 8 and 9);
+  three runs in a row, because two blocks use real threads and deadlines.
+- `conversation_cache_test`: **4 862 checks, exit 0**; `conversation_file_test`: **183 checks, exit 0**;
+  `conversation_validation_test`: **972 host-only checks, exit 0**; `session_save_reclaim_test`:
+  **119 checks, exit 0**.
+- the engine: `--target strata` built, exit 0 (only the tree's existing C4996/C4324 warnings).
+
+Step 6 is next: the Windows writer priority (`THREAD_PRIORITY_BELOW_NORMAL` beside the Linux
+`PRIO_PROCESS 10`).
+
 ## Risks and open questions
 
 - **The hot path.** `shared_ptr` in `ConversationCache` touches every park, take and admission. Any

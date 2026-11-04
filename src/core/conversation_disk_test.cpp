@@ -8,7 +8,9 @@
 // Phase 2's plan tests land one step at a time: 10 (flag 0: a park writes nothing, an eviction writes the whole image)
 // is the block "the cache's events drive the disk tier", written with step 2; 1, 2, 4 and 5 (debounce, reset, eviction
 // bypass, QUIT bypass) are the four "debounce"/"reset"/"eviction"/"quit" blocks, written with step 3; 6 and 7 (one end
-// state per --prompt-cache-every, a flush under it writes K/V and no state) are the "shape" block, with step 4.
+// state per --prompt-cache-every, a flush under it writes K/V and no state) are the "shape" block, with step 4; 3, 8
+// and 9 (a read cancels a queued write, the same allocation comes back, a take during a write waits) are the "cancel"
+// and "take-writing" blocks, with step 5.
 #include "strata/core/conversation_disk.hpp"
 
 #include <algorithm>
@@ -249,6 +251,16 @@ bool wait_until(F done, int ms = 10000) {
     }
     return done();
 }
+// The tier hands a written image back as a new shared image and a queued one as its own allocation.  Most blocks below
+// only read the image, so this unwraps it (moving the payload, not copying it) and leaves the allocation tests to use
+// take() directly.
+bool take_image(ConversationDiskTier& tier, uint64_t id, int64_t tokens, SavedConversation& out, std::string& error,
+                const std::function<bool(uint64_t, std::string&)>& admit = {}) {
+    std::shared_ptr<SavedConversation> image;
+    const bool ok = tier.take(id, tokens, image, error, admit);
+    out = ok && image ? std::move(*image) : SavedConversation{};
+    return ok;
+}
 }  // namespace
 
 int main() {
@@ -397,12 +409,12 @@ int main() {
         check(tier.best(prompt_of(700), {}, true).tokens == 0, "best: another control-vector state does not match");
         check(tier.best(prompt_of(700, 5), {}, false).tokens == 0, "best: other tokens do not match");
         SavedConversation back;
-        check(tier.take(live.id, live.tokens, back, e), "take");
+        check(take_image(tier, live.id, live.tokens, back, e), "take");
         check(same(back, expect), "read back exactly: both stages, the live state and every checkpoint");
         check(tier.size() == 1 && tier.bytes() > 0 && tier_files(dir) == 3,
               "take keeps the entry and its files (step 4: reads no longer delete)");
         SavedConversation twice;
-        check(tier.take(live.id, live.tokens, twice, e) && same(twice, expect), "a second read is the same image");
+        check(take_image(tier, live.id, live.tokens, twice, e) && same(twice, expect), "a second read is the same image");
         check(tier.size() == 1 && tier_files(dir) == 3, "the second read keeps them too");
         const auto st = tier.stats();
         check(st.queued == 1 && st.written == 1 && st.disk_hits == 2 && st.ram_hits == 0 && st.fallbacks == 0 &&
@@ -426,13 +438,13 @@ int main() {
         const auto a_now = tier.best(prompt_of(450), {}, false);
         check(a_now.tokens == 400 && a_now.id != 0, "the entry being written is matched by the id put gave it");
         SavedConversation back;
-        check(tier.take(b.id, b.tokens, back, e) && same(back, image(400, 3, 5000)), "b back from RAM");
+        check(take_image(tier, b.id, b.tokens, back, e) && same(back, image(400, 3, 5000)), "b back from RAM");
         check(tier.stats().ram_hits == 1 && logged("RAM hit: 400 tokens"), "a RAM hit, logged");
         release.set_value();
         tier.wait_idle();
         check(!tier.pending() && tier.size() == 1 && tier_files(dir) == 2, "a written after the release");
         SavedConversation a_back;
-        check(tier.take(a_now.id, 400, a_back, e) && same(a_back, image(400, 2)),
+        check(take_image(tier, a_now.id, 400, a_back, e) && same(a_back, image(400, 2)),
               "the published entry keeps the id of its queued image: the match the writer saw reads back");
         check(tier.best(prompt_of(450, 5000), {}, false).tokens == 0, "b is gone from the tier");
     }
@@ -470,7 +482,7 @@ int main() {
         tier.wait_idle();
         const auto m = tier.best(prompt_of(450), {}, false);
         SavedConversation back;
-        const bool ok = tier.take(m.id, m.tokens, back, e, [](uint64_t, std::string& why) { why = "no RAM"; return false; });
+        const bool ok = take_image(tier, m.id, m.tokens, back, e, [](uint64_t, std::string& why) { why = "no RAM"; return false; });
         check(!ok && back.kv.empty() && back.stage_images.empty() && tier.size() == 0 && tier_files(dir) == 0 &&
               tier.stats().ram_drops == 1 && logged("dropped 400 tokens on the RAM refusal"),
               "refused read: empty image, the entry and its files are gone, counted and logged");
@@ -666,9 +678,64 @@ int main() {
               "shape: the write says which shape it was and why a state was skipped");
         SavedConversation back;
         const auto m = tier.best(prompt_of(1300, 1000), {}, false);
-        check(tier.take(m.id, m.tokens, back, e) && back.live.ids.size() == 1200,
+        check(take_image(tier, m.id, m.tokens, back, e) && back.live.ids.size() == 1200,
               "shape: a read lands on the stored state");
         fs::remove_all(sdir);
+    }
+
+    {   // a read cancels a queued write (plan test 3) and the queued image comes back as the same allocation (test 8)
+        const fs::path cdir2 = dir / "cancel";
+        fs::remove_all(cdir2);
+        fs::create_directories(cdir2);
+        auto o = opts(cdir2, GiB);
+        o.flush_seconds = 1;
+        ConversationDiskTier tier(std::move(o));
+        check(tier.open(e), "cancel: open");
+        auto img = std::make_shared<SavedConversation>(image(400, 80));
+        check(img.use_count() == 1, "cancel: one owner before the park");
+        tier.park(5, img);
+        check(img.use_count() == 2, "cancel: the queued job shares the allocation (use_count 2)");
+        const auto m = tier.best(prompt_of(450), {}, false);
+        check(m.queued && m.tokens == 400, "cancel: the queued image is matched");
+        std::shared_ptr<SavedConversation> back;
+        check(tier.take(m.id, m.tokens, back, e), "cancel: the read takes the queued image");
+        check(back == img, "cancel: the reader gets the same allocation, no copy");
+        check(back.use_count() == 2, "cancel: the queue let go (the reader and the local handle)");
+        tier.wait_idle();
+        check(tier.stats().written == 0 && tier.size() == 0 && tier_files(cdir2) == 0,
+              "cancel: read before the deadline leaves no file");
+        check(tier.stats().ram_hits == 1, "cancel: counted as a RAM hit");
+        back.reset();
+        check(img.use_count() == 1, "cancel: the image is held once and freed once");
+        fs::remove_all(cdir2);
+    }
+
+    {   // a take during a write (plan test 9): dropped() waits for that one write, the reader keeps the image and the
+        // tier lets its handle go
+        const fs::path wdir = dir / "take-writing";
+        fs::remove_all(wdir);
+        fs::create_directories(wdir);
+        auto o = opts(wdir, GiB);
+        std::promise<void> started, release;
+        o.before_write = [&] {
+            started.set_value();
+            release.get_future().wait();
+        };
+        ConversationDiskTier tier(std::move(o));
+        check(tier.open(e), "take-writing: open");
+        auto img = std::make_shared<SavedConversation>(image(400, 81));
+        check(tier.force(9, img), "take-writing: the forced write is queued");
+        started.get_future().wait();   // the writer holds the job now
+        std::future<void> cancelled = std::async(std::launch::async, [&] { tier.dropped(9); });
+        release.set_value();           // let the write finish
+        check(cancelled.wait_for(std::chrono::seconds(10)) == std::future_status::ready,
+              "take-writing: dropped() waits for the running write instead of gutting the image");
+        cancelled.get();
+        tier.wait_idle();
+        check(img.use_count() == 1 && img->live.ids.size() == 400,
+              "take-writing: the reader keeps the image, the tier's handle is gone");
+        check(tier.stats().written == 1 && tier.size() == 1, "take-writing: the write finished and published the entry");
+        fs::remove_all(wdir);
     }
 
     {   // the block store's write path: append (across runs), page-aligned kv blocks, a torn tail cut back
@@ -758,7 +825,7 @@ int main() {
             const auto m = tier.best(prompt_of(4300), {}, false);
             check(m.tokens == 4200 && m.restore_tokens == 4200, "store: best claims the deepest state");
             SavedConversation back;
-            check(tier.take(m.id, m.tokens, back, e), "store: read the appended entry");
+            check(take_image(tier, m.id, m.tokens, back, e), "store: read the appended entry");
             const SavedConversation expect = image(4200, 30, 1000, 0, 48, 1);
             check(same_checkpoint(back.live, expect.live) && back.kv.size() == expect.kv.size() &&
                   same_kv(back.kv[0], expect.kv[0]) && same_kv(back.kv[1], expect.kv[1]),
@@ -784,7 +851,7 @@ int main() {
             tier.wait_idle();
             check(logged(" (appended)"), "append id: the write appended to the published entry");
             SavedConversation qback;
-            const bool qok = tier.take(q.id, 1200, qback, e);
+            const bool qok = take_image(tier, q.id, 1200, qback, e);
             check(qok, "append id: the read of the queued image's id finds the appended entry");
             const SavedConversation expect = image(1200, 42, 1000, 0, 48, 1);
             check(qok && qback.live.ids.size() == 1200 && same_checkpoint(qback.live, expect.live) &&
@@ -796,7 +863,7 @@ int main() {
                   same_checkpoint(qback.checkpoints[1], checkpoint(300, 51)) &&
                   same_checkpoint(qback.checkpoints[2], checkpoint(150, 61)),
                   "append id: the target entry's states are kept as written, deepest first below the appended live");
-            check(tier.clear() == 1 && !tier.take(q.id, 1200, qback, e) &&
+            check(tier.clear() == 1 && !take_image(tier, q.id, 1200, qback, e) &&
                   e.find("the entry is gone") != std::string::npos,
                   "append id: clear takes the entry and the map, so the queued id finds nothing");
         }
@@ -852,7 +919,7 @@ int main() {
             };
             const uint64_t sid1 = staying.best(prompt_of(700), {}, false).id;   // the scan renumbers the entries
             SavedConversation out2;
-            check(!staying.take(sid1, 600, out2, e, no_ram), "ram drop: the read is refused for RAM");
+            check(!take_image(staying, sid1, 600, out2, e, no_ram), "ram drop: the read is refused for RAM");
             check(staying.size() == 1 && tier_files(sdir) == 2 && staying.stats().ram_drops == 0,
                   "ram drop: with the flag the entry and its files stay for the next start");
 
@@ -860,7 +927,7 @@ int main() {
             check(dropping.open(e) && dropping.size() == 1, "ram drop: the entry taken in by the default tier");
             const uint64_t sid2 = dropping.best(prompt_of(700), {}, false).id;
             SavedConversation out;
-            check(!dropping.take(sid2, 600, out, e, no_ram), "ram drop: the read is refused again");
+            check(!take_image(dropping, sid2, 600, out, e, no_ram), "ram drop: the read is refused again");
             check(dropping.size() == 0 && tier_files(sdir) == 0 && dropping.stats().ram_drops == 1 &&
                   logged("dropped 600 tokens on the RAM refusal"),
                   "ram drop: the entry and its files are gone, counted and logged");
@@ -935,7 +1002,7 @@ int main() {
             check(tier.open(e) && tier.size() == 1, "ring: open to read back");
             const auto m = tier.best(prompt_of(4300, 7000), {}, false);
             SavedConversation back;
-            const bool ok = tier.take(m.id, m.tokens, back, e);
+            const bool ok = take_image(tier, m.id, m.tokens, back, e);
             check(ok, ok ? "ring: the read lands on the state with a row-0 layer"
                          : ("ring: the read failed: " + e).c_str());
             check(back.kv.size() == 3 && back.kv[2].pooled.empty() && back.kv[2].pooled_rows == 0 &&
@@ -997,7 +1064,7 @@ int main() {
             const auto o = tier.best(prompt_of(601), {}, false);
             check(o.tokens == 600 && o.live, "rewrite: the original still matches its own tokens");
             SavedConversation old_back;
-            check(tier.take(o.id, o.restore_tokens, old_back, e) && same(old_back, original),
+            check(take_image(tier, o.id, o.restore_tokens, old_back, e) && same(old_back, original),
                   "rewrite: and it still reads back as the original");
             std::this_thread::sleep_for(std::chrono::milliseconds(1100));   // the LRU order is in seconds
             std::vector<int32_t> ep = edited.live.ids;
@@ -1006,7 +1073,7 @@ int main() {
             check(m.tokens == 600 && m.restore_tokens == 600 && m.live && m.id != o.id,
                   "rewrite: the edited entry matches its tokens, not the original's");
             SavedConversation back;
-            check(tier.take(m.id, m.restore_tokens, back, e) && same(back, edited),
+            check(take_image(tier, m.id, m.restore_tokens, back, e) && same(back, edited),
                   "rewrite: the edited image came back byte for byte");
             check(tier.put(image(600, 142, 9000, 0, 48, 1)), "rewrite: put a third conversation");
             tier.wait_idle();
@@ -1078,7 +1145,7 @@ int main() {
             const auto m = tier.best(prompt_of(600), {}, false);
             check(m.tokens == 500 && m.live, "persist: matches after a restart");
             SavedConversation back;
-            const bool read = tier.take(m.id, m.tokens, back, e);
+            const bool read = take_image(tier, m.id, m.tokens, back, e);
             if (!read) std::fprintf(stderr, "take: %s\n", e.c_str());
             check(read, "persist: read back after a restart");
             check(same(back, split_image(500, 20)), "persist: the image is exactly the one written");
@@ -1131,7 +1198,7 @@ int main() {
             const auto m = tier.best(prompt_of(450, 6000), {}, false);
             check(m.tokens == 400, "persist: b matches by its index");
             SavedConversation back;
-            check(!tier.take(m.id, m.tokens, back, e) && back.kv.empty() && logged("fails its hash"),
+            check(!take_image(tier, m.id, m.tokens, back, e) && back.kv.empty() && logged("fails its hash"),
                   "persist: a's image under b's index is refused, never restored as b");
             check(tier.best(prompt_of(450), {}, false).tokens == 400, "persist: a is still there");
         }
@@ -1181,7 +1248,7 @@ int main() {
             const auto m = tier.best(prompt_of(4300), {}, false);
             check(m.tokens == 4200 && m.restore_tokens == 4200, "read path: the deepest state is claimed");
             SavedConversation back;
-            check(tier.take(m.id, m.tokens, back, e), "read path: read");
+            check(take_image(tier, m.id, m.tokens, back, e), "read path: read");
             const SavedConversation expect = image(4200, 60, 1000, 0, 48, 1);
             check(back.live.ids.size() == 4200 && same_checkpoint(back.live, expect.live) &&
                   back.kv.size() == 2 && same_kv(back.kv[0], expect.kv[0]) && same_kv(back.kv[1], expect.kv[1]),
@@ -1200,7 +1267,7 @@ int main() {
             check(shorter.tokens == 600 && !shorter.live, "read path: an earlier state matches a shorter prompt");
             SavedConversation part;
             const uint64_t was = st.bytes_read;
-            check(tier.take(shorter.id, shorter.tokens, part, e), "read path: read the earlier state");
+            check(take_image(tier, shorter.id, shorter.tokens, part, e), "read path: read the earlier state");
             const uint64_t took = tier.stats().bytes_read - was;
             check(took > 0 && took < all, "read path: an earlier state reads only the blocks below it");
             check(part.live.ids.size() == 600 && part.checkpoints.size() == 2,
@@ -1232,7 +1299,7 @@ int main() {
             const auto m = tier.best(prompt_of(4300), {}, false);
             check(m.tokens == 4200 && m.restore_tokens == 4200, "damage: the index still claims 4200 before a read");
             SavedConversation back;
-            check(tier.take(m.id, m.tokens, back, e), "damage: the read falls back instead of failing");
+            check(take_image(tier, m.id, m.tokens, back, e), "damage: the read falls back instead of failing");
             check(back.live.ids.size() == 600, "damage: it lands on the state at 600, the deepest that verifies");
             check(back.checkpoints.size() == 2 && back.checkpoints[0].ids.size() == 300 &&
                   back.checkpoints[1].ids.size() == 150, "damage: the states below it come back, deepest first");
@@ -1254,7 +1321,7 @@ int main() {
                   "damage: a fresh tier's index knows nothing of the damage until it reads");
             const auto m = tier.best(prompt_of(4300), {}, false);
             SavedConversation back;
-            check(tier.take(m.id, m.tokens, back, e) && back.live.ids.size() == 600,
+            check(take_image(tier, m.id, m.tokens, back, e) && back.live.ids.size() == 600,
                   "damage: the fresh tier falls back too");
             check(tier.best(prompt_of(4300), {}, false).restore_tokens == 600,
                   "damage: and lowers restore_tokens after it");
@@ -1283,7 +1350,7 @@ int main() {
         pause();
         const auto a = tier.best(prompt_of(450, 1000), {}, false);
         SavedConversation back;
-        check(a.tokens == 400 && a.live && tier.take(a.id, a.tokens, back, e), "budget by use: read a, the oldest");
+        check(a.tokens == 400 && a.live && take_image(tier, a.id, a.tokens, back, e), "budget by use: read a, the oldest");
         pause();
         check(tier.put(image(400, 83, 13000)), "budget by use: put d");
         tier.wait_idle();
@@ -1421,7 +1488,7 @@ int main() {
                   "start-up: and the excess is kept until the next append");
             const auto m = tier.best(prompt_of(650), {}, false);
             SavedConversation back;
-            check(m.tokens == 600 && tier.take(m.id, m.tokens, back, e), "start-up: the entry reads back");
+            check(m.tokens == 600 && take_image(tier, m.id, m.tokens, back, e), "start-up: the entry reads back");
             check(tier.size() == 1 && tier_files(sdir) == 2, "start-up: the entry and its files stay");
         }
         fs::remove_all(sdir);
@@ -1459,7 +1526,7 @@ int main() {
                   "pin: the unpinned conversation went at start");
             const auto m = tier.best(prompt_of(650, 1000), {}, false);
             SavedConversation back;
-            check(m.tokens == 600 && tier.take(m.id, m.tokens, back, e), "pin: the pinned one stayed and reads back");
+            check(m.tokens == 600 && take_image(tier, m.id, m.tokens, back, e), "pin: the pinned one stayed and reads back");
             check(back.live.used == 555 && back.checkpoints[0].used == 777 && back.checkpoints[0].pinned &&
                       back.checkpoints[1].used == 111 && !back.checkpoints[1].pinned,
                   "pin: used and pinned came back through the index, across the restart");

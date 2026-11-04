@@ -14439,15 +14439,13 @@ int main(int argc, char** argv) {
                         why = "not enough RAM: " + ram_note(mem);
                         return false;
                     };
-                    strata::core::SavedConversation image;
                     std::string disk_err;
                     const auto d0 = Clock::now();
-                    if (conv_disk.take(on_disk.id, on_disk.restore_tokens, image, disk_err, admit)) {
+                    if (conv_disk.take(on_disk.id, on_disk.restore_tokens, incoming, disk_err, admit)) {
                         disk_read_ms = std::chrono::duration<double, std::milli>(Clock::now() - d0).count();
                         // what the read actually rebuilt: a damaged block falls back to an earlier state, and the
                         // prompt then starts again there (the estimate above is no promise, only a guess)
-                        parked.tokens = (int64_t) image.live.ids.size();
-                        incoming = std::make_shared<strata::core::SavedConversation>(std::move(image));
+                        parked.tokens = (int64_t) incoming->live.ids.size();
                         // The image's `live` is the state the read lands on, checkpoint or not: a read restores the
                         // session with it, so this request resumes at its length as a live state.  The match's own
                         // `live` flag says only whether the entry's deepest key matched the prompt, and when the
