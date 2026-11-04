@@ -606,6 +606,50 @@ through every step.
 
 Phase 2's steps, 1-9, are complete in code and tests.
 
+2026-11-04. **A review after step 9 found three real problems; they are fixed and green.** The reviewer was
+asked to read phase 2 against the spec (its report is not in the repo). What it found and what changed:
+
+- **the park path could wait a whole background write** (the spec's gate). `ConversationCache::put()` calls
+  `drop_superseded()` on every park, that fires `superseded`, and `generate.cpp` sent both `taken` and
+  `superseded` to one `dropped(serial)` which waits for the running write of that serial. With the debounce
+  on, the writer is usually writing the copy a turn back - exactly what `drop_superseded` drops - so the
+  next park stalled. The spec says the wait happens only when a request takes the very conversation the
+  writer is flushing, and that is right: only the restore path moves sub-objects out of the shared image.
+  `dropped(serial, bool wait_running = true)` now separates the two; the `taken` event waits, the
+  `superseded` event passes `false` and only cancels. Its log line says so ("waited N ms for the write of
+  N tokens to end"), because a superseded conversation's write is not cancelled when it has begun - it ends.
+- **`wait_idle()` could miss a wakeup.** The RAM-hit branch of `take()` and the cancel path of `dropped()`
+  erased queued jobs without `cv_.notify_all()`, while `wait_idle()` waits on a bare `cv_.wait(lock)`.
+  Unreachable with one request thread, a latent hang with two. Both paths notify now.
+- **the server's log line could name a mode that never runs.** `serve/server.py` printed the flush mode
+  whenever persist was not `off` or the debounce was not `0`, without checking `--conversation-disk-dir`;
+  without the folder the tier is off. The line now needs the dir flag.
+- small ones: `conversation_disk_read_bytes()` adds the one `.bin` header per stage that
+  `read_entry_image()` charges, so the "not read" estimate is the read's own number; and
+  `--conversation-disk-flush-seconds` is capped like the `INT32_MAX` flags instead of the numeric group's
+  `INT64_MAX / (1024*1024)`, which could overflow `steady_clock` when added to `now()`.
+- tests: "superseded" (a cancel returns while the write still runs), "cancel-deferred" (the cache's cancel
+  of a still-queued write leaves no file at all), and test 10's second half (a forced write keeps the
+  checkpoint chain and says `forced`), which the review called out as only half-checked.
+
+Not fixed, recorded here as the reviewer's remaining points:
+
+- **QUIT and persist do not write a pinned conversation as the whole image.** `evict_oldest()` skips an
+  entry holding a pinned shared prefix (and the guarded donor), so the QUIT loop never forces it: with
+  flush `N` its deferred job is collapsed by `wait_idle()` and written in the debounced shape, and with
+  flush `0` it is not written at all. This is phase 1's behaviour for flush `0`; the debounced shape is
+  the new part, and it contradicts "the QUIT save writes the whole image" for a conversation the budget
+  keeps for its pin. Fixing it means a QUIT-time pass over the cache's entries rather than an eviction
+  loop, which changes the QUIT path - a decision for the owner, not a review fix.
+- **`published_` grows for the whole run** (one pair per append, pruned only by `clear()`), and `take()`
+  scans it linearly. Small, but unbounded.
+- **`write()` calls `chain_prefix()` for every entry under the tier's mutex**, and that recomputes the
+  prefix digest for every block from token 0. A debounce writes far more often than an eviction did, so
+  the request thread's `best()`/`take()` queue behind it more often. Not measured: it is the hot-path
+  number the restart is for.
+- the queued-image handback still relies on the caller not moving sub-objects out of an image the cache
+  also holds (today `added > 0` keeps that path unreachable); the invariant lives in `generate.cpp`.
+
 ## Risks and open questions
 
 - **The hot path.** `shared_ptr` in `ConversationCache` touches every park, take and admission. Any

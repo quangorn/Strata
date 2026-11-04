@@ -1082,7 +1082,8 @@ class StrataEngine:
             at = args.index("--conversation-disk-flush-seconds") + 1
             flush = args[at] if at < len(args) else "0"
         self.quit_s = ENGINE_QUIT_WAIT_S if persist == "off" else 300
-        if persist != "off" or flush not in ("", "0"):
+        # without a folder the tier is off, and the line would name a write schedule that never runs
+        if "--conversation-disk-dir" in args and (persist != "off" or flush not in ("", "0")):
             when = "at eviction and QUIT only" if flush in ("", "0") else f"{flush} s after quiet"
             print(f"[strata] conversation disk: persist {persist}, a park is written {when}", flush=True)
         end_leftover_engines(exe)                        # one an earlier run lost still holds the GPU and the memory

@@ -827,8 +827,9 @@ one) when the disk holds a longer prefix than the session, a `--batch` slot or t
   index and `.bin` together; a park that does not fit the cache's byte budget goes to the disk too (`sent to the disk`
   in the log) instead of being dropped, and a write needs its blocks plus `--session-min-free-mib` free on the volume,
   as a session file's write does (`not enough disk space` in the log, nothing written);
-- a background thread (CPU nice 10 on Linux, below normal priority on Windows) writes the blocks, so a switch never
-  waits for the disk; a conversation asked for again before its write ends comes back from the write queue (a "RAM hit").
+- a background thread (CPU nice 10 on Linux, below normal priority on Windows) writes the blocks, so a park never
+  waits for the disk; a conversation asked for again before its write ends comes back from the write queue (a "RAM hit")
+  while the write is still queued, and waits for that one write and then reads its file once the write has started.
   A queued image holds its RAM until it is written: when RAM is short, parking and a read back wait for the queue before
   they evict more. A write a `--conversation-disk-flush-seconds` park delayed is not RAM pressure: its bytes are still
   the cache's (or an evicted image the writer already holds), so a "make room" or QUIT collapses its due time instead of
@@ -840,8 +841,10 @@ one) when the disk holds a longer prefix than the session, a `--batch` slot or t
   and QUIT ignore the debounce and write at once. A debounced flush is cheap: it appends the K/V past the last stored
   block and **at most one end state**, and only when the end is at least `--prompt-cache-every` tokens (default 16,384)
   past the deepest stored state, or the conversation has no state yet - never a checkpoint chain. An evicted
-  conversation and the QUIT save write the whole image, chain included, as phase 1 did. The tier's files and format do
-  not change: a debounced flush just appends fewer blocks;
+  conversation and the QUIT save write the whole image, chain included, as phase 1 did. One exception: a conversation
+  held for its pinned shared prefix is never evicted (`evict_oldest` skips it), so QUIT does not force it either - with
+  the debounce on it is written in the debounced shape, and with `0` it is not written at all, as in phase 1. The
+  tier's files and format do not change: a debounced flush just appends fewer blocks;
 - a read back needs RAM for the whole image above `--conversation-cache-min-free-mib`, as a park does; without it the
   prompt is read again (`not restored (not enough RAM ...)`). A read keeps the conversation on the disk (the next
   eviction of it appends to the same entry) and reads only the blocks its deepest stored state needs. Every block is
