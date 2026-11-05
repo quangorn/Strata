@@ -24,6 +24,17 @@ typed as `strata`. The model that serves here is `IQ2_XS low_ram`. Every check b
 Check 2, 3 and 7 are the ones a change to `serve/server.py`, `strata_cli/launch/runner.py` or `strata_control/updater.py` needs
 before a commit: the offline suite covers the logic, these cover the files that run.
 
+## Engine tests and the serving model
+
+The engine tests in `build-*/Release` (and `ctest -R "conversation|session_save"`) must run with the serving model
+stopped. `conversation_snapshot_test` compares `cudaMemGetInfo` before and after six restores, with 4 MiB of slack, to
+prove that a restore allocates nothing on the card (#2409). With a model serving, the free figure moves by the driver's
+own pool blocks (0 to 16 blocks of 10.9 MiB on this PC) and the check fails run to run with `six more restores allocate
+nothing on the card`. Measured on 2026-11-05: with `iq2_xs-low_ram` serving, 9-13 of 20 runs failed in each of the
+plain, `STRATA_CKPT_ASYNC=1` and `STRATA_CKPT_VRAM_SLOTS=1` variants; with the model stopped, 60 of 60 passed and
+`ctest -R "conversation|session_save"` answered 11 of 11. The test itself is unchanged: the failure is the measurement,
+not an engine fault, and on the Linux CUDA path the check stays as it was.
+
 ## The offline suite on this PC
 
 `./.venv/Scripts/python.exe -m pytest tests/terminal -q` (the `.venv` needs `pytest` and `textual==8.2.8`) answers 2036 passed
