@@ -752,14 +752,17 @@ Both serving profiles ran the phase 2 build (engine `0.1.55.14-windows-x86_64-cu
 of real agent requests on this PC (RTX 4080 16 GB, 48 GB RAM, Windows 10), on the serving store folder
 `E:\strata-conv-data` with the 76 800 MiB budget: `iq2_xs-low_ram` with `--conversation-disk-flush-seconds 60`
 and `--conversation-cache-mib 4096` from 05:03 to the QUIT at 15:00, and `iq2_xs-max_ram` with the flag at its
-default `0` and `--conversation-cache-mib 8192` from 12:01; the second ran until 02:18 on 2026-11-06 and was
-terminated, so it sent no QUIT. The arms are not a controlled A/B — different hours, different RAM caches,
-the same store folder — and every number names its run.
+default `0` and `--conversation-cache-mib 8192` from 12:01. The second is **running now** (port 8080, its log
+written to 02:31 on 2026-11-06), so its numbers are the run as it stands at the scan, and its QUIT line comes
+when the server stops. The launch file `strata-swift-iq2_xs.max_ram.json` gained the flag `60` at 14:59 on
+2026-11-05, during the run; the server keeps the flags it loaded, so the next start of this profile is a
+debounced one. The arms are not a controlled A/B — different hours, different RAM caches, the same store
+folder — and every number names its run.
 
 | arm | flush | cache | requests | writes (appended) | shapes | K/V | states | index | past median | park median | park p95 | park max | QUIT | disk hits | `not read` | waits for RAM |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
 | low_ram | 60 | 4096 MiB | 793 | 97 (54) | 51 forced, 46 debounced (40 wrote a state) | 40 701 MiB | 23 759 MiB | 392 MiB | 10 819 | 148.9 ms | 773.5 ms | 1242.9 ms | 3.1 s | 43 | 0 | 1, 2050 ms |
-| max_ram | 0 | 8192 MiB | 3166 | 44 (4) | 44 forced | 47 132 MiB | 31 415 MiB | 133 MiB | 127 397 | 146.1 ms | 960.6 ms | 8515.0 ms | none | 29 | 8 | 5, 16 092 ms |
+| max_ram | 0 | 8192 MiB | 3166 | 44 (4) | 44 forced | 47 132 MiB | 31 415 MiB | 133 MiB | 127 397 | 146.1 ms | 960.6 ms | 8515.0 ms | stop timed out (300 s) | 29 | 8 | 5, 16 092 ms |
 
 - **the park gate passes on live traffic**: median 148.9 ms with the debounce against 146.1 ms without it
   (159 and 594 parks), p95 lower with it (773.5 against 960.6 ms), and the worst park is the flush-0 arm's
@@ -768,8 +771,16 @@ the same store folder — and every number names its run.
   127 397, and 54 of the 97 writes appended to entries the disk already held (4 of 44 in the flush-0 arm).
 - **the QUIT day ends with almost nothing to write**: `saved for the next start in 3.1 s` with 51 entries and
   75 497 MiB on disk, one 2050 ms wait for 2 queued writes; the flush-0 runs in this log QUIT at the same
-  store size in 15.3, 16.8, 26.4 and 29.8 s (2026-11-03). The flush-0 day sent no QUIT, so its QUIT number
-  is not comparable.
+  store size in 15.3, 16.8, 26.4 and 29.8 s (2026-11-03). The flush-0 arm is running, so its QUIT number
+  comes when that server stops.
+- **the stop of the flush-0 arm says the same in the other direction**: stopping it on 2026-11-06 gave
+  `server_stop_deadline_expired` — its QUIT did not fit the server's 300 s window (the run held ~44 entries
+  of a 76 GiB store, and the log has no `saved for the next start` line for it). A debounced day reaches
+  QUIT in 3.1 s; a full-store flush-0 burst does not reach it at all inside the stop window. This PC's
+  clock moved during the day (log timestamps of 23:35-23:39 sit among file stamps of 02:3x), so the
+  section's times are read from the lines the engine printed, and the restart the owner's other session
+  made came with no flush flag: the live instance is flush 0, `--conversation-cache-mib 8192`, and the
+  launch file's `60` still applies at its next start.
 - **the corrected `not read` estimate holds on live traffic**: 0 refusals in the debounced day against 8
   (2373 tokens) in the flush-0 run; the reads took the blocks below the state they landed on.
 - **restore time, the number phase 3 says to watch**: 43 disk hits, 127 422 MiB, mean 982 MB/s; median
