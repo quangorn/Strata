@@ -185,6 +185,17 @@ Restore time is the number to watch: a pack is not the single sequential file of
 restore of a 165K-token conversation was 5.6 s at 643 MB/s on the 2x CMP box
 (`DETAILS.md:860-861`).
 
+Part of this ran on 2026-11-06. The reader became a tool, `tools/conversation_store_scan.py` (the
+ad-hoc scripts of the earlier snapshots are not in the repo), and the store the morning after the
+phase 2 live day reads: 38 entries, 76 539 MiB, K/V 46 917 MiB, states 29 500 MiB, the duplicated
+prefix **13 706 MiB = 29.2% of the K/V, 17.9% of the store** — the fourth snapshot of the series,
+down from 36.3% and 22.2% on 2026-11-04, as the day's 54 appends merged growing conversations. The
+restore time came from live traffic the same day: 43 disk hits, mean 982 MB/s, median 3.2 s, p95
+5.2 s, max 6.9 s (154 871 tokens, 4598 MiB, 701 MB/s) — the same time band as the 2x CMP baseline
+on this PC's SSD, before any pack sharing exists. "Did the duplication disappear" is not answered
+yet: the state part (29 500 MiB, 38.6% of the store) is the biggest single part of the folder in
+every snapshot since phase 2's live day.
+
 ## Risks and open questions
 
 - **Garbage collection is where caches leak.** Refcounts that are decremented twice, or never,

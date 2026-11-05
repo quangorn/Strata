@@ -746,6 +746,50 @@ it); on this PC such a loop grew one conversation to 259 886 tokens and the serv
 with "request exceeds the context window: prompt (262165 tokens) leaves no room to answer in the context
 (262144)". The engine was fine; the loop was wrong, and the fix tracks the whole prompt.
 
+## Live day on the serving profiles (2026-11-05/06)
+
+Both serving profiles ran the phase 2 build (engine `0.1.55.14-windows-x86_64-cuda-cuda13`) for a full day
+of real agent requests on this PC (RTX 4080 16 GB, 48 GB RAM, Windows 10), on the serving store folder
+`E:\strata-conv-data` with the 76 800 MiB budget: `iq2_xs-low_ram` with `--conversation-disk-flush-seconds 60`
+and `--conversation-cache-mib 4096` from 05:03 to the QUIT at 15:00, and `iq2_xs-max_ram` with the flag at its
+default `0` and `--conversation-cache-mib 8192` from 12:01; the second ran until 02:18 on 2026-11-06 and was
+terminated, so it sent no QUIT. The arms are not a controlled A/B — different hours, different RAM caches,
+the same store folder — and every number names its run.
+
+| arm | flush | cache | requests | writes (appended) | shapes | K/V | states | index | past median | park median | park p95 | park max | QUIT | disk hits | `not read` | waits for RAM |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| low_ram | 60 | 4096 MiB | 793 | 97 (54) | 51 forced, 46 debounced (40 wrote a state) | 40 701 MiB | 23 759 MiB | 392 MiB | 10 819 | 148.9 ms | 773.5 ms | 1242.9 ms | 3.1 s | 43 | 0 | 1, 2050 ms |
+| max_ram | 0 | 8192 MiB | 3166 | 44 (4) | 44 forced | 47 132 MiB | 31 415 MiB | 133 MiB | 127 397 | 146.1 ms | 960.6 ms | 8515.0 ms | none | 29 | 8 | 5, 16 092 ms |
+
+- **the park gate passes on live traffic**: median 148.9 ms with the debounce against 146.1 ms without it
+  (159 and 594 parks), p95 lower with it (773.5 against 960.6 ms), and the worst park is the flush-0 arm's
+  (8515.0 against 1242.9 ms). The phase 1 quoted median, 234 ms, is under both arms.
+- **the debounced flush writes its delta**: median tokens past the deepest stored state 10 819 against
+  127 397, and 54 of the 97 writes appended to entries the disk already held (4 of 44 in the flush-0 arm).
+- **the QUIT day ends with almost nothing to write**: `saved for the next start in 3.1 s` with 51 entries and
+  75 497 MiB on disk, one 2050 ms wait for 2 queued writes; the flush-0 runs in this log QUIT at the same
+  store size in 15.3, 16.8, 26.4 and 29.8 s (2026-11-03). The flush-0 day sent no QUIT, so its QUIT number
+  is not comparable.
+- **the corrected `not read` estimate holds on live traffic**: 0 refusals in the debounced day against 8
+  (2373 tokens) in the flush-0 run; the reads took the blocks below the state they landed on.
+- **restore time, the number phase 3 says to watch**: 43 disk hits, 127 422 MiB, mean 982 MB/s; median
+  3.2 s, p95 5.2 s, max 6.9 s (154 871 tokens, 4598 MiB, 701 MB/s); the 43 `reused from the disk` lines say
+  median 3.4 s, max 7.1 s. A ~150K-token conversation restores in the same time band as the 5.6 s at
+  643 MB/s on the 2x CMP box, on this PC's SSD.
+- **supersede fires in RAM, not on the disk**: the cache dropped 37 superseded copies (flush 60) and 135
+  (flush 0); disk-side supersede is 0 in all 141 writes, as phase 1 measured for its 403.
+- **RAM hits are 0 on both arms**: no live request read back a queued image inside its quiet window, so the
+  queued-image handback and the running-write wait stay proven offline only (the blocks "take-writing" and
+  "cancel").
+- **waits for RAM go down with the debounce**: 1 (2050 ms) against 5 (16 092 ms).
+- The store after the day, read at 02:23 on 2026-11-06 with `tools/conversation_store_scan.py` — the `.idx`
+  reader of the plan, committed here so phase 3's re-run uses the same tool: 38 entries, 76 539 MiB, K/V
+  46 917 MiB, states 29 500 MiB, 5 451 442 tokens; the duplicated prefix **13 706 MiB = 29.2% of the K/V,
+  17.9% of the store**, down from the 2026-11-04 morning snapshot (36.3% and 22.2%); the biggest pair shares
+  127 726 tokens (1792.5 MiB); the shared system prompt band 6731-7798 tokens; 0 entries fully inside
+  another, 0 pinned state blocks; 6-9 states per conversation, 7 in 32 of 38 — the chain rule's count, the
+  phase 3 window is untested.
+
 ## Risks and open questions
 
 - **The hot path.** `shared_ptr` in `ConversationCache` touches every park, take and admission. Any
@@ -762,5 +806,6 @@ with "request exceeds the context window: prompt (262165 tokens) leaves no room 
 - **Crash value is zero.** The store is a cache: a crash costs one longer prompt read. That is why `0`
   (off) is a defensible default and why the debounce can be long.
 - **Static analysis, unconfirmed.** Everything here about the current code is read, not run, except
-  the numbers quoted from the measurements and [DETAILS.md](DETAILS.md). No part of phase 2 is
-  measured on hardware yet.
+  the numbers quoted from the measurements and [DETAILS.md](DETAILS.md). Phase 2 is measured in part on
+  this PC's live traffic (the section "Live day on the serving profiles", 2026-11-05/06): the park
+  durations, the write shapes, the QUIT, the reads, the store scan.
