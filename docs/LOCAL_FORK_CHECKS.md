@@ -58,3 +58,18 @@ None of the eleven says anything about the engine step of the launch or of `stra
 `test_launch_engine_first.py` (20 cases), `test_updater.py` (49), `test_round8_fixes.py` (25), `test_no_acquisition.py` (13),
 `test_component_start.py`, `test_make_guard.py`, `test_profiles.py`, `test_launch_monitor.py` (81 together), `test_issues_022.py`
 and `test_tui2_023_install.py` (34).
+
+## The app's UI tests on this PC
+
+`npm test` in `apps/host` needs two things this checkout had not set up:
+
+- `npm ci` in `apps/host` (the folder had no `node_modules`; one test imports `esbuild`). Measured 2026-11-08: the run
+  without it ended with every module failing on `Cannot find package 'esbuild'`.
+- the working tree in LF. `core.autocrlf` was `true` here, so `.gitattributes` (which says nothing about `.ts` / `.tsx`)
+  checked the app's sources out with CRLF. Measured on the merged tree: 1503 passed, 2 failed with the tree in CRLF
+  (`ui-do.test.mjs` reads `src/lib/store.ts` against a regex that wants `\n`, and the composer case is the same class);
+  after `git config core.autocrlf false` and a re-checkout from the index, 1504 passed, 1 failed. The third case
+  (`markdown-crlf.test.mjs`) was a Windows limit, not a line ending, and is fixed in commit `4319d013`. With both:
+  **1505 passed, 0 failed, 110 skipped** (the skipped group is `STRATA_HARNESS_DIR` — no built Harness on this PC).
+
+`bin/strata.ps1`, `*.cmd` and `*.bat` keep CRLF by `.gitattributes`; the re-checkout did not touch them.
