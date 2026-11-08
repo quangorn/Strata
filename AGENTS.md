@@ -37,10 +37,11 @@ package folder and the manifest, `resolve()` picks `0.1.55.1-local` over `0.1.55
 and the engine keeps naming itself `0.1.55-local` so the disk store survives. The exception is a merge of upstream's
 release line: taking upstream's `project(VERSION …)` bump is the only case where the engine string changes, and it
 empties the store on purpose. Pinning the old string over changed kernels would let indexes written by the old engine
-be read back by the new one, which is a data risk, not a versioning rule. The merge of `upstream/main`
-(v0.2.12, engine 0.1.58) on 2026-11-08 takes the bump, so the store is expected to drop every index at the first
-start on `0.1.58-local` and re-warm; this is static analysis until check 2 of `docs/LOCAL_FORK_CHECKS.md` is run on
-the merged tree, and its measured numbers go in that file. The next model
+be read back by the new one, which is a data risk, not a versioning rule. Measured on 2026-11-08 on the merged tree
+(`upstream/main`, v0.2.12): `package` built `0.1.58-local-windows-x86_64-cuda-cuda13`, `strata.exe --version` prints
+`strata 0.1.58-local`, and the model started on it at 11:26 — `E:\strata-conv-data` was empty at 11:30 (0 files),
+so every index was dropped at that start, as the identity rule predicts. Check 2 of `docs/LOCAL_FORK_CHECKS.md`
+carries these numbers. The next model
 start takes the new engine; restart the preset when the work
 is done, not during the build. Environment knobs, all optional: `ARCHS` (default 89 = this card; the release
 cuda13 list is `75;86;89;120`), `BUILD_JOBS` (default 24; a 24-job build of this tree needed at most 4 GB RAM),
