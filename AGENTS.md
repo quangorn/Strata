@@ -39,9 +39,9 @@ release line: taking upstream's `project(VERSION …)` bump is the only case whe
 empties the store on purpose. Pinning the old string over changed kernels would let indexes written by the old engine
 be read back by the new one, which is a data risk, not a versioning rule. Measured on 2026-11-08 on the merged tree
 (`upstream/main`, v0.2.12): `package` built `0.1.58-local-windows-x86_64-cuda-cuda13`, `strata.exe --version` prints
-`strata 0.1.58-local`, and the model started on it at 11:26 — `E:\strata-conv-data` was empty at 11:30 (0 files),
-so every index was dropped at that start, as the identity rule predicts. Check 2 of `docs/LOCAL_FORK_CHECKS.md`
-carries these numbers. The next model
+`strata 0.1.58-local`, and the model started on it at 11:26 — `E:\strata-conv-data` held 0 files at 11:30 (every index
+dropped, as the identity rule predicts), and by 11:38 the tier had written 3 entries back from live traffic
+(5068 MiB, 457,458 tokens). Check 2 of `docs/LOCAL_FORK_CHECKS.md` carries these numbers. The next model
 start takes the new engine; restart the preset when the work
 is done, not during the build. Environment knobs, all optional: `ARCHS` (default 89 = this card; the release
 cuda13 list is `75;86;89;120`), `BUILD_JOBS` (default 24; a 24-job build of this tree needed at most 4 GB RAM),
