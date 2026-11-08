@@ -148,10 +148,11 @@ the root keeps what every branch resumes from. The measured use is the shared sy
 the root.
 
 The write side of this rule is specified separately in
-[CONVERSATION_DISK_STATE_WINDOW.md](CONVERSATION_DISK_STATE_WINDOW.md): a write adds at most one state and
-only when it is `--prompt-cache-every` past the newest stored one, so a conversation stops accumulating
-states at the source. It keeps the root pinned, as this section asks. What stays here is trimming files that
-already hold more than the window.
+[CONVERSATION_DISK_STATE_WINDOW.md](CONVERSATION_DISK_STATE_WINDOW.md): a write keeps a window of seven
+states - a new file gets its whole window in one fill, after that a write appends one end state only when
+it is `--prompt-cache-every` past the newest stored one - so a conversation grows by one state per window
+and stops accumulating states at the source. It keeps the root pinned, as this section asks. What stays here
+is trimming files that already hold more than the window.
 
 ### 5. Crash consistency
 
@@ -206,8 +207,9 @@ disappear" is the same tool, not a new one.
    to an earlier state (phase 1's rule) still works.
 6. **compaction**: a pack above the dead-space threshold is rewritten, live blocks keep working, a
    reader that started before it finishes is unaffected.
-7. **window**: eight flushes of a short conversation at `--prompt-cache-every 16384` leave the root and the
-   end state, not six states plus the root: the write-side window
+7. **window**: eight flushes of a short conversation at `--prompt-cache-every 16384` leave the end state
+   alone - the first flush writes it, an idle flush on a new file offers the live state without the root,
+   and every flush under the window writes nothing - not six states plus the root: the write-side window
    ([CONVERSATION_DISK_STATE_WINDOW.md](CONVERSATION_DISK_STATE_WINDOW.md)) stopped the accumulation at the
    source, so what this test now checks is that an older file's extra states are collected when it is
    trimmed; a file that still holds more than seven is read as seven.

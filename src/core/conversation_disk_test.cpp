@@ -20,7 +20,8 @@
 // cache's entries.  The two "pinned quit" blocks record what that means: a pinned conversation is never evicted, so QUIT
 // forces nothing for it - the idle flush's shape (one end state, no chain) at flush N, and no write at all at flush 0.
 // The "window" block is docs/CONVERSATION_DISK_STATE_WINDOW.md's: the fill branch to seven states, the root's exception
-// to the gap, the gap beating the target, the append branch, window 0 and a read of a file holding fifteen states.
+// to the gap, the gap beating the target, the append branch, window 0, a read of a file holding fifteen states, the
+// accepted positions written in every stage (its test 9), and a legacy file whose close states act as barriers.
 // The blocks that test the store, not the window, set `prompt_cache_every = 0` in opts() so a write keeps every state
 // it offers: the window's own rules are the "shape" and "window" blocks.
 #include "strata/core/conversation_disk.hpp"
@@ -1040,6 +1041,93 @@ int main() {
             check(tier.stats().bytes_read - read_before == kv + kStates + headers,
                   "legacy: it reads the K/V, the seven states and the header - not the other eight states");
             fs::remove_all(ldir);
+        }
+        {   // stages (the note's test 9): the accepted positions get a state block in every stage's `.bin`, and the
+            // read takes the blocks of every stage back
+            const fs::path sdir = dir / "window-stages";
+            fs::remove_all(sdir);
+            fs::create_directories(sdir);
+            const SessionFileIdentity sid{73, 79};
+            auto o = opts(sdir, GiB);
+            o.persist = true;
+            o.identity = sid;
+            o.prompt_cache_every = 1000;
+            ConversationDiskTier tier(std::move(o));
+            check(tier.open(e), "stages: open");
+            auto stage = [&](size_t tokens, uint8_t seed, int64_t lo, int64_t hi) {
+                SavedConversation s = image(tokens, seed, 1000, lo, hi, 1);
+                s.checkpoints.clear();
+                const std::vector<size_t> at = {500, 4000, 6000};   // the same positions as the first stage's chain
+                for (size_t i = at.size(); i-- > 0;)
+                    s.checkpoints.push_back(checkpoint(at[i], uint8_t(seed + 9 + i), 1000));
+                return s;
+            };
+            SavedConversation multi = chained(10000, 68, {500, 4000, 6000});
+            multi.stage_images.push_back(stage(10000, 118, 26, 48));
+            check(tier.put(std::move(multi)), "stages: put a two-stage image with three checkpoints and live at 10000");
+            tier.wait_idle();
+            ConversationDiskEntry idx;
+            for (const auto& f : fs::directory_iterator(sdir))
+                if (f.path().extension() == ".idx") conversation_disk_index_read(f.path().string(), sid, idx);
+            check(idx.stages.size() == 2, "stages: the entry has both stages");
+            for (size_t s = 0; s < idx.stages.size(); ++s) {
+                std::vector<int64_t> st;
+                for (const auto& b : idx.stages[s].blocks)
+                    if (b.kind == ConversationDiskBlock::state) st.push_back(b.tokens_start);
+                std::sort(st.begin(), st.end());
+                check(st == std::vector<int64_t>({500, 4000, 6000, 10000}),
+                      "stages: every accepted position has a state block in every stage");
+            }
+            SavedConversation back;
+            const auto m = tier.best(prompt_of(10100), {}, false);
+            check(m.tokens == 10000 && take_image(tier, m.id, m.tokens, back, e) &&
+                  back.stage_images.size() == 1 && back.stage_images[0].live.ids.size() == 10000,
+                  "stages: a read takes the blocks of both stages back");
+            fs::remove_all(sdir);
+        }
+        {   // rule 9: states an older build left closer than the window are barriers: no new state comes within the
+            // window above one of them, and the file's shallowest stays the exempt root pair
+            const fs::path bdir = dir / "window-barriers";
+            fs::remove_all(bdir);
+            fs::create_directories(bdir);
+            const SessionFileIdentity bid{67, 71};
+            auto o0 = opts(bdir, GiB);
+            o0.persist = true;
+            o0.identity = bid;
+            o0.prompt_cache_every = 0;
+            {   // a window-0 write plants states 1500 apart - closer than the window of the next tier
+                ConversationDiskTier tier(o0);
+                check(tier.open(e), "barriers: open at window 0");
+                const std::vector<size_t> at = {500, 2000, 5000};
+                check(tier.put(chained(10000, 66, at)), "barriers: the window-0 write puts close states in the file");
+                tier.wait_idle();
+            }
+            ConversationDiskEntry idx;
+            for (const auto& f : fs::directory_iterator(bdir))
+                if (f.path().extension() == ".idx") conversation_disk_index_read(f.path().string(), bid, idx);
+            check(states_oldest_first(idx) == std::vector<int64_t>({500, 2000, 5000, 10000}),
+                  "barriers: the legacy file holds states closer than the window to come");
+            auto o = opts(bdir, GiB);
+            o.persist = true;
+            o.identity = bid;
+            o.prompt_cache_every = 1000;
+            ConversationDiskTier tier(std::move(o));
+            check(tier.open(e) && tier.size() == 1, "barriers: open at window 1000 over the legacy file");
+            // a fill offers chain points 900 tokens above the stored barrier 2000 and 500 past the stored 5000, and a
+            // live state 1000 past the newest barrier 10000: both chain points are cut by the gap, the live state is
+            // taken, and the entry keeps its legacy states as barriers
+            check(tier.put(chained(11000, 67, {2900, 5500})), "barriers: fill with chain points within the window of barriers");
+            tier.wait_idle();
+            for (const auto& f : fs::directory_iterator(bdir))
+                if (f.path().extension() == ".idx") conversation_disk_index_read(f.path().string(), bid, idx);
+            check(states_oldest_first(idx) == std::vector<int64_t>({500, 2000, 5000, 10000, 11000}),
+                  "barriers: the chain points within the window above stored barriers are not written, the live state is");
+            const std::vector<int64_t> s = states_oldest_first(idx);
+            bool spaced = true;
+            for (size_t i = 2; i < s.size(); ++i)
+                if (s[i] - s[i - 1] < 1000) spaced = false;
+            check(spaced, "barriers: every pair above the root pair is at least the window apart");
+            fs::remove_all(bdir);
         }
         fs::remove_all(wdir);
     }

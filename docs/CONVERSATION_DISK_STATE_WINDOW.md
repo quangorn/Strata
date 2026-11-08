@@ -232,7 +232,8 @@ and lets the store collect the blocks. This note keeps 7 states including live -
 at write time and by the gap rule, and never removes anything. So after this note:
 
 - the cause phase 3 §4 names ("phases 1 and 2 accumulate states - one per flush, plus the chain at every
-  eviction") is gone: a write adds at most one state, and only every `W`;
+  eviction") is gone: a write adds at most seven states once (the fill), after that one state per `W` of
+  growth;
 - phase 3's stated worst case ("a 300-turn agent conversation would be 35 GiB") stops being true: the bound
   becomes conversation length divided by `W`, about 1.5 GiB at 226k tokens;
 - what remains of §4 is trimming *historical* files and long-lived ones: a file still grows by one state per
@@ -267,5 +268,6 @@ blocks this note stops writing are simply not allocated.
   percentages of §"Validation on hardware" and of the §"Risks" bullet will be measured against a smaller
   store and are not comparable across the change;
 - §4's test 7, "eight flushes leave six states plus the root, and the two dropped ones are collected", must be
-  rewritten to this note's rules: eight flushes of a short conversation at `W = 16 384` leave the root and the
-  end state, not six plus the root.
+  rewritten to this note's rules: eight flushes of a short conversation at `W = 16 384` leave the end state
+  alone (the idle flush on a new file offers the live state without the root, and every later flush under the
+  window writes nothing), not six plus the root.

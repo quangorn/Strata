@@ -11,7 +11,8 @@ started with (`--conversation-disk-flush-seconds`, the folder, the budget). What
 - the shape of every write: `fill write` (a new file or fewer than seven states: the window is taken),
   `append write` (one end state past a file that already holds seven) and `idle flush write` (a debounced
   park's end state), with the older logs' `forced write, the whole image` and `debounced write, ...`
-  understood too, and the bytes split K/V, states, index;
+  understood too, the rule-3 `skipped N tokens: ...` lines counted as writes that wrote nothing, and the
+  bytes split K/V, states, index;
 - tokens past the deepest stored state, which is the number that decides "one state per flush" against
   "the whole chain";
 - writes, RAM hits, disk hits, tokens given back, waits for RAM, budget removals, failures — the tier's
@@ -43,6 +44,8 @@ WRITE = re.compile(
     r"(\d+) new state, ([\d.]+) MiB\), index ([\d.]+) MiB rewritten, (\d+) file")
 SHAPE = re.compile(r"; (forced|debounced|fill|append|idle flush) write, ([^;]+); (\d+) tokens"
                    r"(?: past the deepest stored state)?(?:, the entry held no state before)?")
+# rule 3 of docs/CONVERSATION_DISK_STATE_WINDOW.md: a write under the window writes nothing at all
+SKIP = re.compile(r"skipped (\d+) tokens: (\d+) tokens past the newest stored state and --prompt-cache-every is (\d+)")
 PARK = re.compile(r"conversation cache: parked (\d+) tokens in ([\d.]+) ms")
 QUIT = re.compile(r"conversation disk: saved for the next start in ([\d.]+) s")
 WAITED = re.compile(r"waited (\d+) ms for (\d+) queued write")
@@ -82,6 +85,9 @@ class Run:
         self.queues = self.writes = 0
         self.kv_mib = self.state_mib = self.index_mib = 0.0
         self.appended = self.forced = self.debounced = self.states = self.appended_states = 0
+        self.skipped = 0        # rule 3: writes that found the end under the window and wrote nothing
+        self.skip_past = []     # tokens past the newest stored state on those skipped writes
+        self.new_states = 0     # new state blocks all writes added, the fill's window included
         self.past = []          # tokens past the deepest stored state, per write
         self.totals = None      # the last `totals:` line of the run
         self.park_ms = []
@@ -101,6 +107,7 @@ class Run:
         self.writes += 1
         self.appended += 1 if "(appended)" in line else 0
         self.kv_mib += float(m.group(6))
+        self.new_states += int(m.group(7))
         self.state_mib += float(m.group(8))
         self.index_mib += float(m.group(9))
         s = SHAPE.search(line)
@@ -115,6 +122,13 @@ class Run:
             self.states += 1 if "end state written" in s.group(2) else 0
             self.past.append(int(s.group(3)))
 
+    def add_skip(self, line: str):
+        m = SKIP.search(line)
+        if not m:
+            return
+        self.skipped += 1
+        self.skip_past.append(int(m.group(2)))
+
     def report(self) -> list[str]:
         f = self.flags
         out = [f"run started {self.started}  engine {Path(self.exe).parent.name}"
@@ -124,7 +138,13 @@ class Run:
         out.append(f"  writes {self.writes} ({self.appended} appended): {self.kv_mib:.0f} MiB K/V, "
                    f"{self.state_mib:.0f} MiB states, {self.index_mib:.0f} MiB index; shapes: "
                    f"{self.forced} fill (or an older log's whole image), {self.appended_states} append, "
-                   f"{self.debounced} idle flush (or an older log's debounced), {self.states} wrote an end state")
+                   f"{self.debounced} idle flush (or an older log's debounced), {self.states} wrote an end state, "
+                   f"{self.new_states} new state blocks, {self.skipped} skipped under the window")
+        if self.skip_past:
+            out.append(f"  tokens past the newest stored state on the skipped writes: "
+                       f"median {int(statistics.median(self.skip_past))}, "
+                       f"p95 {int(percentile(self.skip_past, 0.95))}, max {max(self.skip_past)} over "
+                       f"{len(self.skip_past)} skips")
         if self.past:
             out.append(f"  tokens past the deepest stored state: median {int(statistics.median(self.past))}, "
                        f"p95 {int(percentile(self.past, 0.95))}, max {max(self.past)} over {len(self.past)} writes")
@@ -164,6 +184,7 @@ class Run:
                 "writes": self.writes, "appended": self.appended, "forced": self.forced,
                 "debounced": self.debounced, "wrote_state": self.states,
                 "fill": self.forced, "append": self.appended_states, "idle": self.debounced,
+                "skipped": self.skipped, "new_states": self.new_states,
                 "kv_mib": round(self.kv_mib), "state_mib": round(self.state_mib),
                 "past_median": int(statistics.median(self.past)) if self.past else 0,
                 "park_median_ms": round(statistics.median(self.park_ms), 1) if self.park_ms else 0,
@@ -193,6 +214,8 @@ def parse(text: str) -> list[Run]:
         r = runs[-1]
         if "wrote " in line and " MiB appended" in line:
             r.add_write(line)
+        elif "skipped " in line and " tokens past the newest stored state" in line:
+            r.add_skip(line)
         elif "conversation disk: totals:" in line:
             t = TOTALS.search(line)
             if t:

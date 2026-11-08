@@ -179,6 +179,15 @@ int main() {
                   "gap: a live state 500 past the newest stored one is cut");
         }
         {
+            // a candidate below a taken point is held to the gap against the file barriers too, not only the live
+            // state: the file holds 500 (the root), 2000 (its root pair) and 5000; a fill adds the image's chain at
+            // 2900, 900 tokens above the barrier 2000, which is no root pair, so the chain point is cut
+            std::vector<int64_t> at = {500, 2000, 2900, 5000, 8000};
+            std::vector<char> pin = {1, 1, 0, 1, 0};   // the file's positions pinned, the chain and live free
+            check(thin(at, 1000, pin) == std::vector<int64_t>({500, 2000, 5000, 8000}),
+                  "gap: a chain point within the window above a stored barrier is cut; the live 3000 past 5000 stays");
+        }
+        {
             // window 0: no gap requirement at all, and a pinned point is never cut
             std::vector<int64_t> at = {10, 20, 30};
             check(thin(at, 0, {}) == at, "gap: window 0 keeps every candidate");

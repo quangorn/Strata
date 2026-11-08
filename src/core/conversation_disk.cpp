@@ -1513,12 +1513,11 @@ void ConversationDiskTier::write(Job& job) {
     };
     for (const int64_t at : held)
         if (at > 0) wanted[at] = true;
-    // the root: the shallowest state of the write - the file's shallowest, or the image's, whichever is lower - and
-    // the one point every request shares, in practice the end of the system prompt (the RAM cache pins it too)
-    if (fill) {
-        if (!front.checkpoints.empty()) add_key(front.checkpoints.back(), true);
+    // the root: the shallowest state of the write - the file's shallowest, or the image's, whichever is lower - is
+    // pinned by index in `pinned[0]` below; it is the one point every request shares, in practice the end of the
+    // system prompt (the RAM cache pins it too)
+    if (fill)
         for (const auto& c : front.checkpoints) add_key(c, c.pinned);   // the chain, thinned below; a pin is protected
-    }
     add_key(front.live, false);   // the live state is not protected: it is simply the newest point
 
     const size_t ncand = wanted.size();
