@@ -513,6 +513,20 @@ applies at the next start. Network, key, MCP and program keys are not editable t
 - With `"stream": true` everything arrives as it is made: thinking, answer and tool calls (the tool's name first, then its
   arguments piece by piece). While the model reads a long prompt the stream sends keep-alives. The server window prints progress
   every 15 s and `GET /status` says what it is doing. Closing the connection or pressing stop in your app stops the model.
+- One request takes the engine at a time (the single turn), and the server remembers which thread holds it and which
+  taking of it. A request that has waited 120 s for the turn (`TURN_WAIT_REPORT_S`) says in the log, once, who holds
+  it; a live holder adds every thread's stack to the line (a thread that is gone has no stack to show), and if the
+  holder's thread is gone — a request whose client left without closing its generator — the turn is taken back so the
+  queue moves on. The take-back is named by the holder the report saw, so a live holder that took the turn in between
+  (the abandoned generator freed by the GC, the next request taking it) keeps it. A holder that is not a request (an
+  image encode, a session save) is named as such and never released: its stall ends only when its generator is freed.
+  A request whose `--queue-timeout` is under the threshold expires ("the inference queue wait deadline expired")
+  before any report. Measured on this PC 08.11.2026, one model's log (run 12:26-15:05): at the 30 s line the report
+  fired 60 times and every time named a LIVE holder, so the threshold is 120 s; turns over 120 s are 2 of that run's
+  1015 (26 of the whole log's 24 658, median 4 s, max 316 s), and the take-back line has never fired on this PC
+  (0 lines). `serve/test_turn_wait_recovery.py` covers the paths (9 tests, no process, no GPU): on the base
+  (`upstream/main`, which keeps no record of the holder) the file answers 4 errors and 2 failures, and the
+  live-holder race test fails when the take-back ignores the holder it named.
 - A tool call counts only when it names a tool the request declared. A namespaced tool (`mcp__filesystem.write_file`) is
   that call when the model writes `mcp__filesystem__write_file`, `mcp__filesystem=write_file`, `mcp__filesystem_write_file`,
   or the bare member (`write_file`) and exactly one declared tool has that member. A name with `__` in it (`mcp__playwright__browser_navigate`)

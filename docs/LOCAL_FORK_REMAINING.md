@@ -2,9 +2,11 @@
 
 The state on 2026-11-08, after the merge of `upstream/main` (v0.2.12, engine 0.1.58) into
 `engine/conversation-disk-store` (pushed to `origin` as `df5cc636`): the engine package
-`0.1.58-local-windows-x86_64-cuda-cuda13` is built and serves; `tools/deploy_local_code.py` copied the six
-fork files into `components\control\0.1.56`, and the server that runs there is the upstream release's Control —
-a restart is what starts the fork's code. The offline suite answers 30 failed, 2777 passed, 78 skipped, 1 error
+`0.1.58-local-windows-x86_64-cuda-cuda13` is built and serves; `tools/deploy_local_code.py` copied the fork files
+into `components\control\0.1.56` (six, then two re-runs on 2026-11-08 for `serve/server.py`'s 120 s turn report and
+the take-back guard and the new `serve/test_turn_wait_recovery.py` — seven), and the server that runs there is the
+code it loaded at its start: a restart is what starts the deployed files. The offline suite answers 30 failed, 2777
+passed, 78 skipped, 1 error
 and 407 subtests (28 of the failures are conditions of this PC; two are load, see `LOCAL_FORK_CHECKS.md`). The
 app's UI tests answer 1505 passed, 0 failed, 110 skipped.
 
@@ -50,12 +52,21 @@ run by the offline suite, and nothing here has been run on the merged tree yet. 
 
 ## Git bookkeeping, not a check
 
-- `main` is behind `engine/conversation-disk-store`; fast-forward it to `df5cc636` when the branch is accepted.
-- Candidates for upstream, each one change per pull request, title with its area:
-  - `[GUI]` `apps/host/tests/markdown-crlf.test.mjs` passes the text through stdin instead of argv: Windows caps
-    CreateProcess at 32 767 characters and the fixture's JSON is 56 672 (the fork's fix `4319d013`; the suite then
-    answered 1505 passed, 0 failed, 110 skipped).
-  - `[Engine]` the memory guard `include/strata/core/test_memory.hpp` with its use in `gemm_w16_parity` and
-    `gdn_rec_parity` (the fork's commit `cfcb93a0`). Report the Windows finding that started it: a parity test
-    took 8.52 GiB of the card and 8.48 GiB of RAM beside a serving model, and the engine stopped with
-    `verify: timed out at layer 14; … the GPU did not finish within 5 s`.
+- `main` is behind `engine/conversation-disk-store`; fast-forward it to the branch's tip when the branch is accepted.
+- No upstream pull request is opened (the owner's rule, 2026-11-08). The two fixes that were listed as candidates stay
+  in this branch and are not sent: `[GUI]` `apps/host/tests/markdown-crlf.test.mjs` passes its text through stdin
+  instead of argv (the fork's commit `4319d013`; the app suite then answered 1505 passed, 0 failed, 110 skipped), and
+  `[Engine]` the memory guard `include/strata/core/test_memory.hpp` with its use in `gemm_w16_parity` and
+  `gdn_rec_parity` (the fork's commit `cfcb93a0`; `gemm_w16_parity` needs 8.52 GiB of the card and 8.48 GiB of RAM
+  beside a serving model).
+- The branch `server/turn-wait-recovery` is deleted (local and `origin`, 2026-11-08): its tip `0f6cc63b` is an
+  ancestor of `engine/conversation-disk-store`, and the merge of upstream (`a40ef613`) kept its hunks in
+  `serve/server.py`. The fix is still needed: `upstream/main` keeps no record of who holds the turn, and its #4271
+  part 1 (`c08fd2ec`, in the merged tree) ends a blocked socket write, not a generator left with no thread. Its
+  threshold is now 120 s (measured, `docs/DETAILS.md`), and `serve/test_turn_wait_recovery.py` covers it: 9 tests,
+  no process and no GPU; on the base (`upstream/main`, `146df3c4`) the file answers 4 errors and 2 failures. A review
+  of 2026-11-08 found two holes in the fix, both fixed here: the take-back was "whoever holds the turn now", so a
+  live holder that took the turn between the report's look and its release lost it (the take-back is now named by the
+  holder the report saw, `test_the_take_back_leaves_a_live_holder_that_came_in_between` fails without that guard),
+  and the liveness check read the thread id, which Windows reuses (the keeper is now a weakref to the thread;
+  measured on this PC: 0 of 200 finished threads had their id given to a live one, so this is latent, not seen).

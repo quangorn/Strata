@@ -51,6 +51,7 @@ import threading
 import time
 import urllib.request
 import uuid
+import weakref
 from http.client import HTTPException
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -287,7 +288,11 @@ def focused_recovery_prompt(tok, ids, generated):
 
 LOOPBACK_NAMES = ("localhost", "127.0.0.1", "::1")
 QUEUE_BEAT_S = 10.0         # a request waiting for the single turn sends a keep-alive this often (#1619)
-TURN_WAIT_REPORT_S = 30.0   # a request waiting for the turn this long reports its holder and the stacks, once
+# Measured on this PC 08.11.2026, one model's log (run 12:26-15:05): at the 30 s line the report fired 60 times, and
+# every time named a LIVE holder — an ordinary long turn.  Turns over 120 s are 2 of that run's 1015 turns, 26 of the
+# whole log's 24 658 (median 4 s, max 316 s), so 120 s reports a turn that is long for this PC, not everyday traffic.
+# The check runs only after a failed acquire, so the first report lands in the beat ending between 120 and 130 s.
+TURN_WAIT_REPORT_S = 120.0  # a request waiting for the turn this long reports its holder and the stacks, once
 KEEPALIVE_S = 10.0          # a held-back tool argument leaves the stream quiet: ping at least this often
 # Anthropic clients add /v1/messages to their base URL themselves. A base URL that already ends in /v1 (copied from an OpenAI-style
 # setup) makes them post /v1/v1/messages; these two paths mean the same as the real ones. Nothing else is aliased.
@@ -4813,10 +4818,14 @@ class Service:
         self.config_effort = None                     # #1641: the config's "reasoning_effort": the level for requests with none
         self.keep_awake = None                        # #1727 (opt-in): serve.keepawake.KeepAwake, the config's "prevent_sleep"
         self.fifo = threading.Lock()
-        # who holds the single turn, and which taking of it (a token): a request that left without closing its
-        # generator used to keep the turn silently until the GC freed it, and every later request queued for minutes
-        # with busy=false and nothing in the log.  See Service._turn_take / turn_wait_report.
+        # who holds the single turn, and which taking of it (a token names this taking): a request that left without
+        # closing its generator used to keep the turn silently until the GC freed it, and every later request queued
+        # for minutes with busy=false and nothing in the log.  The thread is kept as a weakref: Windows reuses a
+        # finished thread's id (measured on this PC 08.11.2026: 0 of 200 finished threads had their id given to a
+        # live one, so a stale ident is latent here, not seen), and the ident stays only as a label in the log line.
+        # See Service._turn_take / _turn_give / turn_wait_report.
         self.turn_owner: int | None = None
+        self.turn_thread: weakref.ReferenceType | None = None
         self.turn_token: int | None = None
         self.turn_seq = 0
         self.slot_save_path = None                    # --slot-save-path: /slots/0?action=save|restore (off when None)
@@ -5022,19 +5031,25 @@ class Service:
         with self.status_lock:
             self.turn_seq += 1
             self.turn_owner = threading.get_ident()
+            self.turn_thread = weakref.ref(threading.current_thread())
             self.turn_token = self.turn_seq
             return self.turn_token
 
-    def _turn_give(self, token: int | None = None) -> None:
-        """Release the turn taken by `token` (None: whoever holds it now, a forced take-back).  A request that was
-        forced out and later closes its generator only passes its own old token, so it never frees another one's turn;
-        an untracked holder (an image encode, a session save) leaves turn_owner None and is left alone."""
+    def _turn_give(self, token: int | None = None, owner: int | None = None) -> None:
+        """Release the turn taken by `token` (None: any taking), and only if the thread that holds it now is `owner`
+        (None: any holder).  A request that was forced out and later closes its generator passes only its own old
+        token, so it never frees another one's turn; the report that takes a dead holder's turn back passes its
+        `owner`, so a live holder that came in between — the abandoned generator freed by the GC, the next request
+        taking it — keeps its turn.  An untracked holder (an image encode, a session save) leaves turn_owner None
+        and is left alone."""
         with self.status_lock:
             if self.turn_owner is None:
                 return
             if token is not None and token != self.turn_token:
                 return
-            self.turn_owner, self.turn_token = None, None
+            if owner is not None and self.turn_owner != owner:
+                return
+            self.turn_owner, self.turn_thread, self.turn_token = None, None, None
         try:
             self.fifo.release()
         except RuntimeError:                    # already released by a forced take-back
@@ -5042,20 +5057,24 @@ class Service:
 
     def turn_wait_report(self, request_id: str, waited_s: float) -> None:
         """A request that waited for the turn this long says who holds it, once, with every thread's stack in the
-        log; if the holder's thread is gone (an abandoned request), the turn is taken back so the queue moves on."""
+        log; if the holder's thread is gone (an abandoned request), the turn is taken back so the queue moves on.
+        The stacks are written only for a live holder: a thread that is gone has no stack to show."""
         with self.status_lock:
-            owner, queued = self.turn_owner, self.status.get("queued")
+            owner, queued, held = self.turn_owner, self.status.get("queued"), self.turn_thread
         if owner is None:
             print(f"[strata] request {request_id} has waited {waited_s:.0f} s for the engine's turn, which no "
                   f"generation holds (an image encode or a session save), queued {queued}", flush=True)
+            # reported, never released: an untracked holder's stall ends when its generator is freed.  A request
+            # whose --queue-timeout is under the report threshold expires (QueueWaitExpired) before it gets here.
         else:
-            alive = owner in {t.ident for t in threading.enumerate()}
+            thread = held() if held is not None else None
+            alive = thread is not None and thread.is_alive()
             print(f"[strata] request {request_id} has waited {waited_s:.0f} s for the engine's turn: the holder is "
                   f"thread {owner}, {'alive' if alive else 'GONE'}, queued {queued}", flush=True)
             if not alive:
                 print(f"[strata] the holder thread {owner} of the engine's turn is gone (a request left without "
                       "closing its generator): taking the turn back so the queue moves", flush=True)
-                self._turn_give()
+                self._turn_give(owner=owner)
                 return
         import faulthandler
         faulthandler.dump_traceback(file=sys.stderr)
