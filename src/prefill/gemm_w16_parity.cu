@@ -10,6 +10,7 @@
 // ("auto"), each cached weight used twice.  Every output must be identical bit for bit.  A weight larger than the scratch (the 248320 x 2560
 // output head) is reported separately and is NOT part of the verdict: it never goes through Gemm::native in the prompt path.
 // Exit 77 without a CUDA device.
+#include "strata/core/test_memory.hpp"
 #include "strata/prefill/gemm.hpp"
 
 #include <cuda_fp16.h>
@@ -74,6 +75,24 @@ int main() {
         shapes.push_back({q, 512, 2560, "attn_k", true});
     }
     shapes.push_back({0, 248320, 2560, "output head (bigger than the scratch)", false});
+    // The test's own peak, asked BEFORE anything is allocated.  At the head (248320 rows) and T 4096, Y[0] and Y[1] are 3.79 GiB
+    // each on the card, out[0] and out[1] the same in RAM, and the weights of every shape live there for the whole run: 8.52 GiB
+    // of the card and 8.48 GiB of RAM, 17 GiB together.  Measured 2026-11-08 with IQ2_XS serving on this card, that is what made the engine's
+    // verify time out, so a run that cannot fit now says so and exits 77 (ctest's skip) instead of starting.
+    int64_t max_k = 0, max_n = 0;
+    uint64_t weight_bytes = 0;
+    for (const Shape& s : shapes) {
+        const QType& q = qts[s.qt];
+        if (s.K % q.elems != 0) continue;
+        if (s.K > max_k) max_k = s.K;
+        if (s.N > max_n) max_n = s.N;
+        weight_bytes += (uint64_t) (s.N * s.K / q.elems) * (uint64_t) q.bytes;
+    }
+    const int64_t Ts[] = {16, 64, 512, 4096};
+    const int64_t Tmax = 4096;
+    const uint64_t out_bytes = (uint64_t) Tmax * max_n * 4;   // Y[0] and Y[1] on the card, out[0] and out[1] in RAM
+    const uint64_t host_peak = weight_bytes + 2 * out_bytes;   // the weights are built in RAM shape by shape, the two outputs at once
+    if (!strata::core::test_memory_enough(weight_bytes + 2 * out_bytes + (uint64_t) Tmax * max_k * 2, host_peak, "gemm_w16_parity")) return 77;
     std::mt19937 rng(20261103u);
     std::vector<Weight> ws;
     for (const Shape& s : shapes) {
@@ -89,10 +108,6 @@ int main() {
         if (!ok(cudaMalloc(&w.dev, bytes), "W") || !ok(cudaMemcpy(w.dev, h.data(), bytes, cudaMemcpyHostToDevice), "W copy")) return 1;
         ws.push_back(w);
     }
-    int64_t max_k = 0, max_n = 0;
-    for (const Weight& w : ws) { if (w.s.K > max_k) max_k = w.s.K; if (w.s.N > max_n) max_n = w.s.N; }
-    const int64_t Ts[] = {16, 64, 512, 4096};
-    const int64_t Tmax = 4096;
     uint16_t* X = nullptr;
     float* Y[2] = {nullptr, nullptr};
     if (!ok(cudaMalloc((void**) &X, (size_t) Tmax * max_k * 2), "X") || !ok(cudaMalloc((void**) &Y[0], (size_t) Tmax * max_n * 4), "Y0") ||

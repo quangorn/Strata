@@ -25,6 +25,8 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
+#include "strata/core/test_memory.hpp"
+
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
@@ -1729,6 +1731,18 @@ int main(int argc, char** argv) {
         std::printf("gdn_rec_parity: %d failures\n", fails);
         return fails ? 1 : 0;
     }
+    // The bytes the test holds on the card at its longest prompt: the inputs (h, gate, beta, z, gamma, state0), the two
+    // recurrence outputs and states, the FP32 output and the two FP16 output norms.  T 32768, the default run's longest,
+    // is 4.27 GiB; T 51820 (--long, the engine's longest prompt) is 6.75 GiB, as the header of this file says.  A model
+    // serving on this card cannot give that: measured 2026-11-08, a parity test of this kind took the card's free memory
+    // while IQ2_XS served, and the engine's verify timed out at layer 14 ("the GPU did not finish within 5 s").  So the
+    // test asks the card before it allocates and exits 77 (ctest's skip) when the room is not there.
+    auto peak_device = [](int64_t T) {   // 4 bytes a float, 2 a FP16 pair; the counts are Inputs and check_bits
+        return 4ull * (uint64_t) T * C + 8ull * (uint64_t) T * HV + 16ull * (uint64_t) T * HV * S
+             + 12ull * (uint64_t) S * HV * S + 4ull * S;
+    };
+    const int64_t longest = do_long ? 51820 : 32768;
+    if (!strata::core::test_device_enough(peak_device(longest), "gdn_rec_parity")) return 77;
     if (do_bench_tc) {   // the tensor-core timings alone
         for (const int64_t T : {(int64_t) 2048, (int64_t) 8192, (int64_t) 32768}) bench(T, true);
         return 0;

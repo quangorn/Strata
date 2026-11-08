@@ -1441,6 +1441,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
       set_tests_properties(dma_batch_registered_parity PROPERTIES TIMEOUT 120)
     endif()
     add_executable(gdn_rec_parity src/prefill/gdn_rec_parity.cu)
+    target_include_directories(gdn_rec_parity PRIVATE include)
     target_link_libraries(gdn_rec_parity PRIVATE ${_strata_gpu_runtime_target})
     add_test(NAME gdn_rec_parity COMMAND gdn_rec_parity)
     # STRATA_GDN_TC=1: the tensor-core helpers of the scan, each on one warp against a double-precision reference.  Any sm_80+

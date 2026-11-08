@@ -20,6 +20,8 @@ typed as `strata`. The model that serves here is `IQ2_XS low_ram`. Every check b
 | 7 | Control update keeps the fork's files | `strata update` after a feed has a newer Control, then `python tools/deploy_local_code.py`, then the start | A new `components\control\<version>` folder appears, the four fork files are copied into it, `active.json` selects it, and the start uses it |
 | 8 | The portable package serves | `packaging/repack_local_portable.sh`, then the start | The package is named with `-local`, its `BUILD.json` records the AVX2 floor and the static runtime, and the model loads on this PC |
 | 9 | `strata update --engine` on a local package | `strata update --engine --check` | Exit 5, the version rule refuses the installed package. Measured 2026-11-02 on `0.1.55-local`: `'0.1.55-local' is not a version number (expected like 0.1.46 or 0.1.46.1)`. The feed pattern (`strata_control/feed.py:62`) reads digits only, so the `-local` suffix is what fails, not the build number: `0.1.55.1-local` must fail the same way (static analysis, not run). On the merged tree the same rule reads `0.1.58-local` (static analysis, not run on 0.1.58). This is the known limit, not a bug to fix here: the default path (`update --check`, `update`) must answer 0 with the "not taken from the feed" line |
+| 10 | A heavy GPU parity test asks for room before it takes it | `build-cuda/Release/gemm_w16_parity.exe` and `gdn_rec_parity.exe` with the model serving | Each prints its need and the free figure it measured and exits 77 (ctest's skip) without allocating, so the serving model keeps its card. Measured 2026-11-08: `gemm_w16_parity` prints the RAM term and
+exits 77, `gdn_rec_parity` fits and runs (0 failures). The numbers are in "The GPU parity tests ask for room" below |
 
 Check 2, 3 and 7 are the ones a change to `serve/server.py`, `strata_cli/launch/runner.py` or `strata_control/updater.py` needs
 before a commit: the offline suite covers the logic, these cover the files that run.
@@ -35,24 +37,51 @@ plain, `STRATA_CKPT_ASYNC=1` and `STRATA_CKPT_VRAM_SLOTS=1` variants; with the m
 `ctest -R "conversation|session_save"` answered 11 of 11. The test itself is unchanged: the failure is the measurement,
 not an engine fault, and on the Linux CUDA path the check stays as it was.
 
+## The GPU parity tests ask for room
+
+`gemm_w16_parity` builds the dense projections of Qwen3.8-Flash-Next in four quant types and, at its last shape (the
+248320-row output head) and T 4096, holds `Y[0]` and `Y[1]` on the card at 3.79 GiB each and `out[0]` and `out[1]` in RAM
+at the same size, beside 0.90 GiB of weights: **8.52 GiB of the card and 8.48 GiB of RAM**, 17 GiB together (the byte
+count of the test's own `cudaMalloc` sizes and its two output vectors). Measured 2026-11-08:
+the test ran (and passed, 207.19 s) with `iq2_xs-low_ram` serving, the PC went into heavy swap, and the engine stopped
+with `verify: timed out at layer 14; its GPU waits were released but the GPU did not finish within 5 s`. The test came in
+with upstream's commit `62853e78` (the FP16 weight cache and its parity test, part of v0.2.12); it had never run on this
+PC before, because the tests were not built here. `gdn_rec_parity` builds the same kind of arrays: 4.27 GiB of the card at
+T 32768 (the longest in its default run), 6.75 GiB at T 51820 with `--long` — the file's own header says "needs ~7 GB" for
+that case, which the byte count of `Inputs` + `check_bits` reproduces. No other ctest entry passes 3 GiB: the largest
+after these are `gemm_dequant_side_parity` at about 1 GiB (`Y[0]`, `Y[1]` at T 512 over 8 shapes), `gemm_f32_parity` and
+`dequant_wide_parity` at about 0.9 GiB and 0.3 GiB (computed from their `cudaMalloc` sizes, not measured).
+
+Both heavy tests now ask before they allocate, through `include/strata/core/test_memory.hpp`:
+`test_memory_enough(need_device, need_host, name)` for `gemm_w16_parity` (its executable links `strata_prefill`, which
+links `strata_engine`, so `available_host_bytes()` is there), and `test_device_enough(need_device, name)` for
+`gdn_rec_parity` (it links only the CUDA runtime, so the RAM term is not available to it). A test that cannot fit prints
+the need and the free figure it measured and exits 77, which ctest reports as a skip. Measured on 2026-11-08 with
+`iq2_xs-low_ram` serving: `gemm_w16_parity.exe` answers `gemm_w16_parity: needs 8.48 GiB of RAM, 4.20 GiB free - skipped`
+and exits 77 (its card term passes: the low_ram preset leaves more than 8.52 GiB of the card free), and
+`gdn_rec_parity.exe` — 4.27 GiB, which is free — runs its whole default series, `gdn_rec_parity: 0 failures`, exit 0, with
+the model answering through it (`strata launch --status` is `ready at http://127.0.0.1:8080` after it). A test that fits
+runs; a test that cannot fit is skipped, and the engine's card and RAM stay as they were.
+
 ## The offline suite on this PC
 
-`./.venv/Scripts/python.exe -m pytest tests/terminal -q` (the `.venv` needs `pytest` and `textual==8.2.8`) answers 2036 passed
-and 62 skipped, with eleven failures (measured 2026-11-02, after the engine build-number rule). Seven are upstream's: they fail
-at `upstream/main` with no fork change, on this PC.
+`./.venv/Scripts/python.exe -m pytest tests/terminal -q` (the `.venv` needs `pytest` and `textual==8.2.8`) answers
+**30 failed, 2777 passed, 78 skipped, 1 error, 407 subtests passed in 2121.59 s** (measured 2026-11-08 on the merged
+tree, `upstream/main` v0.2.12, with `iq2_xs-low_ram` serving). The PC was under load during this run (a `ctest` of the
+GPU parity tests ran beside it), and the causes of the `test_procs` and `test_runtime` rows are not separated from that
+load: they were not re-run alone after that run. Every case below is a condition of this PC, not the fork's code.
 
-| File | Case | Why it fails here |
+| File | Cases | Why it fails here |
 |---|---|---|
-| `test_launch_dsv41.py` | four plan and list cases | the fixtures describe 4 AMD cards and 251 GB, and the plan answers with this PC's Windows placement rule ("on Windows a model runs on one AMD card"); one verdict is `tight` where the fixture expects `fits` |
-| `test_private_files.py` | a locked file read after the repair | the ACL repair runs on a temp folder under `D:\tmp\cygwin`, and this PC locks it differently |
-| `test_bundle_imports.py` | setup.py tools import inside the bundle | the checkout has no `third_party/llama.cpp` and `STRATA_GGUF_PY` is not set, so `gguf-py` is not found |
-| `test_bench_standard.py` | one request-outcome case | the outcome (`connection_TimeoutError` against `timeout`) depends on the network this PC sees; the pair moves — 2026-11-02: the round-total case fails, the other passes |
-| `test_launch_tui.py` | `FolderStep::test_default_folder_and_free_space_and_change` | seen 2026-11-02: the step reads this PC's default folder and free space, which is not what the fixture describes; the same nature as the checkout cases below |
-
-Three more are this checkout, not the code. `test_discovery.py` and `test_shared_models_folder.py` expect a machine with no
-Strata install visible, and this checkout answers as one: its root holds the launch files (`strata-swift-iq2_xs.json` and two
-more), so `Catalog.root` is the checkout. `test_no_acquisition.py` scans the modules a start loads by their path under the
-checkout's root, so a module under `.venv/Lib/site-packages` was counted as project code; that case skips `.venv` now.
+| `test_split_parallel.py` | 12 (the split plans, the app's plan, the draft-layer fetch) | the all-cards split rule reads the cards only on Linux: `strata_control/split_engine.expected` sets `cards = []` when `sys.platform` is not linux, so every plan on this PC answers `dflash2` where the fixture expects `split` and `mtp` |
+| `test_fix3_0212.py` | 3 (the same split rule on busy and free cards) | the same rule: `split_expected()` answers False on Windows, so `(split, choice)` is `(False, "dflash2")` against the fixture's `(True, "mtp")` |
+| `test_launch_dsv41.py` | 4 plan and list cases | the fixtures describe 4 AMD cards and 251 GB, and the plan answers with this PC's Windows placement rule ("on Windows a model runs on one AMD card"); one verdict is `tight` where the fixture expects `fits` |
+| `test_private_files.py` | 1 (a locked file read after the repair) | the ACL repair runs on a temp folder under `D:\tmp\cygwin`, and this PC locks it differently |
+| `test_bench_standard.py` | 3 request-outcome cases | the outcome (`connection_TimeoutError` against `timeout`) depends on the network this PC sees; the pair moves — 2026-11-02: the round-total case fails, the other passes; 2026-11-08 all three fail |
+| `test_pictures.py` | 1 (the picture file in the run config's data folder) | the tree the case compares is built with `/` path keys (`f"models/{NAME}"`), and on Windows `Path`'s parts give `\`: `models\mmproj-Tiny.gguf` against the expected `models/mmproj-Tiny.gguf` |
+| `test_update_notice.py` | 1 (a monitor beside a hanging feed) | the temp folder it makes cannot be removed: `.updates/update.lock` is unlinked by the cleanup with `PermissionError 13` |
+| `test_discovery.py`, `test_shared_models_folder.py` | 3 | they expect a machine with no Strata install visible, and this checkout answers as one: its root holds the launch files (`strata-swift-iq2_xs.json` and two more), so `Catalog.root` is the checkout |
+| `test_procs.py`, `test_runtime.py` | 1 + 1 (and 1 error) | seen 2026-11-08 under the load of the `ctest` run: a live engine of this executable and a reused PID are read from this PC's process list, which had the model and the test executables in it. Cause not separated: not re-run alone |
 
 None of the eleven says anything about the engine step of the launch or of `strata update`. The groups that do test them pass:
 `test_launch_engine_first.py` (20 cases), `test_updater.py` (49), `test_round8_fixes.py` (25), `test_no_acquisition.py` (13),
