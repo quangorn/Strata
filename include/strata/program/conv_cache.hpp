@@ -26,6 +26,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <vector>
 
 namespace strata::program::conv_cache {
 
@@ -116,6 +117,60 @@ inline size_t spread_victim(const int64_t* lens, const uint64_t* stamps, size_t 
         if (v != n) return v;
     }
     return eviction_victim(stamps, n, cap, tail, pinned);
+}
+
+/// The conversation disk tier's write window (docs/CONVERSATION_DISK_STATE_WINDOW.md): which of a write's state
+/// positions survive the gap rule.  `positions` are the candidates, oldest first, so index 0 is the root - the
+/// shallowest state, in practice the end of the system prompt every request shares.  `pinned[i]` marks a point that
+/// may not be cut: the root (also pinned by index, as `eviction_victim()` does), a checkpoint the image marks pinned,
+/// and a position the file already holds (those are barriers, never removed).  The walk goes newest first: the live
+/// state is taken only when it is at least `window` past the newest barrier below it, and each point after it only
+/// when it is at least `window` below the nearest one taken above it.  Adjacent accepted positions are therefore
+/// `window` apart except for the root pair - the root and the state just above it may be closer.  `window <= 0` takes
+/// every candidate.  Pure and deterministic, so conv_cache_test.cpp walks the scenarios by hand; the caller then
+/// thins the result to the target with `spread_victim()`, which only removes points and so keeps the gap property.
+inline std::vector<int64_t> gap_thin(const int64_t* positions, size_t n, int64_t window, const bool* pinned) {
+    std::vector<int64_t> out;
+    if (positions == nullptr || n == 0) return out;
+    std::vector<char> keep(n, 0);
+    for (size_t i = 0; i < n; ++i)
+        if (i == 0 || (pinned != nullptr && pinned[i])) keep[i] = 1;
+    // the nearest barrier below each candidate: the live state (the one with nothing taken above it) must be a full
+    // window past it, so it is precomputed before the walk marks new points as kept
+    std::vector<int64_t> barrier_below(n, 0);
+    std::vector<char> has_below(n, 0);
+    int64_t last = 0;
+    bool any = false;
+    for (size_t i = 0; i < n; ++i) {
+        barrier_below[i] = last;
+        has_below[i] = any ? 1 : 0;
+        if (keep[i]) {
+            last = positions[i];
+            any = true;
+        }
+    }
+    int64_t above = 0;
+    bool have_above = false;
+    for (size_t i = n; i-- > 0;) {
+        if (keep[i]) {
+            above = positions[i];
+            have_above = true;
+            continue;
+        }
+        const bool clear_above = !have_above || positions[i] <= above - window;
+        // the live state is the one with nothing taken above it: it must also be a full window past the newest barrier
+        // below it - unless that barrier is the root, whose pair is the rule's one exception
+        const bool clear_below = have_above || !has_below[i] || barrier_below[i] == positions[0] ||
+                                 positions[i] >= barrier_below[i] + window;
+        if (window <= 0 || (clear_above && clear_below)) {
+            keep[i] = 1;
+            above = positions[i];
+            have_above = true;
+        }
+    }
+    for (size_t i = 0; i < n; ++i)
+        if (keep[i]) out.push_back(positions[i]);
+    return out;
 }
 
 }  // namespace strata::program::conv_cache

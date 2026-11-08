@@ -133,6 +133,60 @@ int main() {
         check(eviction_victim(s4.data(), s4.size(), 4, nullptr, all) == 2, "everything pinned: the oldest pin leaves, never the root");
         check(eviction_victim(s4.data(), s4.size(), 1, nullptr, all) == 0, "a one-slot budget keeps no pin: the oldest leaves");
     }
+    {   // the disk tier's write window: gap_thin() decides which of a write's state positions survive
+        auto thin = [](const std::vector<int64_t>& at, int64_t window, std::vector<char> pinned) {
+            return strata::program::conv_cache::gap_thin(at.data(), at.size(), window,
+                                                         pinned.empty() ? nullptr
+                                                                        : reinterpret_cast<const bool*>(pinned.data()));
+        };
+        {
+            // the root's exception: with a window of 1000 the ten-point chain keeps every point a window apart, the
+            // root pair among them, and the root is never cut
+            std::vector<int64_t> at = {500, 1000, 2000, 3000, 4000, 5000, 6000, 7000, 8000, 9000, 10000};
+            std::vector<char> pin(at.size(), 0);
+            pin[0] = 1;
+            const std::vector<int64_t> got = thin(at, 1000, pin);
+            check(got.size() == at.size() && got.front() == 500, "gap: every point of a chain a window apart is kept");
+        }
+        {
+            // the root pair may be closer than the window; no other pair may
+            std::vector<int64_t> at = {500, 1500, 4000, 6000};
+            std::vector<char> pin(at.size(), 0);
+            pin[0] = 1;
+            const std::vector<int64_t> got = thin(at, 1000, pin);
+            check(got == std::vector<int64_t>({500, 1500, 4000, 6000}),
+                  "gap: the state just above the root is kept however close it is");
+        }
+        {
+            // the live state is under the same gap: 100 tokens past the newest state in the file is too close - here
+            // 6000 is in the file (pinned) and the live state at 6100 is cut
+            std::vector<int64_t> at = {500, 1500, 4000, 6000, 6100};
+            std::vector<char> pin = {1, 0, 0, 1, 0};
+            check(thin(at, 1000, pin) == std::vector<int64_t>({500, 1500, 4000, 6000}),
+                  "gap: the live state within the window of the newest stored one is cut, the stored one stays");
+        }
+        {
+            // a barrier the file already holds: seven states and a live one window past the newest
+            std::vector<int64_t> at = {500, 4000, 6000, 7000, 8000, 9000, 10000, 12000};
+            std::vector<char> pin(at.size(), 1);
+            pin.back() = 0;
+            check(thin(at, 1000, pin) == at, "gap: seven held states and a live state 2000 past the newest all stay");
+            pin.back() = 0;
+            std::vector<int64_t> close = {500, 4000, 6000, 7000, 8000, 9000, 10000, 10500};
+            std::vector<char> pin2(close.size(), 1);
+            pin2.back() = 0;
+            check(thin(close, 1000, pin2) == std::vector<int64_t>({500, 4000, 6000, 7000, 8000, 9000, 10000}),
+                  "gap: a live state 500 past the newest stored one is cut");
+        }
+        {
+            // window 0: no gap requirement at all, and a pinned point is never cut
+            std::vector<int64_t> at = {10, 20, 30};
+            check(thin(at, 0, {}) == at, "gap: window 0 keeps every candidate");
+            std::vector<char> pin = {0, 0, 0};
+            check(thin(at, 100000, pin) == std::vector<int64_t>({10, 30}),
+                  "gap: a window above the chain keeps the root and the live state the root pair allows");
+        }
+    }
     {   // #2409: a restore is refused only for a card that must create its copy stream and has no room for it
         constexpr uint64_t need = strata::program::conv_cache::kRestoreFirstUseMib << 20;
         const uint64_t loaded[] = {300ull << 20, 104ull << 20};         // a loaded card: far under --vram-reserve-mib

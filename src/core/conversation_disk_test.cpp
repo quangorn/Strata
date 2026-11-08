@@ -5,20 +5,24 @@
 // write path", 3 and 6 "background write"/"the read path", 4 "the budget by use", 5 and 8 "start-up", 7 "the LRU stamp
 // and the pin", 9 "the block store's write path" and "supersede", 10 "history rewrite", 11 "a folder of the previous
 // build".  Test 1, the gate, is `conversation_snapshot_test.cpp`: it needs a card.
-// Phase 2's plan tests land one step at a time: 10 (flag 0: a park writes nothing, an eviction writes the whole image)
-// is the block "the cache's events drive the disk tier", written with step 2; 1, 2, 4 and 5 (debounce, reset, eviction
-// bypass, QUIT bypass) are the four "debounce"/"reset"/"eviction"/"quit" blocks, written with step 3; 6 and 7 (one end
-// state per --prompt-cache-every, a flush under it writes K/V and no state) are the "shape" block, with step 4; 3, 8
-// and 9 (a read cancels a queued write, the same allocation comes back, a take during a write waits) are the "cancel"
-// and "take-writing" blocks, with step 5.  Step 9's two log fixes are in the "shape" block too: an append's totals count
-// the bytes appended, not the entry's published size, and best().bytes is the blocks a read lands on, not the file.
+// Phase 2's plan tests land one step at a time: 10 (flag 0: a park writes nothing, an eviction writes the image) is the
+// block "the cache's events drive the disk tier", written with step 2; 1, 2, 4 and 5 (debounce, reset, eviction bypass,
+// QUIT bypass) are the four "debounce"/"reset"/"eviction"/"quit" blocks, written with step 3; 6 and 7 (an end state per
+// --prompt-cache-every, a write under it writes nothing) are the "shape" block, with step 4; 3, 8 and 9 (a read cancels
+// a queued write, the same allocation comes back, a take during a write waits) are the "cancel" and "take-writing"
+// blocks, with step 5.  Step 9's two log fixes are in the "shape" block too: an append's totals count the bytes
+// appended, not the entry's published size, and best().bytes is the blocks a read lands on, not the file.
 // A review after step 9 added three blocks: "superseded" (a superseded conversation cancels without waiting for its
 // running write - the wait is take-only), "cancel-deferred" (the cache's cancel of a still-queued write leaves no file)
-// and test 10's second half in "the cache's events drive the disk tier" (a forced write keeps the checkpoint chain and
-// says so).
+// and test 10's second half in "the cache's events drive the disk tier" (an eviction keeps the checkpoint chain, thinned
+// by the window, and says how many states it took).
 // The review's open QUIT point is decided on 2026-11-04: the QUIT path stays the eviction loop, with no pass over the
 // cache's entries.  The two "pinned quit" blocks record what that means: a pinned conversation is never evicted, so QUIT
-// forces nothing for it - the debounced shape (one end state, no chain) at flush N, and no write at all at flush 0.
+// forces nothing for it - the idle flush's shape (one end state, no chain) at flush N, and no write at all at flush 0.
+// The "window" block is docs/CONVERSATION_DISK_STATE_WINDOW.md's: the fill branch to seven states, the root's exception
+// to the gap, the gap beating the target, the append branch, window 0 and a read of a file holding fifteen states.
+// The blocks that test the store, not the window, set `prompt_cache_every = 0` in opts() so a write keeps every state
+// it offers: the window's own rules are the "shape" and "window" blocks.
 #include "strata/core/conversation_disk.hpp"
 
 #include <algorithm>
@@ -29,6 +33,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
 #include <future>
 #include <mutex>
 #include <string>
@@ -116,6 +121,26 @@ SavedConversation split_image(size_t tokens, uint8_t seed, int32_t first = 1000)
     SavedConversation s = image(tokens, seed, first, 0, 26);
     s.stage_images.push_back(image(tokens, uint8_t(seed + 50), first, 26, 48));
     return s;
+}
+
+// one stage's image with its checkpoints at chosen token counts (`at`), for the window's tests: the gap rule is about
+// positions, and image() only offers two.  One K/V layer set (heads 1) keeps a 60k-token image small.
+SavedConversation chained(size_t tokens, uint8_t seed, const std::vector<size_t>& at, int32_t first = 1000) {
+    SavedConversation s = image(tokens, seed, first, 0, 48, 1);
+    s.checkpoints.clear();
+    // deepest first, as image() orders them: the shallowest - the root - is last
+    for (size_t i = at.size(); i-- > 0;) s.checkpoints.push_back(checkpoint(at[i], uint8_t(seed + 9 + i), first));
+    return s;
+}
+
+// the state positions an entry's index holds, oldest first
+std::vector<int64_t> states_oldest_first(const ConversationDiskEntry& e) {
+    std::vector<int64_t> out;
+    if (e.stages.empty()) return out;
+    for (const auto& b : e.stages[0].blocks)
+        if (b.kind == ConversationDiskBlock::state) out.push_back(b.tokens_start);
+    std::sort(out.begin(), out.end());
+    return out;
 }
 
 // the drafter's ring layer, as `layer.cpp`'s kv_plan gives it (`pooled_rows = 2`, "the drafter has no indexer"):
@@ -237,6 +262,9 @@ ConversationDiskOptions opts(const fs::path& dir, uint64_t budget) {
     ConversationDiskOptions o;
     o.dir = dir.string();
     o.budget_bytes = budget;
+    // The blocks below test the store, the read path and the cache's events, not the window: no gap requirement, so a
+    // write keeps every candidate state (the window's own rules are the "window"/"fill"/"append"/"idle" blocks).
+    o.prompt_cache_every = 0;
     o.log = [](const std::string& l) { std::lock_guard<std::mutex> g(lines_m); lines.push_back(l); };
     return o;
 }
@@ -514,7 +542,8 @@ int main() {
     }
 
     {   // the cache's events drive the disk tier (set_on_change); with flush 0 (phase 2 step 2, plan test 10) a park
-        // writes nothing: an eviction writes the whole image, exactly as phase 1's hook did
+        // writes nothing: an eviction writes the image now, and its chain is thinned by the window (no gap at
+        // `prompt_cache_every = 0`, so all of it is kept - docs/CONVERSATION_DISK_STATE_WINDOW.md)
         ConversationDiskTier tier(opts(dir, GiB));
         check(tier.open(e), "open 6");
         ConversationCache cache(GiB, 1);
@@ -537,10 +566,11 @@ int main() {
         tier.wait_idle();
         check(evicted_events == 1 && cache.size() == 1 && cache.evictions() == 1 && tier.size() == 1, "a is on the disk");
         check(tier.best(prompt_of(450), {}, false).tokens == 400, "a matches on the disk");
-        // plan test 10's other half: the eviction wrote the WHOLE image - the checkpoint chain too, and it says so
+        // plan test 10's other half: the eviction wrote the image's chain too, and the log says how many states it took
         const auto chain = tier.best(prompt_of(300), {}, false);
-        check(chain.tokens == 200 && !chain.live, "flush 0: the evicted image's checkpoints are on the disk (forced shape)");
-        check(logged("forced write, the whole image"), "flush 0: the write says it took the forced shape");
+        check(chain.tokens == 200 && !chain.live, "flush 0: the evicted image's checkpoints are on the disk (fill shape)");
+        check(logged("fill write, 3 states in the window (the root included), 3 new"),
+              "flush 0: the write says it took the fill shape and how many states it added");
         check(cache.best(prompt_of(450, 8000), {}, false).tokens == 400, "b stays in RAM");
         // the event comes before take() hands the image over (its queued write is cancelled, step 5)
         auto b_image = cache.take(cache.best(prompt_of(450, 8000), {}, false).index);
@@ -630,7 +660,7 @@ int main() {
 
     {   // QUIT and a pinned conversation (the review after step 9, decided 2026-11-04 to keep as it is): `evict_oldest`
         // skips an entry holding a pinned shared prefix, so the QUIT eviction loop never forces it.  With the debounce on,
-        // its queued park is collapsed by `wait_idle()` and written in the debounced shape - one end state, no chain.
+        // its queued park is collapsed by `wait_idle()` and written in the idle flush's shape - the end state alone.
         const fs::path qdir = dir / "pinned-quit-debounced";
         fs::remove_all(qdir);
         fs::create_directories(qdir);
@@ -664,9 +694,10 @@ int main() {
         check(std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count() < 60.0,
               "pinned quit: the QUIT wait did not run into the debounce");
         check(tier.stats().written == 2 && tier.size() == 2, "pinned quit: both conversations end on the disk");
-        check(logged("forced write, the whole image"), "pinned quit: the evicted one takes the forced shape");
-        check(logged("debounced write, the end state written"),
-              "pinned quit: the pinned one is written in the debounced shape, as the debounce defines it");
+        check(logged("fill write, 3 states in the window (the root included)"),
+              "pinned quit: the evicted one takes the fill shape");
+        check(logged("idle flush write, the end state written"),
+              "pinned quit: the pinned one is written in the idle flush's shape: the end state alone");
         const auto pinned_state = tier.best(prompt_of(450), {}, false);
         check(pinned_state.tokens == 400, "pinned quit: the pinned entry's end state is on the disk");
         check(tier.best(prompt_of(200), {}, false).tokens == 0,
@@ -707,9 +738,10 @@ int main() {
         fs::remove_all(qdir);
     }
 
-    {   // what a debounced flush writes (phase 2 step 4, plan tests 6 and 7): the K/V delta and at most one end state,
-        // one per --prompt-cache-every tokens, and no checkpoint chain.  The numbers are scaled down (600/1200/1300
-        // tokens, prompt_cache_every 512) so the test does not build 200k-token K/V.
+    {   // the idle (debounced) flush and the window (docs/CONVERSATION_DISK_STATE_WINDOW.md, rules 3 and 6): an idle
+        // flush offers the live state alone, whatever the file holds, and a write under the window writes nothing at all
+        // - no state, no K/V, no index.  The numbers are scaled down (600/1200/1300 tokens, prompt_cache_every 512) so
+        // the test does not build 200k-token K/V.
         const fs::path sdir = dir / "flush-shape";
         fs::remove_all(sdir);
         fs::create_directories(sdir);
@@ -738,8 +770,17 @@ int main() {
                 if (b.kind == ConversationDiskBlock::kv) end = std::max(end, b.tokens_end);
             return end;
         };
+        auto bin_bytes = [&] {
+            std::string all;
+            for (const auto& f : fs::directory_iterator(sdir)) {
+                if (f.path().extension() != ".bin") continue;
+                std::ifstream in(f.path(), std::ios::binary);
+                all += std::string((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+            }
+            return all;
+        };
         tier.park(1, std::make_shared<SavedConversation>(image(600, 70)));
-        check(wait_until([&] { return tier.stats().written == 1; }), "shape: the first debounced flush");
+        check(wait_until([&] { return tier.stats().written == 1; }), "shape: the first idle flush");
         ConversationDiskEntry after1;
         check(read_entry(after1), "shape: the index is readable");
         check(states_of(after1) == 1 && after1.tokens == 600 && after1.live.ids.size() == 600 &&
@@ -749,44 +790,258 @@ int main() {
         check(kv_end1 == 600, "shape: and the K/V of the whole entry");
         // 600 tokens past the stored state (>= 512): the end state is written
         tier.park(1, std::make_shared<SavedConversation>(image(1200, 71)));
-        check(wait_until([&] { return tier.stats().written == 2; }), "shape: the second debounced flush");
+        check(wait_until([&] { return tier.stats().written == 2; }), "shape: the second idle flush");
         ConversationDiskEntry after2;
         check(read_entry(after2) && states_of(after2) == 2 && after2.tokens == 1200,
               "shape: the second flush adds one end state at 1200 (the growth passed 512)");
         check(after2.checkpoints.size() == 1 && after2.checkpoints[0].ids.size() == 600 &&
                   after2.live.ids.size() == 1200,
               "shape: its keys are only the states it has blocks for");
-        // 100 tokens past the stored state (< 512): K/V only, no state
-        const auto written_before_kv_only = tier.stats().bytes_written;
-        tier.park(1, std::make_shared<SavedConversation>(image(1300, 72)));
-        check(wait_until([&] { return tier.stats().written == 3; }), "shape: the third debounced flush");
-        ConversationDiskEntry after3;
-        check(read_entry(after3), "shape: the index after the K/V-only flush");
-        check(states_of(after3) == 2 && after3.tokens == 1200 && after3.live.ids.size() == 1200,
-              "shape: 100 tokens past the stored state: the K/V is written, no end state");
-        check(kv_end_of(after3) == 1300 && kv_end_of(after3) > kv_end1, "shape: the K/V past the stored state is on the disk");
-        // step 9: the totals count the bytes this write appended, not the entry's published size (phase 1's log reported
-        // the whole file for every append: 1666 MiB for a 122 MiB write)
-        const auto written_after_kv_only = tier.stats().bytes_written;
-        check(written_after_kv_only > written_before_kv_only &&
-                  written_after_kv_only - written_before_kv_only < tier.bytes() / 4,
-              "shape: an append counts what it appended, not the entry's whole file");
-        check(tier.best(prompt_of(1300, 1000), {}, false).tokens == 1200,
-              "shape: best() claims the stored state, not the K/V tail");
-        // step 9: the "read the tokens or read the file" estimate weighs the blocks a read of that state lands on, not
-        // the entry's whole file: the 100-token K/V tail the entry appended and no state covers is not counted
+        // step 9: the "read the tokens or read the file" estimate weighs the blocks a read lands on, not the entry's file
         const auto near = tier.best(prompt_of(1300, 1000), {}, false);
-        check(near.bytes > 0 && near.bytes < tier.bytes(),
+        check(near.tokens == 1200 && near.bytes > 0 && near.bytes < tier.bytes(),
               "shape: best() bytes is the blocks below the stored state, under the entry's file");
-        check(logged("debounced write, the end state written") &&
-                  logged("debounced write, no end state (under --prompt-cache-every)") &&
-                  logged("100 tokens past the deepest stored state"),
-              "shape: the write says which shape it was and why a state was skipped");
+        // 100 tokens past the stored state (< 512): nothing is written at all
+        const std::string before = bin_bytes();
+        const uint64_t bytes_before = tier.bytes();
+        const size_t written_before = tier.stats().written;
+        const uint64_t appended_before = tier.stats().bytes_written;
+        tier.park(1, std::make_shared<SavedConversation>(image(1300, 72)));
+        check(wait_until([&] { return tier.stats().queued >= 3; }), "shape: the third flush is queued");
+        tier.wait_idle();
+        check(tier.stats().written == written_before && tier.stats().bytes_written == appended_before,
+              "shape: 100 tokens past the stored state: nothing is written and no write is counted");
+        check(tier.bytes() == bytes_before && bin_bytes() == before,
+              "shape: the .bin is byte for byte the same, and no index was rewritten");
+        ConversationDiskEntry after3;
+        check(read_entry(after3) && states_of(after3) == 2 && after3.tokens == 1200,
+              "shape: the index still names the two stored states");
+        check(kv_end_of(after3) == 1200, "shape: no K/V above the deepest stored state was written for it");
+        check(logged("skipped 1300 tokens: 100 tokens past the newest stored state and --prompt-cache-every is 512"),
+              "shape: the skip line says how far past the stored state the end was, against the window");
+        check(logged("idle flush write, the end state written"), "shape: an idle flush that wrote says so");
         SavedConversation back;
         const auto m = tier.best(prompt_of(1300, 1000), {}, false);
         check(take_image(tier, m.id, m.tokens, back, e) && back.live.ids.size() == 1200,
-              "shape: a read lands on the stored state");
+              "shape: a read still lands on the deepest stored state");
         fs::remove_all(sdir);
+    }
+
+    {   // the window of state blocks (docs/CONVERSATION_DISK_STATE_WINDOW.md): the fill branch, the root's exception to
+        // the gap, the gap beating the target, and the append branch on a file that already holds the window.  The
+        // numbers are scaled down (tokens in the thousands, prompt_cache_every 1000) so the K/V stays small.
+        const fs::path wdir = dir / "window";
+        fs::remove_all(wdir);
+        fs::create_directories(wdir);
+        const SessionFileIdentity wid{23, 29};
+        auto window_opts = [&] {
+            auto o = opts(wdir, GiB);
+            o.persist = true;
+            o.identity = wid;
+            o.prompt_cache_every = 1000;
+            return o;
+        };
+        auto only_index = [&](ConversationDiskEntry& idx) {
+            for (const auto& f : fs::directory_iterator(wdir))
+                if (f.path().extension() == ".idx") return conversation_disk_index_read(f.path().string(), wid, idx);
+            return false;
+        };
+        {   // fill to 7: an image with ten checkpoints on a new file leaves exactly seven states, at the positions a
+            // hand-run of gap_thin() then spread_victim() gives
+            ConversationDiskTier tier(window_opts());
+            check(tier.open(e), "fill: open");
+            const std::vector<size_t> at = {500, 1000, 2000, 3000, 4000, 5000, 6000, 7000, 8000, 9000};
+            check(tier.put(chained(10000, 60, at)), "fill: put an image of ten checkpoints");
+            tier.wait_idle();
+            // gap at 1000 from the newest down keeps 9000..1000 and the pinned root; the thinning to 7 then drops 1000,
+            // 3000, 5000 and 2000 (each round the smallest relative gap), leaving the root and six above it
+            check(logged("fill write, 7 states in the window (the root included)"),
+                  "fill: seven states, the root included");
+        }
+        ConversationDiskEntry filled;
+        check(only_index(filled), "fill: the index reads back");
+        check(states_oldest_first(filled) == std::vector<int64_t>({500, 4000, 6000, 7000, 8000, 9000, 10000}),
+              "fill: the window is the root and the six points spread_victim() keeps");
+        check(filled.tokens == 10000 && filled.live.ids.size() == 10000, "fill: the deepest state is the live one");
+
+        {   // the root survives the gap: the shallowest state is written even when the one above it is closer than the
+            // window, and every other adjacent pair stays at least `prompt_cache_every` apart
+            const fs::path rdir = dir / "window-root";
+            fs::remove_all(rdir);
+            fs::create_directories(rdir);
+            const SessionFileIdentity rid{31, 37};
+            auto o = opts(rdir, GiB);
+            o.persist = true;
+            o.identity = rid;
+            o.prompt_cache_every = 16384;
+            ConversationDiskTier tier(std::move(o));
+            check(tier.open(e), "root: open");
+            const std::vector<size_t> at = {9000, 20000, 40000};
+            check(tier.put(chained(60000, 61, at)), "root: put the 60k image");
+            tier.wait_idle();
+            ConversationDiskEntry idx;
+            for (const auto& f : fs::directory_iterator(rdir))
+                if (f.path().extension() == ".idx") conversation_disk_index_read(f.path().string(), rid, idx);
+            check(states_oldest_first(idx) == std::vector<int64_t>({9000, 20000, 40000, 60000}),
+                  "root: all four are written, including the root and the 20000 state 11000 below the next");
+            const std::vector<int64_t> s = states_oldest_first(idx);
+            bool spaced = true;
+            for (size_t i = 2; i < s.size(); ++i)
+                if (s[i] - s[i - 1] < 16384) spaced = false;
+            check(spaced, "root: every pair above the root is at least the window apart");
+            fs::remove_all(rdir);
+        }
+        {   // the gap beats the target: the same image at half the conversation a window leaves two states, not seven
+            const fs::path gdir = dir / "window-gap";
+            fs::remove_all(gdir);
+            fs::create_directories(gdir);
+            const SessionFileIdentity gid{41, 43};
+            auto o = opts(gdir, GiB);
+            o.persist = true;
+            o.identity = gid;
+            o.prompt_cache_every = 32768;
+            ConversationDiskTier tier(std::move(o));
+            check(tier.open(e), "gap: open");
+            const std::vector<size_t> at = {9000, 20000, 40000};
+            check(tier.put(chained(60000, 62, at)), "gap: put the 60k image");
+            tier.wait_idle();
+            ConversationDiskEntry idx;
+            for (const auto& f : fs::directory_iterator(gdir))
+                if (f.path().extension() == ".idx") conversation_disk_index_read(f.path().string(), gid, idx);
+            check(states_oldest_first(idx) == std::vector<int64_t>({9000, 20000, 60000}),
+                  "gap: a window above half the conversation leaves three states, not seven - fewer than the target");
+            fs::remove_all(gdir);
+        }
+        {   // the append branch: seven states in the file, growth under the window writes nothing (rule 3), growth over
+            // it adds one end state and the K/V only up to it (rule 7)
+            ConversationDiskTier tier(window_opts());
+            check(tier.open(e) && tier.size() == 1, "append: open over the filled file");
+            const std::vector<std::string> before = [&] {
+                std::vector<std::string> v;
+                for (const auto& f : fs::directory_iterator(wdir))
+                    if (f.path().extension() == ".bin") {
+                        std::ifstream in(f.path(), std::ios::binary);
+                        v.push_back(std::string((std::istreambuf_iterator<char>(in)),
+                                                std::istreambuf_iterator<char>()));
+                    }
+                return v;
+            }();
+            const uint64_t bytes_before = tier.bytes();
+            check(tier.put(image(10500, 63, 1000, 0, 48, 1)), "append: put 10500 tokens (500 past the newest state)");
+            tier.wait_idle();
+            check(tier.bytes() == bytes_before && logged("skipped 10500 tokens: 500 tokens past the newest stored state"),
+                  "append under the window: nothing written, the file and its index are untouched");
+            bool same_bins = true;
+            size_t k = 0;
+            for (const auto& f : fs::directory_iterator(wdir))
+                if (f.path().extension() == ".bin") {
+                    std::ifstream in(f.path(), std::ios::binary);
+                    const std::string now((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+                    if (k >= before.size() || now != before[k]) same_bins = false;
+                    ++k;
+                }
+            check(same_bins, "append under the window: the .bin is byte for byte the same");
+            ConversationDiskEntry idx;
+            check(only_index(idx) && idx.tokens == 10000, "append under the window: the index still names 10000");
+            check(tier.best(prompt_of(10600), {}, false).tokens == 10000,
+                  "append under the window: a read still lands on the deepest stored state");
+            // 2000 past the newest state: one new end state, and no K/V above it
+            const size_t states_before = states_oldest_first(idx).size();
+            check(tier.put(image(12000, 63, 1000, 0, 48, 1)), "append: put 12000 tokens (2000 past the newest state)");
+            tier.wait_idle();
+            ConversationDiskEntry after;
+            check(only_index(after), "append: the index reads back");
+            check(states_oldest_first(after).size() == states_before + 1 &&
+                      states_oldest_first(after).back() == 12000,
+                  "append over the window: exactly one new state, the end");
+            int64_t kv_end = 0;
+            for (const auto& b : after.stages[0].blocks)
+                if (b.kind == ConversationDiskBlock::kv) kv_end = std::max(kv_end, b.tokens_end);
+            check(kv_end == 12000, "append over the window: the K/V goes up to the state written, not past it");
+            check(logged("append write, one end state written"), "append: the log says one end state was written");
+            SavedConversation back;
+            const auto m = tier.best(prompt_of(12100), {}, false);
+            check(m.tokens == 12000 && take_image(tier, m.id, m.tokens, back, e) && back.live.ids.size() == 12000,
+                  "append: the entry reads back at the new end");
+        }
+        {   // window 0: no gap requirement, a state at every write
+            const fs::path zdir = dir / "window-zero";
+            fs::remove_all(zdir);
+            fs::create_directories(zdir);
+            const SessionFileIdentity zid{47, 53};
+            auto o = opts(zdir, GiB);
+            o.persist = true;
+            o.identity = zid;
+            o.prompt_cache_every = 0;
+            ConversationDiskTier tier(std::move(o));
+            check(tier.open(e), "window 0: open");
+            check(tier.put(image(600, 64, 1000, 0, 48, 1)), "window 0: put 600");
+            tier.wait_idle();
+            check(tier.put(image(1300, 64, 1000, 0, 48, 1)), "window 0: put 1300, 700 past the end");
+            tier.wait_idle();
+            ConversationDiskEntry idx;
+            for (const auto& f : fs::directory_iterator(zdir))
+                if (f.path().extension() == ".idx") conversation_disk_index_read(f.path().string(), zid, idx);
+            check(idx.tokens == 1300 && states_oldest_first(idx).back() == 1300,
+                  "window 0: a write of 700 tokens still adds its end state");
+            fs::remove_all(zdir);
+        }
+        {   // read with 15 states: the landing state and at most six below it are taken, and Match::bytes is their sum
+            // plus the K/V - the rest of the file is not priced and not read
+            const fs::path ldir = dir / "window-legacy";
+            fs::remove_all(ldir);
+            fs::create_directories(ldir);
+            const SessionFileIdentity lid{59, 61};
+            auto o = opts(ldir, GiB);
+            o.persist = true;
+            o.identity = lid;
+            o.prompt_cache_every = 1000;
+            {
+                ConversationDiskTier tier(o);
+                check(tier.open(e), "legacy: open");
+                const std::vector<size_t> at = {500, 1000, 2000, 3000, 4000, 5000, 6000, 7000, 8000, 9000};
+                check(tier.put(chained(10000, 65, at)), "legacy: the fill writes the window");
+                tier.wait_idle();
+                // eight appends 1000 apart each add one end state: the file ends with fifteen states
+                for (int i = 1; i <= 8; ++i)
+                    check(tier.put(image(10000 + 1000 * i, 65, 1000, 0, 48, 1)),
+                          "legacy: put one append 1000 past the end");
+                tier.wait_idle();
+            }
+            ConversationDiskEntry idx;
+            for (const auto& f : fs::directory_iterator(ldir))
+                if (f.path().extension() == ".idx") {
+                    check(conversation_disk_index_read(f.path().string(), lid, idx), "legacy: the index reads back");
+                }
+            const std::vector<int64_t> states = states_oldest_first(idx);
+            check(states.size() == 15, "legacy: the file holds fifteen states (7 from the fill, 8 appends)");
+            const int64_t landing = states.back();
+            uint64_t kv = 0, kStates = 0, headers = 0;
+            for (const auto& b : idx.stages[0].blocks) {
+                if (b.kind == ConversationDiskBlock::kv && b.tokens_start < landing) kv += b.size;
+            }
+            const std::vector<int64_t> seven(states.end() - 7, states.end());
+            for (const auto& b : idx.stages[0].blocks)
+                if (b.kind == ConversationDiskBlock::state &&
+                    std::find(seven.begin(), seven.end(), b.tokens_start) != seven.end()) kStates += b.size;
+            headers = kConversationDiskBinHeader * idx.stages.size();
+            check(conversation_disk_read_bytes(idx, landing) == kv + kStates + headers,
+                  "legacy: a read is priced as the K/V plus the seven deepest states and the header");
+            ConversationDiskTier tier(o);
+            check(tier.open(e) && tier.size() == 1, "legacy: open to read");
+            const auto m = tier.best(prompt_of(18100), {}, false);
+            check(m.tokens == landing && m.bytes == kv + kStates + headers,
+                  "legacy: Match::bytes is the same number the read is priced at");
+            SavedConversation back;
+            const uint64_t read_before = tier.stats().bytes_read;
+            check(take_image(tier, m.id, m.tokens, back, e), "legacy: the read lands on the deepest state");
+            check(back.live.ids.size() == size_t(landing) && back.checkpoints.size() == 6,
+                  "legacy: the read gives back the landing state and six below it");
+            check(tier.stats().bytes_read - read_before == kv + kStates + headers,
+                  "legacy: it reads the K/V, the seven states and the header - not the other eight states");
+            fs::remove_all(ldir);
+        }
+        fs::remove_all(wdir);
     }
 
     {   // a read cancels a queued write (plan test 3) and the queued image comes back as the same allocation (test 8)

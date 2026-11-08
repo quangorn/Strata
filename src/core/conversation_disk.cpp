@@ -3,6 +3,8 @@
 
 #include "strata/core/conversation_file.hpp"
 
+#include "strata/program/conv_cache.hpp"
+
 #include <algorithm>
 #include <charconv>
 #include <chrono>
@@ -13,6 +15,7 @@
 #include <fstream>
 #include <iterator>
 #include <map>
+#include <memory>
 #include <random>
 #include <set>
 #include <system_error>
@@ -732,6 +735,13 @@ ConversationCheckpoint* state_at(SavedConversation& img, int64_t tokens) {
     return nullptr;
 }
 
+const ConversationCheckpoint* key_at(const SavedConversation& img, int64_t tokens) {
+    if ((int64_t) img.live.ids.size() == tokens) return &img.live;
+    for (const auto& c : img.checkpoints)
+        if ((int64_t) c.ids.size() == tokens) return &c;
+    return nullptr;
+}
+
 ConversationCheckpoint key_only(const ConversationCheckpoint& c) {
     ConversationCheckpoint k;
     k.ids = c.ids;
@@ -781,18 +791,23 @@ bool chain_prefix(const ConversationDiskEntry& e, const std::vector<const SavedC
     return true;
 }
 
-// The entry's states after this image: the deepest state is `live`, the rest are checkpoints, deepest first.  A state
-// the entry already holds at a position keeps its key (the chain check proved the image agrees there).
-void merge_keys(ConversationDiskEntry& e, const SavedConversation& img) {
+// The entry's states after this write: the deepest state is the image's live, the rest are the accepted positions
+// (docs/CONVERSATION_DISK_STATE_WINDOW.md).  A state the entry already holds at a position keeps its key (the chain
+// check proved the image agrees there), and every state the file holds keeps its key too - a key without a block
+// would claim a prefix no read can rebuild, and no block is ever removed.
+void merge_keys(ConversationDiskEntry& e, const SavedConversation& img, const std::vector<int64_t>& positions) {
     std::map<int64_t, ConversationCheckpoint> by_position;
     auto add = [&](const ConversationCheckpoint& k) {
         const int64_t at = (int64_t) k.ids.size();
+        if (at <= 0) return;   // a new entry has no keys yet
         if (!by_position.count(at)) by_position[at] = key_only(k);
     };
     for (const auto& c : e.checkpoints) add(c);
     add(e.live);
-    add(img.live);
-    for (const auto& c : img.checkpoints) add(c);
+    for (const int64_t at : positions) {
+        const ConversationCheckpoint* key = key_at(img, at);
+        if (key) add(*key);
+    }
     e.live = by_position.rbegin()->second;
     e.checkpoints.clear();
     for (auto it = std::next(by_position.rbegin()); it != by_position.rend(); ++it)
@@ -800,22 +815,25 @@ void merge_keys(ConversationDiskEntry& e, const SavedConversation& img) {
     e.tokens = (int64_t) e.live.ids.size();
 }
 
-// A debounced flush writes no checkpoint chain, so the entry's keys gain the end state alone: a key without a `state`
-// block would claim a prefix no read can rebuild.  merge_keys() minus the image's checkpoints.
-void merge_live_key(ConversationDiskEntry& e, const ConversationCheckpoint& live) {
-    std::map<int64_t, ConversationCheckpoint> by_position;
-    auto add = [&](const ConversationCheckpoint& k) {
-        const int64_t at = (int64_t) k.ids.size();
-        if (!by_position.count(at)) by_position[at] = key_only(k);
-    };
-    for (const auto& c : e.checkpoints) add(c);
-    add(e.live);
-    add(live);
-    e.live = by_position.rbegin()->second;
-    e.checkpoints.clear();
-    for (auto it = std::next(by_position.rbegin()); it != by_position.rend(); ++it)
-        e.checkpoints.push_back(it->second);
-    e.tokens = (int64_t) e.live.ids.size();
+// The state positions the file holds a block for in every stage, oldest first.  Those are barriers for a write's gap
+// rule: they are never removed and every new state is at least `prompt-cache-every` from one.
+std::vector<int64_t> states_in_file(const ConversationDiskEntry& e) {
+    std::vector<int64_t> out;
+    if (e.stages.empty()) return out;
+    for (const auto& b : e.stages.front().blocks) {
+        if (b.kind != ConversationDiskBlock::state || b.tokens_start <= 0) continue;
+        bool every_stage = true;
+        for (size_t s = 1; s < e.stages.size() && every_stage; ++s) {
+            bool found = false;
+            for (const auto& other : e.stages[s].blocks)
+                if (other.kind == ConversationDiskBlock::state && other.tokens_start == b.tokens_start) found = true;
+            every_stage = found;
+        }
+        if (every_stage) out.push_back(b.tokens_start);
+    }
+    std::sort(out.begin(), out.end());
+    out.erase(std::unique(out.begin(), out.end()), out.end());
+    return out;
 }
 
 // The state positions every stage holds a block for, deepest first, at or below `limit`: what a read can rebuild.
@@ -843,24 +861,36 @@ std::vector<int64_t> state_positions(const ConversationDiskEntry& e, int64_t lim
     return out;
 }
 
-// The blocks a read of the state at `position` uses, and the bytes they take: the kv blocks the state's extent needs,
-// then every state block at or below it (the checkpoints it hands back).
-uint64_t read_bytes_of(const ConversationDiskEntry& e, int64_t position) {
+// The states a read of the state at `position` takes: that landing state and at most six states below it, deepest
+// first (docs/CONVERSATION_DISK_STATE_WINDOW.md, rule 8).  A file written by an older build may hold more; the extra
+// blocks stay on the disk and no read asks for them.
+std::vector<int64_t> read_states(const ConversationDiskEntry& e, int64_t limit) {
+    std::vector<int64_t> states = state_positions(e, limit);
+    if (states.size() > kConversationDiskStates) states.resize(kConversationDiskStates);
+    return states;
+}
+
+// The blocks a read of these states uses, and the bytes they take: the kv blocks the landing state's extent needs,
+// then the state blocks in `states` (the landing state and the ones it hands back as checkpoints).
+uint64_t read_bytes_of(const ConversationDiskEntry& e, const std::vector<int64_t>& states) {
+    if (states.empty()) return 0;
+    const int64_t landing = states.front();
     uint64_t total = 0;
     for (const auto& stage : e.stages)
         for (const auto& b : stage.blocks) {
-            const bool needed = b.kind == ConversationDiskBlock::kv ? b.tokens_start < position
-                                                                    : b.tokens_start <= position;
+            const bool needed = b.kind == ConversationDiskBlock::kv
+                                        ? b.tokens_start < landing
+                                        : std::find(states.begin(), states.end(), b.tokens_start) != states.end();
             if (needed) total += b.size;
         }
     return total;
 }
 
 // Reads the entry's blocks back into the image they describe, as of the state at `position`: every stage's image, that
-// state as the image's `live`, the states below it as its checkpoints, and its K/V up to the state's extent.  Every
-// block read is checked against its 128 bits and against its place in the chained prefix digest; a block that fails
-// leaves `error` naming it, and the caller falls back to an earlier state.  `admit` is asked for the blocks' bytes
-// first.
+// state as the image's `live`, at most six states below it as its checkpoints, and its K/V up to the state's extent.
+// Every block read is checked against its 128 bits and against its place in the chained prefix digest; a block that
+// fails leaves `error` naming it, and the caller falls back to an earlier state.  `admit` is asked for the blocks'
+// bytes first.
 bool read_entry_image(const ConversationDiskEntry& e, int64_t position, SavedConversation& out, uint64_t& bytes,
                       const std::function<bool(uint64_t, std::string&)>& admit, std::string& error) {
     out = SavedConversation{};
@@ -869,25 +899,33 @@ bool read_entry_image(const ConversationDiskEntry& e, int64_t position, SavedCon
         error = "the entry holds no image";
         return false;
     }
-    uint64_t total = read_bytes_of(e, position);
+    const std::vector<int64_t> states = read_states(e, position);
+    if (states.empty() || states.front() != position) {
+        error = "the entry holds no state at " + std::to_string(position);
+        return false;
+    }
+    uint64_t total = read_bytes_of(e, states);
     if (admit && !admit(total, error)) return false;
-    auto key_at = [&](int64_t at) -> const ConversationCheckpoint* {
+    auto entry_key_at = [&](int64_t at) -> const ConversationCheckpoint* {
         if ((int64_t) e.live.ids.size() == at) return &e.live;
         for (const auto& c : e.checkpoints)
             if ((int64_t) c.ids.size() == at) return &c;
         return nullptr;
     };
-    const ConversationCheckpoint* deepest = key_at(position);
+    const ConversationCheckpoint* deepest = entry_key_at(position);
     if (deepest == nullptr) {
         error = "the entry has no key at the state's position " + std::to_string(position);
         return false;
     }
     // the checkpoints every stage can give back: the states below the one read, deepest first
     std::vector<const ConversationCheckpoint*> below;
-    for (const int64_t at : state_positions(e, position - 1)) {
-        const ConversationCheckpoint* key = key_at(at);
+    for (size_t i = 1; i < states.size(); ++i) {
+        const ConversationCheckpoint* key = entry_key_at(states[i]);
         if (key) below.push_back(key);
     }
+    auto is_state = [&](int64_t at) {
+        return std::find(states.begin(), states.end(), at) != states.end();
+    };
     for (size_t s = 0; s < e.stages.size(); ++s) {
         const ConversationDiskStage& stage = e.stages[s];
         SavedConversation& img = s == 0 ? out : out.stage_images.emplace_back();
@@ -904,7 +942,7 @@ bool read_entry_image(const ConversationDiskEntry& e, int64_t position, SavedCon
         for (const auto& b : stage.blocks) {
             const uint64_t digest = prefix_digest(e.live.ids, e.live.imgs, (size_t) b.tokens_start, prefix);
             const bool needed = b.kind == ConversationDiskBlock::kv ? b.tokens_start < position
-                                                                    : b.tokens_start <= position;
+                                                                    : is_state(b.tokens_start);
             if (needed) {
                 const char* kind = b.kind == ConversationDiskBlock::kv ? "kv" : "state";
                 if (digest != b.prefix_digest) {
@@ -982,10 +1020,10 @@ std::string fmt(const char* f, ...) {
 
 uint64_t conversation_disk_read_bytes(const ConversationDiskEntry& entry, int64_t limit) {
     // the deepest state every stage holds at or below `limit` is the one a read of that match lands on; the read also
-    // charges each stage's `.bin` header, as read_entry_image() does
-    const std::vector<int64_t> positions = state_positions(entry, limit);
-    if (positions.empty()) return 0;
-    return read_bytes_of(entry, positions.front()) + kConversationDiskBinHeader * entry.stages.size();
+    // takes at most six states below it and charges each stage's `.bin` header, as read_entry_image() does
+    const std::vector<int64_t> states = read_states(entry, limit);
+    if (states.empty()) return 0;
+    return read_bytes_of(entry, states) + kConversationDiskBinHeader * entry.stages.size();
 }
 
 // ---- container v2 (conversation_disk.hpp): the `.bin` header, the index's writer and reader.
@@ -1436,20 +1474,13 @@ void ConversationDiskTier::write(Job& job) {
             updated.id = job.entry.id;
         }
     }
-    // The write's shape (phase 2): a forced write (eviction, QUIT) is phase 1's whole image - every `kv` range beyond
-    // the last stored block, the checkpoint chain and the end state.  A debounced flush writes the same `kv` ranges and
-    // at most one end state, and only when the end is `--prompt-cache-every` tokens past the deepest stored state (or
-    // the entry has no state at all): no checkpoint chain.
-    const int64_t deepest_state = target ? updated.tokens : 0;
-    const bool write_state = job.forced || !target ||
-                             (int64_t) tokens - deepest_state >= options_.prompt_cache_every;
+    // The write's shape (docs/CONVERSATION_DISK_STATE_WINDOW.md): the file's positions are barriers, the image's root
+    // and the live state are always candidates, and on the fill branch (a new file, or fewer than kConversationDiskStates
+    // states in it) so is the image's checkpoint chain.  The chain is never written whole: a write adds at most
+    // kConversationDiskStates states, the root included, and only when the gap permits them.
     if (!target) {
         updated.cvec = images.front()->cvec;
         updated.geometry = images.front()->geometry;
-        updated.tokens = (int64_t) images.front()->live.ids.size();
-        updated.live = key_of(images.front()->live);
-        if (job.forced)
-            for (const auto& c : images.front()->checkpoints) updated.checkpoints.push_back(key_of(c));
         updated.stages.resize(images.size());
         for (size_t s = 0; s < images.size(); ++s) {
             updated.stages[s].layer_lo = images[s]->layer_lo;
@@ -1457,13 +1488,96 @@ void ConversationDiskTier::write(Job& job) {
             updated.stages[s].layers = (uint32_t) images[s]->kv.size();
         }
         updated.bytes = 0;
-    } else if (job.forced) {
-        merge_keys(updated, *images.front());
-    } else if (write_state) {
-        merge_live_key(updated, images.front()->live);
     }
     if (!target)
         log(fmt("new entry: no stored conversation is a prefix of this one's %zu tokens", tokens));
+
+    // Which branch (rule 1-6): a debounced (idle) flush offers the live state alone, whatever the file holds; a fill
+    // (no file, or fewer than kConversationDiskStates states in it) offers the image's checkpoints too; an append
+    // offers the live state alone.  In every branch a position the file already holds is a barrier: never removed,
+    // never rewritten, and no new state comes within `prompt-cache-every` of it.
+    const std::vector<int64_t> held = states_in_file(updated);
+    const bool idle = !job.forced;
+    const bool fill = !idle && (!target || held.size() < kConversationDiskStates);
+    const int64_t deepest_state = held.empty() ? 0 : held.back();
+    // position -> never cut by the gap: the root, a position the file already holds, or a pinned checkpoint
+    std::map<int64_t, bool> wanted;
+    auto add_key = [&](const ConversationCheckpoint& c, bool pinned) {
+        const int64_t at = (int64_t) c.ids.size();
+        if (at <= 0) return;
+        auto it = wanted.find(at);
+        if (it == wanted.end())
+            wanted.emplace(at, pinned);
+        else
+            it->second = it->second || pinned;
+    };
+    for (const int64_t at : held)
+        if (at > 0) wanted[at] = true;
+    // the root: the shallowest state of the write - the file's shallowest, or the image's, whichever is lower - and
+    // the one point every request shares, in practice the end of the system prompt (the RAM cache pins it too)
+    if (fill) {
+        if (!front.checkpoints.empty()) add_key(front.checkpoints.back(), true);
+        for (const auto& c : front.checkpoints) add_key(c, c.pinned);   // the chain, thinned below; a pin is protected
+    }
+    add_key(front.live, false);   // the live state is not protected: it is simply the newest point
+
+    const size_t ncand = wanted.size();
+    std::unique_ptr<int64_t[]> candidates(new int64_t[ncand]);
+    std::unique_ptr<bool[]> pinned(new bool[ncand]);
+    {
+        size_t i = 0;
+        for (const auto& [at, p] : wanted) {
+            candidates[i] = at;
+            pinned[i] = p;
+            ++i;
+        }
+    }
+    if (ncand) pinned[0] = true;   // index 0 is the root, as `eviction_victim()` and `gap_thin()` take it
+    std::vector<int64_t> accepted = strata::program::conv_cache::gap_thin(
+            candidates.get(), ncand, options_.prompt_cache_every, pinned.get());
+    // stage 2: thin to the window with the RAM cache's `spread_victim()` (it only removes points, so the gap survives);
+    // the root, the held positions and the pinned checkpoints are not victims
+    if (accepted.size() > kConversationDiskStates) {
+        std::unique_ptr<bool[]> keep(new bool[accepted.size()]);
+        for (size_t i = 0; i < accepted.size(); ++i) keep[i] = wanted.at(accepted[i]);
+        keep[accepted.size() - 1] = true;   // the newest point is never a victim (the live state is the newest here)
+        std::vector<uint64_t> stamps(accepted.size());
+        while (accepted.size() > kConversationDiskStates) {
+            for (size_t i = 0; i < accepted.size(); ++i) stamps[i] = i;
+            const size_t v = strata::program::conv_cache::spread_victim(
+                    accepted.data(), stamps.data(), accepted.size(), (int64_t) kConversationDiskStates, nullptr,
+                    keep.get());
+            if (v >= accepted.size() || keep[v]) break;   // only protected points are left
+            accepted.erase(accepted.begin() + (std::ptrdiff_t) v);
+            std::unique_ptr<bool[]> next(new bool[accepted.size()]);
+            for (size_t i = 0; i < accepted.size(); ++i) next[i] = keep[i < v ? i : i + 1];
+            keep = std::move(next);
+        }
+    }
+    // the states this write adds: accepted positions the file does not hold yet, oldest first
+    std::vector<int64_t> to_write;
+    for (const int64_t at : accepted)
+        if (!std::binary_search(held.begin(), held.end(), at)) to_write.push_back(at);
+
+    // Rule 3: a write under the window writes nothing at all - no state, no K/V, no index.  The queued image's id is
+    // still recorded under the mutex, or a read that matched it would afterwards report "the entry is gone".
+    if (to_write.empty()) {
+        const int64_t past = (int64_t) tokens - deepest_state;
+        {
+            std::lock_guard<std::mutex> lock(m_);
+            if (target && job.entry.id != target) published_.push_back({job.entry.id, target});
+        }
+        const int64_t gap = options_.prompt_cache_every;
+        images.clear();
+        job.image.reset();   // the RAM goes back now, written or not (the cache may hold the same allocation)
+        log(fmt("skipped %zu tokens: %lld tokens past the newest stored state and --prompt-cache-every is %lld; "
+                "nothing written (no state, no K/V, no index)",
+                tokens, (long long) past, (long long) gap));
+        return;
+    }
+    // the entry's keys: the states it holds plus the ones this write accepts, deepest first.  A key without a `state`
+    // block would claim a prefix no read can rebuild, so the image's chain is not merged - only what is written is.
+    merge_keys(updated, front, accepted);
 
     // 2. what the write will add: the blocks this image has and the entry does not (sizes only, before anything is
     // written, so the budget can make room first)
@@ -1472,7 +1586,7 @@ void ConversationDiskTier::write(Job& job) {
     uint64_t need = 0;
     size_t new_blocks = 0;
     std::vector<std::vector<std::pair<int64_t, int64_t>>> ranges(images.size());   // per stage: the new kv ranges
-    std::vector<std::vector<const ConversationCheckpoint*>> states(images.size());
+    const int64_t deepest_written = to_write.back();
     for (size_t s = 0; s < images.size() && error.empty(); ++s) {
         const SavedConversation& img = *images[s];
         if (!kv_plan(img, plans[s], error)) break;
@@ -1483,6 +1597,8 @@ void ConversationDiskTier::write(Job& job) {
                 break;
             }
         } else {
+            // rule 7: no K/V above the deepest state this write adds - a read cannot use it
+            plans[s].limit = std::min<int64_t>(plans[s].limit, (deepest_written / plans[s].page) * plans[s].page);
             int64_t last = 0;
             for (const auto& b : stage.blocks)
                 if (b.kind == ConversationDiskBlock::kv) last = std::max(last, b.tokens_end);
@@ -1495,18 +1611,16 @@ void ConversationDiskTier::write(Job& job) {
                 ++new_blocks;
             }
         }
-        if (job.forced) {
-            states[s].push_back(&img.live);
-            for (const auto& c : img.checkpoints) states[s].push_back(&c);
-        } else if (write_state) {
-            states[s].push_back(&img.live);   // one end state, no checkpoint chain
-        }
-        for (const auto* c : states[s]) {
-            const int64_t at = (int64_t) c->ids.size();
-            bool held = false;
+        for (const int64_t at : to_write) {
+            const ConversationCheckpoint* c = key_at(img, at);
+            if (c == nullptr) {
+                error = "the state at " + std::to_string(at) + " tokens is missing from a stage image";
+                break;
+            }
+            bool held_here = false;
             for (const auto& b : stage.blocks)
-                if (b.kind == ConversationDiskBlock::state && b.tokens_start == at) held = true;
-            if (!held) {
+                if (b.kind == ConversationDiskBlock::state && b.tokens_start == at) held_here = true;
+            if (!held_here) {
                 need += state_payload_size(*c);
                 ++new_blocks;
             }
@@ -1596,13 +1710,13 @@ void ConversationDiskTier::write(Job& job) {
             log(fmt("new kv block stage %zu: tokens %lld-%lld, %.1f MiB at %llu", s, (long long) r.first,
                     (long long) r.second, mib(rec.size), (unsigned long long) rec.offset));
         }
-        for (const auto* c : states[s]) {
+        for (const int64_t at : to_write) {
             if (!error.empty()) break;
-            const int64_t at = (int64_t) c->ids.size();
-            bool held = false;
+            const ConversationCheckpoint* c = key_at(img, at);
+            bool held_here = false;
             for (const auto& b : stage.blocks)
-                if (b.kind == ConversationDiskBlock::state && b.tokens_start == at) held = true;
-            if (held) continue;
+                if (b.kind == ConversationDiskBlock::state && b.tokens_start == at) held_here = true;
+            if (held_here || c == nullptr) continue;
             BlockOut out(file);
             if (!write_state_payload(out, *c)) {
                 error = "the state at " + std::to_string(at) + " tokens could not be written";
@@ -1670,11 +1784,11 @@ void ConversationDiskTier::write(Job& job) {
         for (size_t i = 0; i < entries_.size(); ++i)
             if (entries_[i].id == new_id) {
                 bytes_ -= entries_[i].bytes;
-                const size_t held = entries_[i].readers;          // a read of the older files keeps its protection
+                const size_t readers = entries_[i].readers;        // a read of the older files keeps its protection
                 const int64_t was_damaged = entries_[i].verified;
                 const int64_t now_damaged = updated.verified;
                 entries_[i] = std::move(updated);
-                entries_[i].readers = held;
+                entries_[i].readers = readers;
                 entries_[i].verified = (was_damaged && now_damaged) ? std::min(was_damaged, now_damaged)
                                                                     : (was_damaged ? was_damaged : now_damaged);
                 bytes_ += new_bytes;
@@ -1702,16 +1816,23 @@ void ConversationDiskTier::write(Job& job) {
         on_disk = entries_.size();
         disk_bytes = bytes_;
     }
-    const char* shape = job.forced ? "forced" : "debounced";
+    // The log says which branch ran and what it added (the three lines docs/CONVERSATION_DISK_STATE_WINDOW.md asks for;
+    // the skip branch logged its own line before anything was written)
+    const char* shape = idle ? "idle flush" : (fill ? "fill" : "append");
     std::string state_note;
-    if (job.forced) state_note = "the whole image";
-    else if (write_state) state_note = "the end state written";
-    else state_note = "no end state (under --prompt-cache-every)";
-    // what the validation of "one state per flush" counts: the growth since the deepest state the entry stored
+    if (fill) {
+        state_note = fmt("%zu state%s in the window (the root included), %zu new", accepted.size(),
+                         accepted.size() == 1 ? "" : "s", to_write.size());
+    } else if (idle) {
+        state_note = "the end state written";
+    } else {
+        state_note = "one end state written";
+    }
+    // what the validation of the window counts: the growth since the deepest state the entry stored
     const int64_t past = (int64_t) tokens - deepest_state;
     const std::string past_note =
-            target ? std::to_string(past) + " tokens past the deepest stored state"
-                   : std::to_string(past) + " tokens, the entry held no state before";
+            deepest_state ? std::to_string(past) + " tokens past the deepest stored state"
+                          : std::to_string(past) + " tokens, the entry held no state before";
     images.clear();
     job.image.reset();   // the RAM goes back now, written or not (the cache may hold the same allocation)
     log(fmt("wrote %zu tokens%s: %.1f MiB appended in %zu blocks (%zu new kv, %.1f MiB; %zu new state, %.1f MiB), index "
@@ -1782,7 +1903,7 @@ bool ConversationDiskTier::take(uint64_t id, int64_t tokens, std::shared_ptr<Sav
     SavedConversation image;   // the read builds a new image: a queued one was handed back above, this one is on disk
     // the deepest state the match can rebuild, then the ones before it when a block is damaged
     const int64_t claimed = std::min<int64_t>(tokens > 0 ? tokens : want.tokens, want.tokens);
-    const std::vector<int64_t> positions = state_positions(want, claimed);
+    const std::vector<int64_t> positions = read_states(want, claimed);
     int64_t read_at = 0;
     bool ram_refused = false;   // the preflight said no: see `keep_on_ram_refusal`
     if (positions.empty()) {
@@ -1790,7 +1911,7 @@ bool ConversationDiskTier::take(uint64_t id, int64_t tokens, std::shared_ptr<Sav
     } else {
         // the RAM preflight once, for the largest attempt (a fallback reads less)
         uint64_t need = 0;
-        for (const int64_t at : positions) need = std::max(need, read_bytes_of(want, at));
+        for (const int64_t at : positions) need = std::max(need, read_bytes_of(want, read_states(want, at)));
         if (admit && !admit(need, error)) {
             error = error.empty() ? "not enough RAM" : error;   // nothing was read; the entry goes only on the crutch
             ram_refused = true;

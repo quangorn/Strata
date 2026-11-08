@@ -8,8 +8,10 @@ several runs, split at each `engine started:` line, and each run is reported on 
 started with (`--conversation-disk-flush-seconds`, the folder, the budget). What the phase 2 plan asks for
 (`docs/CONVERSATION_DISK_STORE_PHASE2.md`, "Validation on hardware") is here:
 
-- the shape of every write: `forced write, the whole image` (eviction, QUIT) against `debounced write, the
-  end state written` / `no end state (under --prompt-cache-every)`, and the bytes split K/V, states, index;
+- the shape of every write: `fill write` (a new file or fewer than seven states: the window is taken),
+  `append write` (one end state past a file that already holds seven) and `idle flush write` (a debounced
+  park's end state), with the older logs' `forced write, the whole image` and `debounced write, ...`
+  understood too, and the bytes split K/V, states, index;
 - tokens past the deepest stored state, which is the number that decides "one state per flush" against
   "the whole chain";
 - writes, RAM hits, disk hits, tokens given back, waits for RAM, budget removals, failures — the tier's
@@ -39,8 +41,8 @@ TOTALS = re.compile(
 WRITE = re.compile(
     r"wrote (\d+) tokens( \(appended\))?: ([\d.]+) MiB appended in (\d+) blocks \((\d+) new kv, ([\d.]+) MiB; "
     r"(\d+) new state, ([\d.]+) MiB\), index ([\d.]+) MiB rewritten, (\d+) file")
-SHAPE = re.compile(r"; (forced|debounced) write, ([^;]+); (\d+) tokens(?: past the deepest stored state)?"
-                   r"(?:, the entry held no state before)?")
+SHAPE = re.compile(r"; (forced|debounced|fill|append|idle flush) write, ([^;]+); (\d+) tokens"
+                   r"(?: past the deepest stored state)?(?:, the entry held no state before)?")
 PARK = re.compile(r"conversation cache: parked (\d+) tokens in ([\d.]+) ms")
 QUIT = re.compile(r"conversation disk: saved for the next start in ([\d.]+) s")
 WAITED = re.compile(r"waited (\d+) ms for (\d+) queued write")
@@ -79,7 +81,7 @@ class Run:
         self.exe, self.flags, self.started = exe.replace("\\", "/"), flags(args_line), started
         self.queues = self.writes = 0
         self.kv_mib = self.state_mib = self.index_mib = 0.0
-        self.appended = self.forced = self.debounced = self.states = 0
+        self.appended = self.forced = self.debounced = self.states = self.appended_states = 0
         self.past = []          # tokens past the deepest stored state, per write
         self.totals = None      # the last `totals:` line of the run
         self.park_ms = []
@@ -103,10 +105,13 @@ class Run:
         self.index_mib += float(m.group(9))
         s = SHAPE.search(line)
         if s:
-            if s.group(1) == "forced":
+            what = s.group(1)
+            if what in ("forced", "fill"):        # the whole image (an older log) / the fill branch's window
                 self.forced += 1
-            else:
+            elif what in ("debounced", "idle flush"):
                 self.debounced += 1
+            else:                                  # "append": one end state past a file holding the window
+                self.appended_states += 1
             self.states += 1 if "end state written" in s.group(2) else 0
             self.past.append(int(s.group(3)))
 
@@ -118,7 +123,8 @@ class Run:
                f"  persist {f.get('conversation-disk-persist', '-')}"]
         out.append(f"  writes {self.writes} ({self.appended} appended): {self.kv_mib:.0f} MiB K/V, "
                    f"{self.state_mib:.0f} MiB states, {self.index_mib:.0f} MiB index; shapes: "
-                   f"{self.forced} forced whole image, {self.debounced} debounced, {self.states} wrote a state")
+                   f"{self.forced} fill (or an older log's whole image), {self.appended_states} append, "
+                   f"{self.debounced} idle flush (or an older log's debounced), {self.states} wrote an end state")
         if self.past:
             out.append(f"  tokens past the deepest stored state: median {int(statistics.median(self.past))}, "
                        f"p95 {int(percentile(self.past, 0.95))}, max {max(self.past)} over {len(self.past)} writes")
@@ -157,6 +163,7 @@ class Run:
                 "flush_s": self.flags.get("conversation-disk-flush-seconds", "0"),
                 "writes": self.writes, "appended": self.appended, "forced": self.forced,
                 "debounced": self.debounced, "wrote_state": self.states,
+                "fill": self.forced, "append": self.appended_states, "idle": self.debounced,
                 "kv_mib": round(self.kv_mib), "state_mib": round(self.state_mib),
                 "past_median": int(statistics.median(self.past)) if self.past else 0,
                 "park_median_ms": round(statistics.median(self.park_ms), 1) if self.park_ms else 0,

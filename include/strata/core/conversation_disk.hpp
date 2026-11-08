@@ -39,8 +39,10 @@ struct ConversationDiskOptions {
     /// --conversation-disk-flush-seconds: a park is written after this many quiet seconds (the debounce).  0 = off and
     /// today's behaviour byte for byte: nothing is queued at park time, the tier is written on eviction and at QUIT.
     int64_t flush_seconds = 0;
-    /// --prompt-cache-every: a debounced flush writes an end state only when the end is this many tokens past the
-    /// deepest stored state (or the entry holds no state at all).  0: a state at every flush.
+    /// --prompt-cache-every: the window of state blocks a write keeps (docs/CONVERSATION_DISK_STATE_WINDOW.md).  The
+    /// live state is written only when it is this many tokens past the newest stored state, adjacent states in a file
+    /// are this far apart (the root is the one exception), and a write under the window writes nothing at all.  0: no
+    /// gap requirement, a state at every write.
     int64_t prompt_cache_every = 16384;
     /// Called with every diagnostic line (no trailing newline), from the caller's or the writer's thread.
     std::function<void(const std::string&)> log;
@@ -78,6 +80,12 @@ struct ConversationDiskStats {
 
 /// The `.bin`'s header (64 bytes).
 constexpr size_t kConversationDiskBinHeader = 64;
+
+/// The window of state blocks a file keeps, live and root included (docs/CONVERSATION_DISK_STATE_WINDOW.md): seven is
+/// one state block of ~112.6 MiB at most per seven positions, and it is what a read takes - the landing state plus six
+/// below it - so a long conversation's read is its K/V plus about 0.79 GiB of states instead of the whole file.  A
+/// write adds at most this many; states already in a file are never removed, so an older file may hold more.
+constexpr size_t kConversationDiskStates = 7;
 
 /// What a `.bin` is bound to.  A file whose header names another model, setting, entry or stage is not read.
 struct ConversationDiskBinHeader {
@@ -146,10 +154,10 @@ bool conversation_disk_index_write(const std::string& path, const ConversationDi
 bool conversation_disk_index_read(const std::string& path, const SessionFileIdentity& identity,
                                   ConversationDiskEntry& entry);
 
-/// The bytes a read of `entry` lands on reads: it rebuilds the deepest `state` block at or below `limit`, and that needs
-/// the K/V below it and every state block at or below it - not the entry's whole `.bin`, whose blocks past the state no
-/// read touches yet.  `Match::bytes` is this number, because the "read the tokens or read the file" estimate divides it
-/// by the mean read speed.  0 when the entry holds no such state.
+/// The bytes a read of `entry` lands on reads: the deepest `state` block at or below `limit`, the at most six states
+/// below it, and the K/V below the landing state - not the entry's whole `.bin`, whose blocks past the state (and its
+/// states above the window) no read touches.  `Match::bytes` is this number, because the "read the tokens or read the
+/// file" estimate divides it by the mean read speed.  0 when the entry holds no such state.
 uint64_t conversation_disk_read_bytes(const ConversationDiskEntry& entry, int64_t limit);
 
 class ConversationDiskTier {
@@ -167,32 +175,35 @@ public:
     bool open(std::string& error);
 
     /// The cache's events (ConversationCache::set_on_change).  With flush 0 nothing is written at park time, an
-    /// eviction writes the whole image and a taken or superseded conversation's queued write is cancelled: phase 1's
-    /// behaviour byte for byte.  With `--conversation-disk-flush-seconds N` a park arms a write due in `N` seconds
-    /// (a second park of the same entry replaces it, keeping its id), and eviction or QUIT forces the write at once.
+    /// eviction writes the image now (the window decides which states it keeps) and a taken or superseded
+    /// conversation's queued write is cancelled: phase 1's behaviour byte for byte.  With
+    /// `--conversation-disk-flush-seconds N` a park arms a write due in `N` seconds (a second park of the same entry
+    /// replaces it, keeping its id), and eviction or QUIT forces the write at once.
     void park(uint64_t serial, std::shared_ptr<const SavedConversation> image);
     /// The conversation `serial` left the cache: a queued write of it is cancelled.  `wait_running` (the cache's
     /// `taken` event) also waits for a write already running for that serial, because the restore path moves sub-objects
     /// out of the shared image next; the cache's `superseded` event must pass false - nothing moves out of that image,
     /// and the caller is the parking thread, which would wait a whole write on the hot path.
     void dropped(uint64_t serial, bool wait_running = true);
-    /// Writes `image` whole (eviction or QUIT), now: phase 1's put(), with the cache entry's serial.  Its RAM is freed
-    /// when the write ends, stored or not.
+    /// Writes `image` now (eviction or QUIT), with the cache entry's serial: a fill or an append write, as put().  Its
+    /// RAM is freed when the write ends, stored or not.
     bool force(uint64_t serial, std::shared_ptr<const SavedConversation> image);
     /// Nothing the cache queued is restorable any more (#879's clear): the queue goes, deferred jobs too.
     void cancel_all();
 
     /// Queues `image` for the writer, as force() without a cache entry (tests, and a park the RAM cache refused).
-    /// Every checkpoint is written with it (they hold no K/V), so a prompt that leaves the conversation early still
-    /// resumes from one.  False when the tier is off or over budget.
+    /// The write keeps the window (docs/CONVERSATION_DISK_STATE_WINDOW.md): the image's root, the live state and, on a
+    /// fill branch, the checkpoints at least `prompt_cache_every` apart - at most `kConversationDiskStates` states, so
+    /// a prompt that leaves the conversation early resumes from one of them when the window holds it.  False when the
+    /// tier is off or over budget.
     bool put(SavedConversation&& image);
 
     struct Match {
         uint64_t id = 0;        ///< the entry (stable while the writer runs; 0 = none)
         int64_t tokens = 0;
         bool live = false;
-        /// What a read of this match lands on reads, not the entry's file: the blocks below the deepest `state` block
-        /// a read can rebuild (queued: the image's estimate in RAM).
+        /// What a read of this match lands on reads, not the entry's file: the K/V below the deepest `state` block a
+        /// read can rebuild and that state plus at most six states below it (queued: the image's estimate in RAM).
         uint64_t bytes = 0;
         bool queued = false;    ///< still in RAM: take() hands it back without reading a file
         /// The tokens a read of this match lands on: the deepest `state` block a read can rebuild (a read that fell
@@ -227,11 +238,11 @@ public:
 
     /// Hands entry `id` back in `out`; the entry stays in the tier either way.  A queued image is the same allocation,
     /// moved out of the queue (a "RAM hit", no copy); a written one is read into a new image, its stage images
-    /// included.  Only the blocks the deepest state a read can rebuild needs are read, and a damaged chain falls back
-    /// to an earlier state.  `admit(need, why)` is asked before the blocks' payloads are allocated (session_file_read's
-    /// RAM preflight).  `tokens` is the prefix the request matched (diagnostics).  On failure `out` is empty and
-    /// `error` says why.  The entry stays: its files are a cache, except on a refusal for RAM, which removes it
-    /// (temporary, `keep_on_ram_refusal`).
+    /// included.  Only the landing state, at most six states below it and the K/V below the landing state are read,
+    /// and a damaged chain falls back to an earlier state.  `admit(need, why)` is asked before the blocks' payloads are
+    /// allocated (session_file_read's RAM preflight).  `tokens` is the prefix the request matched (diagnostics).  On
+    /// failure `out` is empty and `error` says why.  The entry stays: its files are a cache, except on a refusal for
+    /// RAM, which removes it (temporary, `keep_on_ram_refusal`).
     bool take(uint64_t id, int64_t tokens, std::shared_ptr<SavedConversation>& out, std::string& error,
               const std::function<bool(uint64_t need_bytes, std::string& why)>& admit = {});
 
@@ -262,7 +273,7 @@ private:
         std::shared_ptr<SavedConversation> image;
         uint64_t serial = 0;                          ///< the cache entry the job came from (0: put(), no entry)
         std::chrono::steady_clock::time_point due;    ///< when the writer may start it
-        bool forced = false;                          ///< eviction or QUIT: write the whole image, chain included
+        bool forced = false;                          ///< eviction, QUIT or put(): a fill or append write, not an idle flush
     };
     /// Queues `job` (keys, image, serial, due and shape filled): assigns its id, replaces an earlier job of the same
     /// serial (keeping that job's id), logs and wakes the writer.  False when the tier is off or over budget.

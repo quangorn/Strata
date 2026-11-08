@@ -147,6 +147,12 @@ This is the answer to "never drop an evicted checkpoint": the window keeps what 
 the root keeps what every branch resumes from. The measured use is the shared system prompt, which is
 the root.
 
+The write side of this rule is specified separately in
+[CONVERSATION_DISK_STATE_WINDOW.md](CONVERSATION_DISK_STATE_WINDOW.md): a write adds at most one state and
+only when it is `--prompt-cache-every` past the newest stored one, so a conversation stops accumulating
+states at the source. It keeps the root pinned, as this section asks. What stays here is trimming files that
+already hold more than the window.
+
 ### 5. Crash consistency
 
 Same order as phase 1: block bytes first, the store index second, the conversation index third. A
@@ -174,6 +180,11 @@ the refusal as a plain read failure: the entry stays, the prompt is read, the by
 refusal left standing after the window is a sign the window is too big, and the answer is the window,
 not a deletion.
 
+The "at most 7 states" half of the argument is specified in
+[CONVERSATION_DISK_STATE_WINDOW.md](CONVERSATION_DISK_STATE_WINDOW.md) and needs to land first; that change
+does not touch this section's removal (the option, the flag, the `ram_drops` stat and the branch in
+`ConversationDiskTier::take`).
+
 ## Expected effect
 
 From the measurement: 14 429 MiB of 21 118 MiB, mostly one growing conversation written again (the
@@ -195,7 +206,11 @@ disappear" is the same tool, not a new one.
    to an earlier state (phase 1's rule) still works.
 6. **compaction**: a pack above the dead-space threshold is rewritten, live blocks keep working, a
    reader that started before it finishes is unaffected.
-7. **window**: eight flushes leave six states plus the root, and the two dropped ones are collected.
+7. **window**: eight flushes of a short conversation at `--prompt-cache-every 16384` leave the root and the
+   end state, not six states plus the root: the write-side window
+   ([CONVERSATION_DISK_STATE_WINDOW.md](CONVERSATION_DISK_STATE_WINDOW.md)) stopped the accumulation at the
+   source, so what this test now checks is that an older file's extra states are collected when it is
+   trimmed; a file that still holds more than seven is read as seven.
 8. **identity change**: a different model or config leaves the old store unreferenced, and the
    start-up scan removes it.
 

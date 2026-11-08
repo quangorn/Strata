@@ -12,6 +12,13 @@ evicts whole conversations by use, and a folder of the previous build is removed
 changes **when** the tier is written and **who owns the bytes**, not the container: the `.bin`
 header, the `.idx` index, the block records and the read path stay exactly as phase 1 left them.
 
+> Later change, [CONVERSATION_DISK_STATE_WINDOW.md](CONVERSATION_DISK_STATE_WINDOW.md) (2026-11-08): the
+> "whole image" shape below is gone from the code. A write now keeps a window of at most seven states
+> (`--prompt-cache-every` apart, the root pinned), adds at most one state past a file that already holds
+> seven, and a read takes seven states. Where this file says "the whole image" or "the whole-image
+> shape" for an eviction or the QUIT save, read "the fill branch's window"; the steps are otherwise the
+> history of how the tier got here and are left as written.
+
 Decisions already agreed (2026-11-03):
 
 1. **the flag is `--conversation-disk-flush-seconds N`**, `int64_t`, `0` = off and today's behaviour

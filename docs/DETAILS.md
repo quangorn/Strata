@@ -899,16 +899,24 @@ one) when the disk holds a longer prefix than the session, a `--batch` slot or t
   park time: the disk is written when a conversation is evicted and at QUIT, as phase 1 did. With `N`, a park arms a
   write `N` seconds out, and a second park of the same conversation replaces the first and moves the deadline (the newer
   image wins). `1` is "write at every park"; the debounce is how long the conversation must be quiet first. An eviction
-  and QUIT ignore the debounce and write at once. A debounced flush is cheap: it appends the K/V past the last stored
-  block and **at most one end state**, and only when the end is at least `--prompt-cache-every` tokens (default 16,384)
-  past the deepest stored state, or the conversation has no state yet - never a checkpoint chain. An evicted
-  conversation and the QUIT save write the whole image, chain included, as phase 1 did. One exception: a conversation
-  held for its pinned shared prefix is never evicted (`evict_oldest` skips it), so QUIT does not force it either - with
-  the debounce on it is written in the debounced shape, and with `0` it is not written at all, as in phase 1. The
-  tier's files and format do not change: a debounced flush just appends fewer blocks;
+  and QUIT ignore the debounce and write at once.
+- **what a write keeps: the state window** (`--prompt-cache-every`, default 16,384). A write adds either one live
+  state or, when the file is new or holds fewer than seven states, a set of up to seven taken from the image's
+  checkpoints - the window (`docs/CONVERSATION_DISK_STATE_WINDOW.md`). Adjacent states in a file are at least
+  `--prompt-cache-every` tokens apart, with one exception: the root, the shallowest state of the write (in practice the
+  end of the system prompt, the point every request shares), is always written and may sit closer to the state above it.
+  The image's checkpoint chain is never written whole, and the K/V stops at the deepest state written - a read cannot use
+  K/V above it. A write with nothing to add (the live state less than `--prompt-cache-every` past the newest stored
+  state) writes nothing at all: no state, no K/V, no index, and the log says how far past it the end was. An idle
+  (debounced) flush offers the live state alone, whatever the file holds; states already in a file are never removed, so
+  a long-lived conversation's file grows by one state per `--prompt-cache-every` of growth. A file written by an older
+  build may hold more states; they stay and no read asks for them. One exception to the branches: a conversation held
+  for its pinned shared prefix is never evicted (`evict_oldest` skips it), so QUIT does not force it either - with the
+  debounce on it is written in the idle flush's shape, and with `0` it is not written at all, as in phase 1;
 - a read back needs RAM for the whole image above `--conversation-cache-min-free-mib`, as a park does; without it the
   prompt is read again (`not restored (not enough RAM ...)`). A read keeps the conversation on the disk (the next
-  eviction of it appends to the same entry) and reads only the blocks its deepest stored state needs. Every block is
+  eviction of it appends to the same entry) and reads only what its deepest stored state needs: the K/V below it and
+  that state plus at most six states below it - seven states in all, not every state the file holds. Every block is
   checked against its 128-bit hash and the chain of the blocks before it, and a damaged block falls back to the deepest
   earlier state whose chain verifies: one bad byte costs the states above it, not the conversation;
 - a file is read back only when that is faster than reading the tokens it adds, by this run's measured disk speed and
@@ -916,18 +924,19 @@ one) when the disk holds a longer prefix than the session, a `--batch` slot or t
   with a saved one no longer reads the saved one's whole file (on the box below 6,033 MiB for 16,384 tokens, 11.4 s
   from its NVMe against ~8 s to read the tokens). Until both speeds are measured the file is read; a skip is logged
   (`not read`, with both estimates). The file estimate is the blocks that read needs - the K/V below the deepest state
-  it lands on and the states at or below it - not the entry's whole file, which a debounced flush may have grown past
-  that state. The tokens counted are the ones a read lands on - the deepest state the file holds, and less after a
+  it lands on and that state plus the six below it - not the entry's whole file, which a debounced flush may have grown
+  past that state. The tokens counted are the ones a read lands on - the deepest state the file holds, and less after a
   fallback on damage - not what the index claims;
 - `--conversation-disk-mib N` (default 32768): the files' total, the least recently used conversation out first (a read
   and a write both stamp it; a conversation holding a pinned shared prefix is left while another one can go, and the
   budget goes over rather than trade the pin). Without `--conversation-disk-persist` the files' identity is a random
   number of the run: only this engine reads them, and its files (`strata-conv-*`) are removed at start and when it
   ends;
-- the log has a line for each new block of a write (kind, tokens, MiB, offset), a line per flush with its shape
-  (`forced` or `debounced`), the K/V and state MiB it appended, the size of the index it rewrote and how many tokens
-  past the deepest stored state it wrote (the numbers a "bytes per day, split by K/V and states" count is made of), a
-  line for every queue, hit and wait (MiB, ms, MB/s) and a totals line (`strata serve: conversation disk: ...`). The
+- the log has a line for each new block of a write (kind, tokens, MiB, offset), a line per write with its shape
+  (`fill`, `append` or `idle flush`) and the states it added (the fill branch's window, or one end state), the K/V and
+  state MiB it appended, the size of the index it rewrote and how many tokens past the deepest stored state it wrote
+  (the numbers a "bytes per day, split by K/V and states" count is made of), a line for every queue, hit, wait (MiB, ms,
+  MB/s) and skipped write, and a totals line (`strata serve: conversation disk: ...`). The
   MiB and MB/s count the bytes this write appended, not the conversation's whole file: an append of 122 MiB says
   122 MiB, where phase 1's line added up every block the file held (measured on this PC: 1666 MiB for a 122.2 MiB
   append). A request reused from the disk says so at the end of its line.
