@@ -196,9 +196,19 @@ The engine: `python3 packaging/build_engine_win_local.py engine`. The model does
 engine's version string does not change (`AGENTS.md`), so the disk store survives the build; the new code is
 taken at the next engine start.
 
-Live check in `C:\Users\karam\AppData\Local\Strata\launch\iq2_xs_low_ram.engine.log`: after an eviction the
+Live check in `C:\Users\karam\AppData\Local\Strata\launch\iq2_xs-low_ram.engine.log`: after an eviction the
 line says "1 new state" (or "7 new state" for a new file), "the whole image" is gone, and `disk hit:` for a
 large conversation asks about 7 x 112.6 MiB plus its K/V instead of 4.6-6.5 GiB.
+
+Measured 2026-11-08 on this PC, package `0.1.58.1-windows-x86_64-cuda-cuda13`, engine started 16:03. A legacy
+file of 115 386 tokens read as **1781 MiB in 2.96 s (630 MB/s)** and came back - the old build priced the same
+read at 6278-6527 MiB, refused it and removed the entry. Live writes: `idle flush write, the end state written;
+35342 tokens past the deepest stored state` (one end state and the K/V up to it); `fill write, 4 states in the
+window (the root included), 3 new` with **0 new kv** - rule 7, no K/V above the deepest state written;
+`skipped 127993 tokens: 12607 tokens past the newest stored state and --prompt-cache-every is 16384; nothing
+written (no state, no K/V, no index)` from real traffic; an idle flush on a new entry wrote one end state with
+the K/V ending at 96856 for the live 96859, and a read that restored a parked conversation cancelled its
+queued write before the deadline. "the whole image" never appears in the log of this run.
 
 ## Expected effect (estimate, not a measurement)
 
