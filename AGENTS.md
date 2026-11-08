@@ -78,6 +78,22 @@ pattern (`src/prefill/kva_test.cpp`). Follow it in new tests. Warnings C4244 and
 `python tools/deploy_local_code.py` copies the fork's launch and control files into the active component folder.
 A running server keeps the code it loaded, so deploy first, then stop and start the model.
 
+The copy is the **whole tree of the parts a Control runs**, not a diff. Measured 2026-11-08: the active Control
+(`components\control\0.1.56`) names `c5ab5d40`, which is 312 commits behind `upstream/main`, so a diff against
+`upstream/main` copied 6 files and left out every file upstream added after that release; the launch code that IS copied
+imports them, and `strata launch --preset "IQ2_XS low_ram" --no-tui` died with
+`ImportError: cannot import name 'arg_layers' from 'strata_control'` (`strata_cli/launch/runner.py:546`). A diff against the
+install's own `COMMIT` copied 63 files, and the launch got further and died at
+`AttributeError: module 'strata_control.gpu_fit' has no attribute 'strix_q4_stall_note'`: 18 files of the parts were the
+release's own, and the folder is not the tree `COMMIT` names (the content of `gpu_fit.py` in the install is in no commit of
+this checkout, and it lacks a function `c5ab5d40` has). The full copy took 20 more files, and the parts of the install are now
+byte for byte this checkout: identical 318, differ 0, missing 0, install-only 0.
+
+The daily launch runs from this checkout (`bin\strata`, the alias in `~/.bashrc`), not from the terminal on this PC: the
+terminal is 0.1.48.1 and hands the command over to the installed Control. Measured 2026-11-08: after the full copy the
+terminal route answers `launch --preset "IQ2_XS low_ram" --no-tui --plan` with rc=0, the checkout route answers rc=0, and
+`strata --version` says `strata 0.2.12 (build 0.1.58; python 3.12.10 at .venv\Scripts\python.exe)`.
+
 ## Tests
 
 - The Terminal and Control suite: `./.venv/Scripts/python.exe -m pytest tests/terminal -q` runs without a GPU,

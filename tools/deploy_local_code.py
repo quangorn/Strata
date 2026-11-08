@@ -4,23 +4,38 @@
 This PC takes everything from upstream as binaries, and this checkout owns two things: the engine and the picture reader,
 built by `packaging/build_engine_win_local.py`, and the Python of the launch and update scripts, patched here. A model serves
 as `components\\control\\<version>\\python\\python.exe -m serve.server`, so the patched files have to be in the Control folder
-that is active. The terminal is NOT touched: the terminal `strata` on this PC (terminal/current, an upstream release) has a
-code base far older than this checkout, and putting files from a newer code base into an older install folder mixes two
-versions of the same modules. The launch runs from this checkout instead: `bin\\strata.ps1` (or `bin\\strata.cmd`) uses its
-`.venv`, and the same launcher upstream ships.
+that is active. The terminal on this PC (terminal/current, an upstream release 0.1.48.1) is not touched by the copy: its launcher
+hands the command over to the installed Control (`strata_cli/handover.py`), so a model started from the terminal runs the Control
+folder's code, and that code has to be complete. The daily launch runs from this checkout: `bin\\strata` (the alias in
+`~/.bashrc`), through its `.venv`, with the same launcher upstream ships. Measured 2026-11-08: before the alias was pointed at
+the checkout, `strata launch --preset "IQ2_XS low_ram" --no-tui` died with
+`ImportError: cannot import name 'arg_layers' from 'strata_control'`; after it the same command plans with rc=0.
 
-The files copied are the ones this checkout changed against upstream (`git diff --name-only upstream/main HEAD`, plus the
-files that are edited and not committed), limited to `strata.py`, `setup.py`, `strata_cli/`, `strata_control/` and `serve/`.
-Nothing else of the install is touched and nothing is downloaded. A Control folder's files are not hashed on a start
+The files copied are **this checkout's whole tree of the parts a Control runs** — `strata.py`, `setup.py`, `strata_cli/`,
+`strata_control/`, `serve/` — not a diff against any commit. Nothing else of the install is touched, nothing is downloaded and
+nothing in the install is deleted (measured 2026-11-08: no file in the parts of the active Control is missing from this
+checkout, so the copy cannot leave a stale module behind). A Control folder's files are not hashed on a start
 (`components/control/active.json` records the archive's SHA-256), so the copy is not refused; an engine package's files are
-checked by SHA-256 against their manifest (`strata_control/engine_component.py`), which is why the engine reaches this PC
-only as a package built here.
+checked by SHA-256 against their manifest (`strata_control/engine_component.py`), which is why the engine reaches this PC only
+as a package built here.
 
-    python tools/deploy_local_code.py plan        show which files differ; nothing is written
+The diff rules were tried and both are wrong on this PC, measured 2026-11-08. Against `upstream/main` the copy was 6 files:
+the active Control (`components\\control\\0.1.56`) names `c5ab5d40`, **312 commits behind** `upstream/main`, so every file
+upstream added after that release is identical to `upstream/main`, never copied, and the launch code that IS copied imports it
+— `strata launch --preset "IQ2_XS low_ram" --no-tui` died with
+`ImportError: cannot import name 'arg_layers' from 'strata_control'` (`strata_cli/launch/runner.py:546`). Against the install's
+`COMMIT` the copy was 63 files, and the launch got further and died at
+`AttributeError: module 'strata_control.gpu_fit' has no attribute 'strix_q4_stall_note'`: 18 of the parts' files in the install
+are the release's own, and `COMMIT` is not a tree the folder matches (the content of `strata_control/gpu_fit.py` there is in no
+commit of this checkout, and it is missing a function `c5ab5d40` has — the folder is older than the commit it names). A Control
+folder of this PC is a release shell (`python\\`, `BUNDLE.json`, `COMMIT`) plus this checkout's Python, and the only shape that
+is consistent inside the folder is the whole tree. The server that runs is the code it loaded at its start, so deploy first,
+then stop and start the model.
+
+    python tools/deploy_local_code.py plan        show which files differ from the install; nothing is written
     python tools/deploy_local_code.py            copy them (a file the target does not have is added)
 
-Run it after `strata update`: a new Control version arrives as a new folder, and the patched files must go in there too. Pull
-upstream first, so the files copied are the newest upstream code plus this checkout's own changes.
+Run it after `strata update`: a new Control version arrives as a new folder, and this checkout's tree must go in there too.
 """
 
 from __future__ import annotations
@@ -29,7 +44,6 @@ import hashlib
 import json
 import os
 import shutil
-import subprocess
 import sys
 from pathlib import Path
 
@@ -65,35 +79,23 @@ def targets(h: Path) -> list[tuple[str, Path]]:
     return out
 
 
-def git(*args) -> list[str]:
-    """The lines a git command prints in this checkout; an empty list when git or the remote is not there."""
-    try:
-        out = subprocess.run(["git", *args], cwd=ROOT, capture_output=True, text=True, encoding="utf-8")
-        return [line.strip() for line in out.stdout.splitlines() if line.strip()]
-    except OSError:
-        return []
-
-
-def owned() -> list[Path]:
-    """The files this checkout owns as paths relative to its root: the ones it changed against upstream, the ones edited
-    and not committed, and the new ones it added. Only the parts of an install it owns are kept."""
-    names = set(git("diff", "--name-only", "upstream/main", "HEAD"))            # committed fork changes
-    names |= set(git("diff", "--name-only"))                                     # edited, not committed
-    names |= set(git("ls-files", "--others", "--exclude-standard"))              # added, not tracked
+def parts() -> list[Path]:
+    """Every file of this checkout under the parts a Control runs, as paths relative to its root, plus the two entry scripts.
+    Byte-code folders are not copied. `tools/` is not part of a Control's run, so it stays out (`tools/gguf_reader.py`, the one
+    module the launch imports from there, is byte for byte the release's — md5 `314a728b…`)."""
     found = []
-    for name in sorted(names):
-        rel = Path(name.replace("\\", "/"))
-        if not rel.parts:
-            continue
-        top = rel.parts[0]
-        if top not in PARTS and rel.as_posix() not in LOOSE:
-            continue
-        if any(part in rel.parts for part in SKIP):
-            continue
-        if not (ROOT / rel).is_file():
-            continue
-        found.append(rel)
-    return found
+    for part in PARTS:
+        for s in (ROOT / part).rglob("*"):
+            if not s.is_file():
+                continue
+            rel = s.relative_to(ROOT)
+            if any(skip in rel.parts for skip in SKIP):
+                continue
+            found.append(rel)
+    for name in LOOSE:
+        if (ROOT / name).is_file():
+            found.append(Path(name))
+    return sorted(found)
 
 
 def digest(path: Path) -> str:
@@ -114,10 +116,7 @@ def main(argv=None) -> int:
     if not found:
         print(f"[strata] no Control component to update under {h}: run Strata's installer first")
         return 1
-    src = owned()
-    if not src:
-        print("[strata] nothing of this checkout's Python is changed against upstream: nothing to copy")
-        return 0
+    src = parts()
     copied = 0
     for label, folder in found:
         print(f"{label}: {folder}")
