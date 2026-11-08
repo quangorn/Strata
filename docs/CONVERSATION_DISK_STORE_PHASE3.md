@@ -192,9 +192,14 @@ prefix **13 706 MiB = 29.2% of the K/V, 17.9% of the store** — the fourth snap
 down from 36.3% and 22.2% on 2026-11-04, as the day's 54 appends merged growing conversations. The
 restore time came from live traffic the same day: 43 disk hits, mean 982 MB/s, median 3.2 s, p95
 5.2 s, max 6.9 s (154 871 tokens, 4598 MiB, 701 MB/s) — the same time band as the 2x CMP baseline
-on this PC's SSD, before any pack sharing exists. "Did the duplication disappear" is not answered
-yet: the state part (29 500 MiB, 38.6% of the store) is the biggest single part of the folder in
-every snapshot since phase 2's live day.
+on this PC's SSD, before any pack sharing exists.
+
+The scan of 2026-11-08, after three more debounced days of live traffic, answers the duplication
+question: 64 entries, 76 624 MiB, the duplicated prefix **58 513 MiB = 76.4% of the store** (117.7%
+of the K/V — a block is counted once for every pair that shares it), against 26 797 MiB of states
+(35.0%). The debounced shape shows in the count: 49 entries of 64 hold one state, and the biggest
+pair shares 201 113 tokens. The duplication did not go away; the delta appends grew it, and the
+duplicated prefix is now the dominant part of the folder.
 
 ## Risks and open questions
 
@@ -214,11 +219,14 @@ every snapshot since phase 2's live day.
   74 939 MiB, the duplicated prefix 18 892 MiB (43.1% of the K/V, 25.2% of the store) against
   31 076 MiB of states (41.5%), the biggest pairs sharing 116 022-197 120 tokens of one dialogue;
   **at 07:29 on 2026-11-04** — 35 entries, 76 155 MiB, the duplicated prefix **16 914 MiB (36.3% of the
-  K/V, 22.2% of the store)** against 29 612 MiB of states (38.9%). The share moves with what the budget
-  keeps, the states are the store's largest part in every snapshot, and the long-prefix copies are what
-  phase 1 cannot stop (the chain rule sends a continuation to a new entry). Phase 3 is judged beside
-  phase 2's state window, not against the baseline's 68.3%, and the honest answer may be to stop at
-  phase 2.
+  K/V, 22.2% of the store)** against 29 612 MiB of states (38.9%); **on 2026-11-08** — 64 entries,
+  76 624 MiB, the duplicated prefix **58 513 MiB (117.7% of the K/V, 76.4% of the store)** against
+  26 797 MiB of states (35.0%) — a K/V block is counted once for every pair that shares it, so the
+  K/V share passes 100%. The share moves with what the budget keeps, and the long-prefix copies are what
+  phase 1 cannot stop (the chain rule sends a continuation to a new entry). After three debounced days
+  of live traffic the duplicated prefix is the dominant cost of the disk, which is the measurement this
+  phase's justification asks for. Phase 3 is judged beside phase 2's state window, not against the
+  baseline's 68.3%.
 - **Static analysis, unconfirmed.** The duplication numbers are measured by that file's `.idx`
   reader; everything else here is read, not run.
 - **Conversations that compaction makes known-stale, to be researched separately.** When the client

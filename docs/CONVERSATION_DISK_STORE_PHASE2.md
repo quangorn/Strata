@@ -196,19 +196,24 @@ the writer starts working while a request is being served.
 
 ## Validation on hardware
 
-Not run. Same PC and profile as the measurements, one day of agent sessions, against a same-day run without
-the change:
+Run on this PC's serving profiles on live agent traffic, 2026-11-05 to 2026-11-08 — the section
+"Live days on the serving profiles" in
+[CONVERSATION_DISK_STORE_PHASE2_STEPS.md](CONVERSATION_DISK_STORE_PHASE2_STEPS.md):
 
-- bytes written per day, split by K/V and states (the phase 1 log line makes this possible for the
-  first time), and the number of flushes per conversation;
-- the duration of the QUIT save against the 17.0 s on the 2x CMP box and whatever this PC measures
-  without the change the same day;
-- waits for the writer (today: 2, 12.1 s and 17.3 s) — the claim of this phase is that they go down,
-  because a queued image no longer holds RAM at the moment RAM is short;
-- the park's own duration (median 234 ms, #2264, quoted by the measurements; not re-measured here): the
-  shared pointer must not make it worse;
-- the `not read` count (`generate.cpp:14379`) and the tokens read again after the restored
-  checkpoint, which is the number that decides "one state per flush" against "the whole chain".
+- bytes written per day, split by K/V and states: the debounced writes append their delta (54 of 97
+  writes appended on 2026-11-05, 44 of 56 and 115 of 217 on the later debounced runs), and the median
+  K/V past the deepest stored state is 2763-10 819 tokens against 127 397 in the flush-0 arm;
+- the duration of the QUIT save: 3.1 s on the debounced day, a clean QUIT with 50 conversations
+  (75 707 MiB) on the debounced restart of 2026-11-06, against flush-0 stops of 15.3-29.8 s and a
+  full-store flush-0 day that did not fit the server's 300 s window;
+- waits for the writer (the claim of this phase): they go down — 1 (2050 ms), 1 (5208 ms),
+  7 (14 340 ms), 4 (6252 ms) across debounced runs, against 5 (16 092 ms) in the flush-0 arm;
+- the park's own duration (median 234 ms, #2264): park medians 125.5-226.8 ms with the debounce,
+  the worst debounced park 4698.5 ms against the flush-0 arm's 8515.0 ms;
+- the `not read` count: 0 in every debounced run (8, 2373 tokens, in the flush-0 arm), so the
+  "one state per flush" shape holds on this traffic so far;
+- RAM hits are 0 on every live run, so the queued-image handback and the running-write wait stay
+  proven offline only.
 
 ## Risks and open questions
 

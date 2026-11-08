@@ -126,12 +126,16 @@ image the disk already holds. Each piece now has a home:
   dialogue; **at 02:23 on 2026-11-06**, after a full day with `--conversation-disk-flush-seconds 60` on the
   serving profile (97 writes, 54 appended) — 38 entries, 76 539 MiB, K/V 46 917 MiB, states 29 500 MiB,
   **13 706 MiB duplicated = 29.2% of the K/V, 17.9% of the store**, the biggest pair sharing 127 726 tokens
-  (1792.5 MiB), the shared system prompt band 6731-7798 tokens, 0 entries fully inside another. The number
-  moves with what the budget keeps (103 removals in the live run), and the case the baseline measured (the
-  same conversation written whole again as it grew) is what the live traffic still produces: a continuation
-  whose image keys changed goes to a new entry with its whole prefix, and `0 superseded` in every one of the
-  403 writes, and in the 141 writes of 2026-11-05/06, means the disk-side supersede rule has nothing to
-  remove. The share moves down as appends merge growing conversations. The rest is phase 3's block sharing.
+  (1792.5 MiB), the shared system prompt band 6731-7798 tokens, 0 entries fully inside another — and after
+  three more debounced days, on 2026-11-08: 64 entries, 76 624 MiB, **58 513 MiB duplicated = 76.4% of the
+  store** (117.7% of the K/V, a block counted once for every pair that shares it), 1 entry fully inside
+  another, the biggest pair sharing 201 113 tokens. The number moves with what the budget keeps (103 removals
+  in the live run), and the case the baseline measured (the same conversation written whole again as it grew)
+  is what the live traffic still produces: a continuation whose image keys changed goes to a new entry with
+  its whole prefix, and `0 superseded` in every one of the 403 writes, and in the 429 writes of 2026-11-05
+  to 2026-11-08, means the disk-side supersede rule has nothing to remove. The delta appends merge growing
+  conversations, and on this PC's traffic the duplicated prefix grew to the dominant part of the folder. The
+  rest is phase 3's block sharing.
   The prefix check ran on ad-hoc scripts until 2026-11-06; the reader is now a tool in the repo,
   `tools/conversation_store_scan.py`, so phase 3's "same day re-run with the same tool" has one.
 - The pin still has no *semantic* disk side: phase 1 stores the flag, but nothing on the disk branches
@@ -141,7 +145,7 @@ image the disk already holds. Each piece now has a home:
   QUIT save, `DETAILS.md:852-854`) is the argument for phase 2, not against `exit-only`.
 - Phase 1 is measured in part on this PC (the numbers above, and "Live traffic on the serving profile" in
   [CONVERSATION_DISK_STORE_PHASE1_STEPS.md](CONVERSATION_DISK_STORE_PHASE1_STEPS.md)). Phase 2 is measured
-  in part on this PC's live traffic ("Live day on the serving profiles" in
-  [CONVERSATION_DISK_STORE_PHASE2_STEPS.md](CONVERSATION_DISK_STORE_PHASE2_STEPS.md), 2026-11-05/06).
-  Phase 3 is not measured. Each phase document has its own validation plan, and the numbers above are its
-  baseline.
+  in part on this PC's live traffic ("Live days on the serving profiles" in
+  [CONVERSATION_DISK_STORE_PHASE2_STEPS.md](CONVERSATION_DISK_STORE_PHASE2_STEPS.md), 2026-11-05 to
+  2026-11-08). Phase 3 is not measured. Each phase document has its own validation plan, and the numbers
+  above are its baseline.

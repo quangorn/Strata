@@ -746,60 +746,53 @@ it); on this PC such a loop grew one conversation to 259 886 tokens and the serv
 with "request exceeds the context window: prompt (262165 tokens) leaves no room to answer in the context
 (262144)". The engine was fine; the loop was wrong, and the fix tracks the whole prompt.
 
-## Live day on the serving profiles (2026-11-05/06)
+## Live days on the serving profiles (2026-11-05 to 2026-11-08)
 
-Both serving profiles ran the phase 2 build (engine `0.1.55.14-windows-x86_64-cuda-cuda13`) for a full day
-of real agent requests on this PC (RTX 4080 16 GB, 48 GB RAM, Windows 10), on the serving store folder
-`E:\strata-conv-data` with the 76 800 MiB budget: `iq2_xs-low_ram` with `--conversation-disk-flush-seconds 60`
-and `--conversation-cache-mib 4096` from 05:03 to the QUIT at 15:00, and `iq2_xs-max_ram` with the flag at its
-default `0` and `--conversation-cache-mib 8192` from 12:01. The second is **running now** (port 8080, its log
-written to 02:31 on 2026-11-06), so its numbers are the run as it stands at the scan, and its QUIT line comes
-when the server stops. The launch file `strata-swift-iq2_xs.max_ram.json` gained the flag `60` at 14:59 on
-2026-11-05, during the run; the server keeps the flags it loaded, so the next start of this profile is a
-debounced one. The arms are not a controlled A/B — different hours, different RAM caches, the same store
-folder — and every number names its run.
+All runs below are the phase 2 build (engine `0.1.55.14-windows-x86_64-cuda-cuda13`) on real agent
+traffic on this PC (RTX 4080 16 GB, 48 GB RAM, Windows 10), on the serving store folder
+`E:\strata-conv-data` with the 76 800 MiB budget. The arms are not a controlled A/B — different days,
+hours, RAM caches, traffic — and every number names its run. The last run is live when this section is
+written: its log runs to 09:03 on 2026-11-08, so its numbers are the run as it stands, and its QUIT
+line comes when the server stops.
 
-| arm | flush | cache | requests | writes (appended) | shapes | K/V | states | index | past median | park median | park p95 | park max | QUIT | disk hits | `not read` | waits for RAM |
-|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
-| low_ram | 60 | 4096 MiB | 793 | 97 (54) | 51 forced, 46 debounced (40 wrote a state) | 40 701 MiB | 23 759 MiB | 392 MiB | 10 819 | 148.9 ms | 773.5 ms | 1242.9 ms | 3.1 s | 43 | 0 | 1, 2050 ms |
-| max_ram | 0 | 8192 MiB | 3166 | 44 (4) | 44 forced | 47 132 MiB | 31 415 MiB | 133 MiB | 127 397 | 146.1 ms | 960.6 ms | 8515.0 ms | stop timed out (300 s) | 29 | 8 | 5, 16 092 ms |
+| run | flush | cache | requests | writes (appended) | shapes | past median | park median | park p95 | park max | QUIT | disk hits | `not read` | waits for RAM |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| low_ram, 05.11 05:03-15:00 | 60 | 4096 MiB | 793 | 97 (54) | 51 forced, 46 debounced (40 wrote a state) | 10 819 | 148.9 ms | 773.5 ms | 1242.9 ms | 3.1 s | 43 | 0 | 1, 2050 ms |
+| max_ram, 05.11 12:01 - 06.11 | 0 | 8192 MiB | 3166 | 44 (4) | 44 forced | 127 397 | 146.1 ms | 960.6 ms | 8515.0 ms | stop timed out (300 s) | 29 | 8 | 5, 16 092 ms |
+| max_ram, 06.11 14:37-18:04 | 60 | 8192 MiB | 116 | 15 (8) | 10 debounced, 5 forced | 2763 | 226.8 ms | 879.4 ms | 879.4 ms | clean: 50 conversations, 75 707 MiB | 6 | 0 | 1, 5208 ms |
+| low_ram, 07.11 11:50-20:15 | 60 | 5120 MiB | 336 | 56 (44) | 36 forced, 20 debounced | 4181 | 125.5 ms | 808.0 ms | 4698.5 ms | engine crashed, no QUIT | 52 | 0 | 7, 14 340 ms |
+| low_ram, 07.11 20:15 → live | 60 | 5120 MiB | 2989 | 217 (115) | 150 debounced, 67 forced | 10 344 | 167.8 ms | 768.5 ms | 4470.5 ms | running | 50 | 0 | 4, 6252 ms |
 
-- **the park gate passes on live traffic**: median 148.9 ms with the debounce against 146.1 ms without it
-  (159 and 594 parks), p95 lower with it (773.5 against 960.6 ms), and the worst park is the flush-0 arm's
-  (8515.0 against 1242.9 ms). The phase 1 quoted median, 234 ms, is under both arms.
-- **the debounced flush writes its delta**: median tokens past the deepest stored state 10 819 against
-  127 397, and 54 of the 97 writes appended to entries the disk already held (4 of 44 in the flush-0 arm).
-- **the QUIT day ends with almost nothing to write**: `saved for the next start in 3.1 s` with 51 entries and
-  75 497 MiB on disk, one 2050 ms wait for 2 queued writes; the flush-0 runs in this log QUIT at the same
-  store size in 15.3, 16.8, 26.4 and 29.8 s (2026-11-03). The flush-0 arm is running, so its QUIT number
-  comes when that server stops.
-- **the stop of the flush-0 arm says the same in the other direction**: stopping it on 2026-11-06 gave
-  `server_stop_deadline_expired` — its QUIT did not fit the server's 300 s window (the run held ~44 entries
-  of a 76 GiB store, and the log has no `saved for the next start` line for it). A debounced day reaches
-  QUIT in 3.1 s; a full-store flush-0 burst does not reach it at all inside the stop window. This PC's
-  clock moved during the day (log timestamps of 23:35-23:39 sit among file stamps of 02:3x), so the
-  section's times are read from the lines the engine printed, and the restart the owner's other session
-  made came with no flush flag: the live instance is flush 0, `--conversation-cache-mib 8192`, and the
-  launch file's `60` still applies at its next start.
-- **the corrected `not read` estimate holds on live traffic**: 0 refusals in the debounced day against 8
-  (2373 tokens) in the flush-0 run; the reads took the blocks below the state they landed on.
-- **restore time, the number phase 3 says to watch**: 43 disk hits, 127 422 MiB, mean 982 MB/s; median
-  3.2 s, p95 5.2 s, max 6.9 s (154 871 tokens, 4598 MiB, 701 MB/s); the 43 `reused from the disk` lines say
-  median 3.4 s, max 7.1 s. A ~150K-token conversation restores in the same time band as the 5.6 s at
+- **the park gate passes on every run**: park medians 125.5-226.8 ms, under the phase 1 quoted 234 ms,
+  and the worst debounced park is 4698.5 ms, under the flush-0 arm's 8515.0 ms.
+- **the debounced flush writes its delta**: the median tokens past the deepest stored state is 2763,
+  4181 and 10 344 on the later debounced runs against 127 397 without the debounce, and appends land
+  on entries the disk already held (54 of 97, then 44 of 56 and 115 of 217 writes).
+- **QUIT fits the stop window when the writes ran at quiet**: `saved for the next start in 3.1 s` on
+  the debounced day; the debounced restart of 2026-11-06 ended clean with 50 conversations
+  (75 707 MiB) on disk; flush-0 runs QUIT at 15.3, 16.8, 26.4 and 29.8 s (2026-11-03), and a
+  full-store flush-0 day did not finish inside the server's 300 s window
+  (`server_stop_deadline_expired`, 2026-11-06).
+- **waits for RAM go down with the debounce**: 1 (2050 ms), 1 (5208 ms), 7 (14 340 ms), 4 (6252 ms)
+  across debounced runs of 116 to 2989 requests, against 5 (16 092 ms) in the flush-0 arm.
+- **restore time, the number phase 3 says to watch**: the debounced days gave median restore 1.48-1.99 s
+  over 50-52 disk hits per run (median tokens 25 043-94 889, p95 5.69-5.77 s, max 10.4 s); the
+  2026-11-05 day gave 43 disk hits, mean 982 MB/s, median 3.2 s, p95 5.2 s, max 6.9 s (154 871 tokens,
+  4598 MiB, 701 MB/s). A ~150K-token conversation restores in the same time band as the 5.6 s at
   643 MB/s on the 2x CMP box, on this PC's SSD.
+- **RAM hits are 0 on every live run**: no request read back a queued image inside its quiet window, so
+  the queued-image handback and the running-write wait stay proven offline only (the blocks
+  "take-writing" and "cancel").
 - **supersede fires in RAM, not on the disk**: the cache dropped 37 superseded copies (flush 60) and 135
-  (flush 0); disk-side supersede is 0 in all 141 writes, as phase 1 measured for its 403.
-- **RAM hits are 0 on both arms**: no live request read back a queued image inside its quiet window, so the
-  queued-image handback and the running-write wait stay proven offline only (the blocks "take-writing" and
-  "cancel").
-- **waits for RAM go down with the debounce**: 1 (2050 ms) against 5 (16 092 ms).
-- The store after the day, read at 02:23 on 2026-11-06 with `tools/conversation_store_scan.py` — the `.idx`
-  reader of the plan, committed here so phase 3's re-run uses the same tool: 38 entries, 76 539 MiB, K/V
-  46 917 MiB, states 29 500 MiB, 5 451 442 tokens; the duplicated prefix **13 706 MiB = 29.2% of the K/V,
-  17.9% of the store**, down from the 2026-11-04 morning snapshot (36.3% and 22.2%); the biggest pair shares
-  127 726 tokens (1792.5 MiB); the shared system prompt band 6731-7798 tokens; 0 entries fully inside
-  another, 0 pinned state blocks; 6-9 states per conversation, 7 in 32 of 38 — the chain rule's count, the
-  phase 3 window is untested.
+  (flush 0); disk-side supersede is 0 in every write of every run, as phase 1 measured for its 403.
+- **the crash run is the measured case of "crash value is zero"**: the run of 07.11 11:50-20:15 ended
+  with the engine crashing (exit code 3221225477); the store carried 32 conversations (73 406 MiB) to
+  the next start, its queued writes were lost, and the price was prompt reads.
+- The store after the days, read with `tools/conversation_store_scan.py` on 2026-11-08: 64 entries,
+  76 624 MiB; K/V 49 733 MiB, states 26 797 MiB, 5 767 774 tokens; the duplicated prefix
+  **58 513 MiB = 76.4% of the store** — 117.7% of the K/V, because a block is counted once for every
+  pair that shares it; 49 entries of 64 hold one state, the debounced shape; 1 entry sits fully inside
+  another (0 on 2026-11-06); the biggest pair shares 201 113 tokens (1843.4 MiB); 0 pinned state blocks.
 
 ## Risks and open questions
 
@@ -818,5 +811,5 @@ folder — and every number names its run.
   (off) is a defensible default and why the debounce can be long.
 - **Static analysis, unconfirmed.** Everything here about the current code is read, not run, except
   the numbers quoted from the measurements and [DETAILS.md](DETAILS.md). Phase 2 is measured in part on
-  this PC's live traffic (the section "Live day on the serving profiles", 2026-11-05/06): the park
-  durations, the write shapes, the QUIT, the reads, the store scan.
+  this PC's live traffic (the section "Live days on the serving profiles", 2026-11-05 to 2026-11-08):
+  the park durations, the write shapes, the QUIT, the reads, the store scan.
