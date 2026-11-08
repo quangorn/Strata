@@ -2,10 +2,12 @@
 
 This is the **quangorn/Strata** fork of `Niko1221/Strata` (remote `upstream`). This PC runs its own engine, its own
 launch code, and one update routine: nothing here downloads an engine, every package is built on this PC.
-Version 0.2.9, engine 0.1.55. Read **[docs/AI_REFERENCE.md](docs/AI_REFERENCE.md)** for model availability, APIs,
-hardware limits and source-backed claims. Read **[docs/LOCAL_FORK_CHECKS.md](docs/LOCAL_FORK_CHECKS.md)** before
-changing `serve/server.py`, `strata_cli/launch/runner.py` or `strata_control/updater.py`: those checks need real
-restarts and are not in the offline suite.
+Version 0.2.12, engine 0.1.58 (the merged upstream line, taken 2026-11-08). The public model families are
+DeepSeekV4.1-Flash-1017, Qwen3.8-Flash-Next and Qwen3.6-35B-A3B; this PC serves Qwen3.8-Flash-Next (`IQ2_XS low_ram`).
+Read **[docs/AI_REFERENCE.md](docs/AI_REFERENCE.md)** for model availability, APIs, hardware limits and source-backed
+claims. Read **[docs/LOCAL_FORK_CHECKS.md](docs/LOCAL_FORK_CHECKS.md)** before changing `serve/server.py`,
+`strata_cli/launch/runner.py` or `strata_control/updater.py`: those checks need real restarts and are not in the
+offline suite.
 
 ## This PC
 
@@ -25,21 +27,27 @@ The canonical path is `python3 packaging/build_engine_win_local.py` from cygwin 
 build folders. The package step writes a folder named by version, and `package_engine.py` refuses an existing one
 ("packages are immutable") — and a folder with `strata.exe`/`strata-vision.exe` running inside cannot be removed on
 Windows. So packaging needs a fresh version, never a stop, and compilation needs neither: no `strata launch --stop`
-before the build. The fork's version rule: the engine's compiled-in version string (`STRATA_VERSION`, from
-`CMakeLists.txt` + `VERSION_SUFFIX`) must not change, because it is part of the conversation identity: the disk
+before the build. The fork's version rule: a package build never changes the engine's compiled-in version string
+(`STRATA_VERSION`, from `CMakeLists.txt` + `VERSION_SUFFIX`), because it is part of the conversation identity: the disk
 tier matches every saved index by model + settings fingerprint, which includes `engine_version`
 (`generate.cpp:10507`), and a start deletes every index whose identity differs (`conversation_disk.cpp:210-211`,
 `247-248`). Measured 2026-11-02: bumping `project(VERSION …)` to `0.1.55.1` emptied the disk store of all saved
 conversations at the next start. Put the build number in `VERSION` only — `VERSION=0.1.55.1 python3 …` names the
 package folder and the manifest, `resolve()` picks `0.1.55.1-local` over `0.1.55-local` by the manifest version,
-and the engine keeps naming itself `0.1.55-local` so the disk store survives. The next model
+and the engine keeps naming itself `0.1.55-local` so the disk store survives. The exception is a merge of upstream's
+release line: taking upstream's `project(VERSION …)` bump is the only case where the engine string changes, and it
+empties the store on purpose. Pinning the old string over changed kernels would let indexes written by the old engine
+be read back by the new one, which is a data risk, not a versioning rule. The merge of `upstream/main`
+(v0.2.12, engine 0.1.58) on 2026-11-08 takes the bump, so the store is expected to drop every index at the first
+start on `0.1.58-local` and re-warm; this is static analysis until check 2 of `docs/LOCAL_FORK_CHECKS.md` is run on
+the merged tree, and its measured numbers go in that file. The next model
 start takes the new engine; restart the preset when the work
 is done, not during the build. Environment knobs, all optional: `ARCHS` (default 89 = this card; the release
 cuda13 list is `75;86;89;120`), `BUILD_JOBS` (default 24; a 24-job build of this tree needed at most 4 GB RAM),
 `VCVARS_VER` (CUDA 13.4 accepts MSVC `_MSC_VER` below 1960, so this PC's toolset 14.44.35207 compiles without it —
 set the knob only for a toolkit that rejects it), `VERSION_SUFFIX` (default `-local`: a forked build names itself
-`strata 0.1.55-local`), `VERSION` (the build number: package folder and manifest only, never bump the engine
-string). Build folders are kept
+`strata 0.1.58-local`), `VERSION` (the build number: package folder and manifest only, never bump the engine
+string on a package build). Build folders are kept
 between runs; delete one when its generator or cached flags change. `STRATA_PORTABLE=ON` is the release-shape
 build (AVX2 floor, static MSVC runtime), repacked over the local package with `packaging/repack_local_portable.sh`.
 Do not add `--use_fast_math` to `EXTRA_FLAGS` for a whole build: it changes rounding outside the kernel files.
