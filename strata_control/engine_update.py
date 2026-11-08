@@ -127,7 +127,10 @@ def start_daily_check(on_done: Callable[[], None] | None = None, root=None, *, f
                 base = Path(root) if root else ec.components_dir()
                 ctx = updater.Context(components=base, source=update_cmd._feed_source(argparse.Namespace(feed=feed), base), trusted=signing.load_trusted_keys(),
                                       hardware=updater.detect_hardware(), feed_timeout=CHECK_TIMEOUT_S, serving=lambda: [])
-                return updater.check(ctx)
+                # engine=False (the fork's rule, LOCAL_FORK_CHECKS 4 and 5): this PC builds its engine in the checkout, so no engine
+                # package is read from the feed. The cached offer stays empty, so the daily notice never names an engine to fetch.
+                # Control and the DeepSeek package are checked as upstream does.
+                return updater.check(ctx, engine=False)
             if refresh_cache(check, root) and on_done is not None:
                 on_done()
         except BaseException:                            # noqa: BLE001 - never a message, never a trace

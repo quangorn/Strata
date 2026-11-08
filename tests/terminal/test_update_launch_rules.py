@@ -1,8 +1,9 @@
 """A launch, a setup and a model download never update an engine by themselves (owner, 11-01; the same shape as #4823: "downloading a model changed my
-engine without asking").  An engine update is the person's choice, and never beside a loaded model.
+engine without asking"). On this PC the rule is stronger: `strata launch` never fetches an engine at all — the engine is the package built in this
+checkout (`packaging/build_engine_win_local.py`), so a stale engine is a warning with the build step, and no engine is a warning with the same step.
 
-* Qwen: `strata launch` with an engine older than the model needs warns and goes on; it updates only on a yes (--yes, or the answer on the screens),
-  and never with a model loaded.  No engine installed at all is still fetched (nothing runs on it yet).
+* Qwen: `strata launch` with an engine older than the model needs warns and goes on; nothing is fetched, whatever was answered, and never beside a
+  loaded model. No engine installed at all is also a warning, not a fetch, and not a refusal.
 * DeepSeek: `strata launch` and setup (which the app runs for a model download) never reach the feed, install, replace or remove an engine package.
 * The app's model download for Qwen never fetches an engine (control_engine_step), as before.
 """
@@ -17,16 +18,35 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from strata_cli.launch import settings as S  # noqa: E402
-from strata_cli.launch.runner import Runner  # noqa: E402
+from strata_cli.launch.runner import ENGINE_BUILD_STEP, Runner  # noqa: E402
 from strata_control import dsv41_engine, engine_component as ec, engine_update, updater  # noqa: E402
 from tests.terminal.test_dsv41_engine import Dsv41Engine  # noqa: E402
-from tests.terminal.test_launch_engine_first import FakeProc, qwen_catalog, update_events  # noqa: E402
+from tests.terminal.test_launch_engine_first import qwen_catalog  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[2]
 OLD = {"usable": True, "engine": {"version": "0.1.45", "backend": "cuda"}, "notice": None}
 NEW = {"usable": True, "engine": {"version": "0.1.50", "backend": "cuda"}, "notice": None}
 NONE = {"usable": False, "engine": None, "notice": "No engine for this PC was found"}
 RUNNING = [{"profile": "launch-demo", "state": "ready"}]
+
+
+class FakeProc:
+    """A `strata update` run that answers as the feed would, so a spawn count of 0 is read as 'nothing was fetched'."""
+
+    def __init__(self, events: list[dict], code: int = 0):
+        self.stdout = iter(json.dumps(e) + "\n" for e in events)
+        self._code = code
+
+    def wait(self) -> int:
+        return self._code
+
+
+def update_events(status: str, note: str = "", code: int = 0) -> list[dict]:
+    res = {"component": "engine", "status": status, "changed": status == "updated", "installed_before": None}
+    if note:
+        res["note"] = note
+    return [{"event": "phase", "phase": "feed", "message": "Reading the signed update feed"},
+            {"event": "result", "results": [res], "exit_code": code}]
 
 
 class QwenStaleEngine(unittest.TestCase):
@@ -42,49 +62,40 @@ class QwenStaleEngine(unittest.TestCase):
             r.ensure_engine()
         return spawns, r, seen
 
-    def test_a_loaded_model_blocks_the_update_even_with_yes(self):
+    def test_a_stale_engine_is_a_warning_with_the_build_step_and_nothing_is_fetched(self):
         for kwargs in ({"assume_yes": True}, {"confirm": lambda *a: True}, {}):
-            spawns, r, seen = self.ensure([OLD], serving=RUNNING, **kwargs)
+            spawns, r, _ = self.ensure([OLD], serving=RUNNING, **kwargs)
             self.assertEqual(spawns, [], kwargs)
-            self.assertTrue(any("running, so Strata did not update the engine" in n for n in r.notices), r.notices)
-            self.assertTrue(any("strata launch --stop" in n for n in r.notices))
+            self.assertTrue(any(ENGINE_BUILD_STEP in n for n in r.notices), r.notices)
 
-    def test_no_yes_no_update(self):
-        spawns, r, _ = self.ensure([OLD])
-        self.assertEqual(spawns, [])
-        self.assertIn("Strata did not update it. Run `strata update` (or start with --yes)", r.notices[0])
-
-    def test_no_to_the_question_no_update(self):
-        asked = []
-        spawns, r, _ = self.ensure([OLD], confirm=lambda t, b: asked.append((t, b)) or False)
-        self.assertEqual(spawns, [])
-        self.assertEqual(len(asked), 1)
-        self.assertIn("older than this model needs", asked[0][1])
-
-    def test_yes_to_the_question_updates(self):
-        spawns, r, _ = self.ensure([OLD, NEW], confirm=lambda t, b: True)
-        self.assertEqual(len(spawns), 1)
-        self.assertEqual(r.notices, [])
-
-    def test_yes_flag_updates_when_nothing_is_loaded(self):
+    def test_yes_does_not_fetch_an_engine_here(self):
         spawns, r, _ = self.ensure([OLD, NEW], assume_yes=True)
-        self.assertEqual(len(spawns), 1)
+        self.assertEqual(spawns, [])
+        self.assertTrue(any(ENGINE_BUILD_STEP in n for n in r.notices), r.notices)
 
-    def test_no_engine_at_all_is_still_fetched_because_nothing_runs_on_it(self):
-        spawns, r, _ = self.ensure([NONE, NEW])
-        self.assertEqual(len(spawns), 1)
+    def test_the_engine_step_asks_no_question(self):
+        asked = []
+        spawns, _r, _ = self.ensure([OLD], confirm=lambda t, b: asked.append((t, b)) or False)
+        self.assertEqual((spawns, asked), ([], []))
+
+    def test_no_engine_at_all_is_a_warning_and_nothing_is_fetched(self):
+        spawns, r, seen = self.ensure([NONE], gb=66.0, assume_yes=True)
+        self.assertEqual(spawns, [])
+        self.assertTrue(r.engine_problem, "the missing engine is kept for the final message")
+        self.assertTrue(any("engine" in str(e.text) for e in seen), seen)
 
     def test_an_engine_that_is_new_enough_asks_nothing(self):
         asked = []
         spawns, r, _ = self.ensure([NEW], confirm=lambda t, b: asked.append(t))
         self.assertEqual((spawns, asked), ([], []))
 
-    def test_plan_says_it_will_ask(self):
+    def test_plan_says_the_engine_is_used_as_it_is(self):
         r = Runner(S.LaunchSettings(family="qwen", model="Q2_0", context=32768), catalog=qwen_catalog(), emit=lambda e: None)
         with mock.patch.object(ec, "status", return_value=OLD), mock.patch.object(Runner, "needed_engine", return_value=(0, 1, 50)), \
                 mock.patch("strata_cli.launch.runner.install_isolation_words", return_value=[]):
             words = r.preflight_words()
-        self.assertTrue(any("will ask before updating it" in w for w in words), words)
+        self.assertTrue(any(ENGINE_BUILD_STEP in w for w in words), words)
+
 
 
 class DeepSeekLaunch(Dsv41Engine):

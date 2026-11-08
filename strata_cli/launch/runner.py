@@ -770,6 +770,9 @@ class Runner:
         self.no_engine(self._no_engine_words(report))
 
     def stale_update_blocked(self, stale: str) -> str | None:
+        # upstream's rule (owner, 11-01). On this PC `strata launch` never spawns `strata update` for an engine, so
+        # `ensure_engine()` warns with the build step and does not call this; nothing else calls it. It stays with the
+        # merged code so the next upstream merge keeps it, and the Qwen tests below test the fork's rule.
         """The engine here is older than this model needs. Updating it is the person's choice (owner, 11-01: an engine update never starts by itself):
         None when they said yes (--yes, or the answer to the question on the screens), else the one plain sentence that says why nothing was
         updated and the next step. A model that is loaded blocks it whatever was answered. Warn, never refuse: the launch goes on."""
