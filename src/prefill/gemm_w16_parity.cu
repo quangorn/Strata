@@ -31,6 +31,14 @@ __global__ void fill_f16(__half* p, int64_t n, unsigned seed, float scale) {
     x ^= x >> 16; x *= 2246822519u; x ^= x >> 13; x *= 3266489917u; x ^= x >> 16;
     p[i] = __float2half(((float) (x & 0xffff) / 32768.0f - 1.0f) * scale);
 }
+// the engine reads STRATA_PF_W16_CACHE_MIB through the process environment; MSVC has no setenv
+void put(const char* k, const char* v) {
+#if defined(_WIN32)
+    _putenv_s(k, v);
+#else
+    setenv(k, v, 1);
+#endif
+}
 bool ok(cudaError_t e, const char* what) {
     if (e != cudaSuccess) std::printf("FAIL: %s: %s\n", what, cudaGetErrorString(e));
     return e == cudaSuccess;
@@ -98,7 +106,7 @@ int main() {
         for (const int64_t T : Ts) {
             std::vector<uint8_t> out[2];
             for (int on = 0; on < 2; ++on) {
-                setenv("STRATA_PF_W16_CACHE_MIB", on ? "auto" : "0", 1);
+                put("STRATA_PF_W16_CACHE_MIB", on ? "auto" : "0");
                 strata::prefill::Gemm gemm;          // a fresh one reads the variable at its first native()
                 std::string err;
                 if (!gemm.init(st, scratch_elems, err)) { std::printf("FAIL: %s\n", err.c_str()); return 1; }
