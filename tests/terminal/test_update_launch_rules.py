@@ -50,13 +50,14 @@ def update_events(status: str, note: str = "", code: int = 0) -> list[dict]:
 
 
 class QwenStaleEngine(unittest.TestCase):
-    def ensure(self, statuses, *, serving=(), confirm=None, assume_yes=False):
+    def ensure(self, statuses, *, serving=(), confirm=None, assume_yes=False, gb=0.0):
         spawns, seen = [], []
         r = Runner(S.LaunchSettings(family="qwen", model="Q2_0", context=32768), catalog=qwen_catalog(), emit=seen.append,
                    confirm=confirm, assume_yes=assume_yes)
         r.check_cancel = lambda: None
         with mock.patch.object(ec, "status", side_effect=list(statuses)), \
                 mock.patch.object(Runner, "needed_engine", return_value=(0, 1, 50)), \
+                mock.patch.object(Runner, "download_gb", return_value=gb), \
                 mock.patch.object(updater, "serving_now", return_value=list(serving)), \
                 mock.patch.object(Runner, "_spawn", side_effect=lambda argv, **kw: spawns.append(argv) or FakeProc(update_events("updated"), 0)):
             r.ensure_engine()

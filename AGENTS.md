@@ -2,7 +2,7 @@
 
 This is the **quangorn/Strata** fork of `Niko1221/Strata` (remote `upstream`). This PC runs its own engine, its own
 launch code, and one update routine: nothing here downloads an engine, every package is built on this PC.
-Version 0.2.12, engine 0.1.58 (the merged upstream line, taken 2026-11-08). The public model families are
+Version 0.2.12, engine 0.1.58. This is the merged upstream line, taken 2026-11-08. The public model families are
 DeepSeekV4.1-Flash-1017, Qwen3.8-Flash-Next and Qwen3.6-35B-A3B; this PC serves Qwen3.8-Flash-Next (`IQ2_XS low_ram`).
 Read **[docs/AI_REFERENCE.md](docs/AI_REFERENCE.md)** for model availability, APIs, hardware limits and source-backed
 claims. Read **[docs/LOCAL_FORK_CHECKS.md](docs/LOCAL_FORK_CHECKS.md)** before changing `serve/server.py`,

@@ -414,7 +414,10 @@ class TheCommand(ModelCase):
         self.parser = sp
 
     def run_cmd(self, *flags, asks=None):
-        argv = ["update", "--feed", self.server.url + "/strata-feed.json", "--components-dir", str(self.components), "--no-control",
+        # `--engine` is said here: on this PC `strata update` takes Control only by default (the engine is built in the
+        # checkout), so the default path never reaches the engine step these cases read about. The fork's own default is
+        # covered in test_updater.py's `test_the_engine_step_is_skipped_by_default`.
+        argv = ["update", "--engine", "--feed", self.server.url + "/strata-feed.json", "--components-dir", str(self.components), "--no-control",
                 "--model-config", str(self.config), *flags]
         a = self.parser.choices["update"].parse_args(argv[1:])
         a.command, a.components_command = "update", None
