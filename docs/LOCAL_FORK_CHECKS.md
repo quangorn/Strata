@@ -70,8 +70,10 @@ runs; a test that cannot fit is skipped, and the engine's card and RAM stay as t
 failures one is a fixture this PC does not have: `ple_parity` answers, in 0.01 s and on a single-test re-run,
 `required PLE table is missing or incompatible: ../../Q2_0/Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00002-of-00002.gguf
 (cannot open …)` — the checkout's `bench/micro` layout does not carry that Q2_0 shard. The second failure,
-`ple_reader_selftest` after 404 s, is recorded with its output in the next section. The run that reached 82 ran with
-the model serving, which is the load that stopped the engine; a full `ctest` needs the model stopped.
+`ple_reader_selftest` after 404 s, is load, not code: re-run alone it passes, **100% tests passed, 0 tests failed out of
+1 in 351.87 s** (measured 2026-11-08, `ctest -C Release -R ple_reader_selftest`). So the partial run's only real failure
+is `ple_parity`'s missing fixture. The run that reached 82 ran with the model serving, which is the load that stopped the
+engine; a full `ctest` needs the model stopped.
 
 ## The offline suite on this PC
 
