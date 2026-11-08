@@ -83,7 +83,8 @@ A running server keeps the code it loaded, so deploy first, then stop and start 
 - The Terminal and Control suite: `./.venv/Scripts/python.exe -m pytest tests/terminal -q` runs without a GPU,
   without downloads and with a serving model stopped. On this PC: 30 failed, 2777 passed, 78 skipped, 1 error and 407
   subtests passed (measured 2026-11-08 on the merged tree); the failures, with their causes, are listed in
-  `docs/LOCAL_FORK_CHECKS.md`.
+  `docs/LOCAL_FORK_CHECKS.md`, and `docs/LOCAL_FORK_REMAINING.md` lists the checks that have not been run on the
+  merged tree.
 - Setup's own tests run without a GPU or downloads: `python tools/test_setup_<name>.py` (for example
   `tools/test_setup_amd.py`, `tools/test_setup_choices.py`).
 - The app's UI tests: `npm test` in `apps/host`. Engine parity tests: `ctest -C Release` in the build folder — use the

@@ -3,7 +3,7 @@
 The pytest suite in `tests/terminal` runs without a GPU, without downloads and without a serving model: every engine, server
 and feed it touches is mocked. The checks below cannot be run that way: they need this PC's engine package, its picture reader
 and a model that is stopped and started for real. Run them in the order given (the routine in `packaging/README.md`,
-"Updating this PC").
+"Updating this PC"). `docs/LOCAL_FORK_REMAINING.md` lists what has not been run on the merged tree, row by row.
 
 `strata` on PATH is this checkout's launcher (`C:\Projects\Strata-fork\bin` is PATH's first entry), so every command below is
 typed as `strata`. The model that serves here is `IQ2_XS low_ram`. Every check below stops and starts it, so it costs minutes
