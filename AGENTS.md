@@ -81,11 +81,19 @@ A running server keeps the code it loaded, so deploy first, then stop and start 
 ## Tests
 
 - The Terminal and Control suite: `./.venv/Scripts/python.exe -m pytest tests/terminal -q` runs without a GPU,
-  without downloads and with a serving model stopped. On this PC: 2034 passed, 62 skipped, 11 known failures
-  (listed with their causes in `docs/LOCAL_FORK_CHECKS.md`).
+  without downloads and with a serving model stopped. On this PC: 30 failed, 2777 passed, 78 skipped, 1 error and 407
+  subtests passed (measured 2026-11-08 on the merged tree); the failures, with their causes, are listed in
+  `docs/LOCAL_FORK_CHECKS.md`.
 - Setup's own tests run without a GPU or downloads: `python tools/test_setup_<name>.py` (for example
   `tools/test_setup_amd.py`, `tools/test_setup_choices.py`).
-- The app's UI tests: `npm test` in `apps/host`. Engine parity tests: `ctest` in the build folder.
+- The app's UI tests: `npm test` in `apps/host`. Engine parity tests: `ctest -C Release` in the build folder — use the
+  native `ctest.exe` beside the VS Build Tools `cmake.exe`, not Cygwin's `/usr/bin/ctest`: measured 2026-11-08, Cygwin's
+  ctest treats the generated path `C:/Projects/Strata-fork/build-cuda/Release/<test>.exe` as relative and prepends its
+  own cwd, so every test comes back `BAD_COMMAND` (`/cygdrive/c/…/build-cuda/C:/Projects/…`). Run `ctest` with the serving
+  model stopped: the GPU parity tests build a real prompt path's arrays, and `gemm_w16_parity` alone takes 8.52 GiB of the
+  card and 8.48 GiB of RAM, 17 GiB together. Measured 2026-11-08, running `ctest` with IQ2_XS serving drove the PC into swap and the
+  engine stopped with "verify: timed out at layer 14; … the GPU did not finish within 5 s". The heavy tests ask for the
+  room they need before they allocate (`include/strata/core/test_memory.hpp`) and exit 77, which ctest reports as a skip.
 - How the engine works, every measured number, the API and all settings: [docs/DETAILS.md](docs/DETAILS.md) and
   the [paper](docs/paper/Strata-Paper.pdf). The Terminal: [docs/TERMINAL.md](docs/TERMINAL.md) and
   [docs/TERMINAL_LAUNCH.md](docs/TERMINAL_LAUNCH.md). Packaging and the update feed:
