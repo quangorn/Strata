@@ -63,13 +63,24 @@ and exits 77 (its card term passes: the low_ram preset leaves more than 8.52 GiB
 the model answering through it (`strata launch --status` is `ready at http://127.0.0.1:8080` after it). A test that fits
 runs; a test that cannot fit is skipped, and the engine's card and RAM stay as they were.
 
+## The engine ctest on this PC (partial, 2026-11-08)
+
+`ctest -C Release` in `build-cuda` (the native `ctest.exe`, 87 entries) reached 82 of 87 before it was stopped:
+**78 passed, 2 failed, 1 skipped** (`pinned_alias_test`, a Linux-path case), the last five entries not run. Of the two
+failures one is a fixture this PC does not have: `ple_parity` answers, in 0.01 s and on a single-test re-run,
+`required PLE table is missing or incompatible: ../../Q2_0/Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00002-of-00002.gguf
+(cannot open …)` — the checkout's `bench/micro` layout does not carry that Q2_0 shard. The second failure,
+`ple_reader_selftest` after 404 s, is recorded with its output in the next section. The run that reached 82 ran with
+the model serving, which is the load that stopped the engine; a full `ctest` needs the model stopped.
+
 ## The offline suite on this PC
 
 `./.venv/Scripts/python.exe -m pytest tests/terminal -q` (the `.venv` needs `pytest` and `textual==8.2.8`) answers
 **30 failed, 2777 passed, 78 skipped, 1 error, 407 subtests passed in 2121.59 s** (measured 2026-11-08 on the merged
-tree, `upstream/main` v0.2.12, with `iq2_xs-low_ram` serving). The PC was under load during this run (a `ctest` of the
-GPU parity tests ran beside it), and the causes of the `test_procs` and `test_runtime` rows are not separated from that
-load: they were not re-run alone after that run. Every case below is a condition of this PC, not the fork's code.
+tree, `upstream/main` v0.2.12, with `iq2_xs-low_ram` serving). 28 of the failures are conditions of this PC; two
+(`test_procs.py`, `test_runtime.py`) are load from the `ctest` run that ran beside this suite — they pass in a re-run of
+the four files alone (measured 2026-11-08: 4 failed, 153 passed, 3 skipped in 335 s). Every listed case is a condition of
+this PC, not the fork's code.
 
 | File | Cases | Why it fails here |
 |---|---|---|
@@ -81,7 +92,7 @@ load: they were not re-run alone after that run. Every case below is a condition
 | `test_pictures.py` | 1 (the picture file in the run config's data folder) | the tree the case compares is built with `/` path keys (`f"models/{NAME}"`), and on Windows `Path`'s parts give `\`: `models\mmproj-Tiny.gguf` against the expected `models/mmproj-Tiny.gguf` |
 | `test_update_notice.py` | 1 (a monitor beside a hanging feed) | the temp folder it makes cannot be removed: `.updates/update.lock` is unlinked by the cleanup with `PermissionError 13` |
 | `test_discovery.py`, `test_shared_models_folder.py` | 3 | they expect a machine with no Strata install visible, and this checkout answers as one: its root holds the launch files (`strata-swift-iq2_xs.json` and two more), so `Catalog.root` is the checkout |
-| `test_procs.py`, `test_runtime.py` | 1 + 1 (and 1 error) | seen 2026-11-08 under the load of the `ctest` run: a live engine of this executable and a reused PID are read from this PC's process list, which had the model and the test executables in it. Cause not separated: not re-run alone |
+| `test_procs.py`, `test_runtime.py` | 1 + 1 (and 1 error) | load, not the code: the suite ran with the `ctest` of the GPU parity tests beside it, and both cases read this PC's live process list (a live engine of this executable, a reused PID). Measured 2026-11-08 in a re-run of these four files alone: `test_procs.py` and `test_runtime.py` pass with no failure and no error |
 
 None of the eleven says anything about the engine step of the launch or of `strata update`. The groups that do test them pass:
 `test_launch_engine_first.py` (20 cases), `test_updater.py` (49), `test_round8_fixes.py` (25), `test_no_acquisition.py` (13),
