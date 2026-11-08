@@ -128,12 +128,22 @@ image the disk already holds. Each piece now has a home:
   **13 706 MiB duplicated = 29.2% of the K/V, 17.9% of the store**, the biggest pair sharing 127 726 tokens
   (1792.5 MiB), the shared system prompt band 6731-7798 tokens, 0 entries fully inside another — and after
   three more debounced days, on 2026-11-08: 64 entries, 76 624 MiB, **58 513 MiB duplicated = 76.4% of the
-  store** (117.7% of the K/V, a block counted once for every pair that shares it), 1 entry fully inside
-  another, the biggest pair sharing 201 113 tokens. The number moves with what the budget keeps (103 removals
+  store** (117.7% of the K/V — the tool prices each entry's bytes per token, K/V and states together,
+  for the longest prefix it shares with any other entry, each entry counted once:
+  `tools/conversation_store_scan.py:133-146`), 1 entry fully inside another, the biggest pair sharing
+  201 113 tokens. The honest number beside that price, read by payload hash on the same folder
+  (2026-11-08): **26 034 MiB of K/V are extra copies** (1524 extra copies of 1314 shared blocks) =
+  34.5% of the store; K/V inside shared prefixes 38 232 MiB = 50.7%; the first copy that has to exist
+  is 12 198 MiB; 0 duplicate bytes outside a shared prefix; 3 entries of 65 have ever been read back.
+  The share moves as the run goes: 75.8% two hours after this scan, 72.7% the same afternoon.
+  The number moves with what the budget keeps (103 removals
   in the live run), and the case the baseline measured (the same conversation written whole again as it grew)
   is what the live traffic still produces: a continuation whose image keys changed goes to a new entry with
   its whole prefix, and `0 superseded` in every one of the 403 writes, and in the 429 writes of 2026-11-05
-  to 2026-11-08, means the disk-side supersede rule has nothing to remove. The delta appends merge growing
+  to 2026-11-08, means the disk-side supersede rule has nothing to remove: the RAM cache's tenth rule (#342)
+  drops the copies it can match before they reach the disk, and the disk rule asks for an exact prefix, so
+  the divergent copies are invisible to it ("Why supersede is 0 on live traffic" in
+  [CONVERSATION_DISK_STORE_PHASE3.md](CONVERSATION_DISK_STORE_PHASE3.md)). The delta appends merge growing
   conversations, and on this PC's traffic the duplicated prefix grew to the dominant part of the folder. The
   rest is phase 3's block sharing.
   The prefix check ran on ad-hoc scripts until 2026-11-06; the reader is now a tool in the repo,

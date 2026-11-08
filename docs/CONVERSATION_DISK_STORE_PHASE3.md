@@ -25,9 +25,37 @@ Measured on this PC after the store was moved to the SSD (RTX 4080 16 GB, 48 GB 
 
 No entry was fully inside another (`fully inside another entry: 0 MiB`), so this is not a stale copy
 of one session; it is the same prefix stored once per copy. Two shapes: the shared system prompt of
-branches, and — the larger one — the same conversation written whole again as it grew, which phase 1's
-append and supersede rule removes before phase 3 is needed. Phase 3 is for what remains: prefixes
-shared between conversations that are not the same conversation.
+branches, and — the larger one — the same conversation written whole again as it grew. Phase 1's append
+and supersede rule was expected to remove these copies; on this PC's live traffic it does not:
+`0 superseded` in all 429 writes of 2026-11-05 to 2026-11-08, and one entry fully inside another by
+2026-11-08 (0 on 2026-11-06). The rule works as written; the traffic is the case it does not cover, and
+section "Why supersede is 0 on live traffic" shows why. Phase 3 is for what remains: prefixes shared
+between conversations that are not the same conversation, and prefixes re-stored when a chain diverges.
+
+## Why supersede is 0 on live traffic
+
+The two dedup rules are read from code (unconfirmed static analysis); the counts are measured from the
+serving logs. They cover complementary cases, and the RAM rule fires first.
+
+- **RAM cache, the tenth rule (#342, `conversation_cache.hpp:563-584`):** a parked state drops an entry
+  when the new prompt is longer, the divergence is inside the last tenth of the entry's tokens, and the
+  pictures below the shared length match; pinned entries are protected. It drops copies whose chain
+  diverged — exactly what the tenth rule says it may drop, "at most a tenth of its tokens unshared".
+  It fires in `put()` (line 549), before the entry is parked, and the disk tier then gets a `superseded`
+  event and cancels the queued write.
+- **Disk supersede (`conversation_disk.cpp:745-782`, used by the write pass at `:1691-1698`):** a write
+  removes an entry only when it is smaller than the new image, no reader holds it, and its live state,
+  every checkpoint and every stored block's `prefix_digest` chain are **exact** prefixes of the new image.
+  There is no tenth rule: a divergent chain fails the check.
+- The exact-prefix case is inside the tenth rule too (the whole entry is shared), so a copy that disk
+  supersede could match is removed from RAM first, and its queued write is cancelled before it lands on
+  the disk. Measured: the cache dropped 37 superseded copies (flush 60) and 135 (flush 0), the disk side
+  0 in every one of the 429 writes. A disk entry is superseded only when a copy reached the disk before
+  RAM removed it, which this traffic does not produce.
+- The disk therefore keeps entries the cache has dropped: 3 entries of 65 have ever been read back, and
+  the budget evicts whole conversations last (73 removals in the live run). The store's duplicates are
+  entries no rule can prove dead, which is the second reason phase 3 shares blocks by content: a shared
+  prefix stored once loses a reference when an entry goes, and its blocks follow the last user.
 
 ## Scope
 
@@ -196,10 +224,28 @@ on this PC's SSD, before any pack sharing exists.
 
 The scan of 2026-11-08, after three more debounced days of live traffic, answers the duplication
 question: 64 entries, 76 624 MiB, the duplicated prefix **58 513 MiB = 76.4% of the store** (117.7%
-of the K/V — a block is counted once for every pair that shares it), against 26 797 MiB of states
-(35.0%). The debounced shape shows in the count: 49 entries of 64 hold one state, and the biggest
-pair shares 201 113 tokens. The duplication did not go away; the delta appends grew it, and the
-duplicated prefix is now the dominant part of the folder.
+of the K/V), against 26 797 MiB of states (35.0%). The debounced shape shows in the count: 49 entries
+of 64 hold one state, and the biggest pair shares 201 113 tokens. The duplication did not go away;
+the delta appends grew it, and the duplicated prefix is now the dominant part of the folder. The
+share moves as the run goes: the same tool read 75.8% two hours after the snapshot above, and 72.7%
+in the afternoon of the same day (64-65 entries, the store inside its 76 800 MiB budget).
+
+How the tool counts, read from `tools/conversation_store_scan.py:133-146` (static analysis, confirmed
+by reproducing the number entry by entry): each entry is priced once, by the longest token prefix it
+shares with any other entry, times its own **bytes per token**, and `bytes` counts K/V **and** states.
+So the metric counts every copy, including the first copy that has to exist, and it prices state
+bytes into the prefix. The store share (72.7-76.4%) is the share with that price; the K/V share
+passes 100% because state bytes ride on the price, not because blocks are counted per pair.
+
+The same folder read by payload hash (my own pass over the `.idx` files, not the repo tool,
+2026-11-08): **26 034 MiB of K/V are extra copies** — 1524 extra copies of 1314 shared blocks,
+34.5% of the store, 53.7% of the K/V; K/V inside shared prefixes is 38 232 MiB = 50.7% of the store;
+the first copy that must exist is 12 198 MiB; every duplicate-by-hash byte sits inside a shared
+prefix, 0 MiB outside one; 3 entries of 65 have ever been read back. The extra copies split:
+8408 MiB (11.1% of the store) under the 20 000-token system-prompt band - three 17.6 MiB blocks
+stored 59 times each - and 17 626 MiB (23.4%) in the long family prefixes (23 families, 17 of them
+with 2-7 entries). The store would need 47 402 MiB of the 75 442 MiB it holds if every unique block
+were stored once.
 
 ## Risks and open questions
 
@@ -221,12 +267,14 @@ duplicated prefix is now the dominant part of the folder.
   **at 07:29 on 2026-11-04** — 35 entries, 76 155 MiB, the duplicated prefix **16 914 MiB (36.3% of the
   K/V, 22.2% of the store)** against 29 612 MiB of states (38.9%); **on 2026-11-08** — 64 entries,
   76 624 MiB, the duplicated prefix **58 513 MiB (117.7% of the K/V, 76.4% of the store)** against
-  26 797 MiB of states (35.0%) — a K/V block is counted once for every pair that shares it, so the
-  K/V share passes 100%. The share moves with what the budget keeps, and the long-prefix copies are what
-  phase 1 cannot stop (the chain rule sends a continuation to a new entry). After three debounced days
-  of live traffic the duplicated prefix is the dominant cost of the disk, which is the measurement this
-  phase's justification asks for. Phase 3 is judged beside phase 2's state window, not against the
-  baseline's 68.3%.
+  26 797 MiB of states (35.0%) — the tool prices each entry's bytes per token, K/V and states together,
+  for the longest prefix it shares with any other entry, each entry counted once, so the K/V share passes
+  100% (`tools/conversation_store_scan.py:133-146`); the extra copies alone, read by payload hash, are
+  26 034 MiB = 34.5% of the store. The share moves with what the budget keeps, and the long-prefix copies
+  are what phase 1 cannot stop (the chain rule sends a continuation to a new entry, and the disk supersede
+  rule does not remove them — section "Why supersede is 0 on live traffic"). After three debounced days of live traffic the
+  duplicated prefix is the dominant cost of the disk, which is the measurement this phase's justification
+  asks for. Phase 3 is judged beside phase 2's state window, not against the baseline's 68.3%.
 - **Static analysis, unconfirmed.** The duplication numbers are measured by that file's `.idx`
   reader; everything else here is read, not run.
 - **Conversations that compaction makes known-stale, to be researched separately.** When the client
