@@ -4,7 +4,7 @@ Raw results and short reports from measurement runs, one folder per run, named b
 the Strata version, hardware and method of its own day, and none is a statement about a later release. Current numbers are in the
 [docs](../README.md) and the [README](../../README.md); how to measure is in [BENCHMARK_PROTOCOL.md](../BENCHMARK_PROTOCOL.md).
 
-This page is built by `python tools/bench_results_index.py` (`--check` fails when a folder is missing from it). 162 folders and 3 loose files, 2448 files in all.
+This page is built by `python tools/bench_results_index.py` (`--check` fails when a folder is missing from it). 162 folders and 3 loose files, 2406 files in all.
 
 
 ## 2026-09
@@ -168,8 +168,8 @@ This page is built by `python tools/bench_results_index.py` (`--check` fails whe
 | [2026-10-22-cuda-cuda12](2026-10-22-cuda-cuda12/) | (no Markdown page) | 2 |
 | [2026-10-22-cuda-cuda13](2026-10-22-cuda-cuda13/) | (no Markdown page) | 2 |
 | [2026-10-27-community-rtx-4080-swift-iq2-xs](2026-10-27-community-rtx-4080-swift-iq2-xs/) | Community benchmark on NVIDIA GeForce RTX 4080 | 2 |
-| [2026-10-27-standard-e50](2026-10-27-standard-e50/) | Strata standard benchmark: NVIDIA GeForce RTX 4080 | 8 |
-| [2026-10-27-standard-e52](2026-10-27-standard-e52/) | Strata standard benchmark: NVIDIA GeForce RTX 4080 | 8 |
+| [2026-10-27-standard-e50](2026-10-27-standard-e50/) | Strata standard benchmark: NVIDIA GeForce RTX 4080 | 7 |
+| [2026-10-27-standard-e52](2026-10-27-standard-e52/) | Strata standard benchmark: NVIDIA GeForce RTX 4080 | 7 |
 | [2026-10-31-standard-rtx-4080-4e360c35](2026-10-31-standard-rtx-4080-4e360c35/) | Strata standard benchmark: NVIDIA GeForce RTX 4080 | 7 |
 | [2026-10-31-standard-rtx-4080-521a8fee](2026-10-31-standard-rtx-4080-521a8fee/) | Strata standard benchmark: NVIDIA GeForce RTX 4080 | 7 |
 | [2026-10-31-standard-rtx-4080-cbc1a827](2026-10-31-standard-rtx-4080-cbc1a827/) | Strata standard benchmark: NVIDIA GeForce RTX 4080 | 7 |
@@ -180,7 +180,7 @@ This page is built by `python tools/bench_results_index.py` (`--check` fails whe
 
 | Folder | What | Files |
 | --- | --- | ---: |
-| [2026-11-01-ab-maxram](2026-11-01-ab-maxram/) | A/B: release 0.1.55 vs fork 0.1.55-local, preset IQ2_XS max_ram | 184 |
+| [2026-11-01-ab-maxram](2026-11-01-ab-maxram/) | A/B: release 0.1.55 vs fork 0.1.55-local, preset IQ2_XS max_ram | 144 |
 | [2026-11-14-rdna2-pcie-auto](2026-11-14-rdna2-pcie-auto/) | PcieAuto on gfx103x: the decode miss split from the CPU pool's speed (#4007) | 3 |
 | [2026-11-20-q36-kv-precision](2026-11-20-q36-kv-precision/) | q36 --kv fp32/fp16/fp8/fp4 — memory width for the K/V cache | 1 |
 
