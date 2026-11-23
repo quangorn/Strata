@@ -27,24 +27,36 @@ before a commit: the offline suite covers the logic, these cover the files that 
 
 ## The offline suite on this PC
 
-`./.venv/Scripts/python.exe -m pytest terminal/tests/terminal -q` (the `.venv` needs `pytest` and `textual==8.2.8`) answers 2036 passed
-and 62 skipped, with eleven failures (measured 2026-11-02, after the engine build-number rule). Seven are upstream's: they fail
-at `upstream/main` with no fork change, on this PC.
+`./.venv/Scripts/python.exe -m pytest terminal/tests/terminal -q` (the `.venv` needs `pytest` and `textual==8.2.8`) answers 3781 passed,
+138 skipped, 5 failed and 1666 subtests passed, in 2583.47 s (43 min) — measured 2026-11-24 on this checkout, after upstream v0.2.20
+was merged into it and the fork's test fixes were in.
 
-| File | Case | Why it fails here |
+The merge brought 18 failures. Thirteen are closed by this checkout's own test edits, five are left. The thirteen:
+
+| File | Cases | What the test change does |
 |---|---|---|
-| `test_launch_dsv41.py` | four plan and list cases | the fixtures describe 4 AMD cards and 251 GB, and the plan answers with this PC's Windows placement rule ("on Windows a model runs on one AMD card"); one verdict is `tight` where the fixture expects `fits` |
-| `test_private_files.py` | a locked file read after the repair | the ACL repair runs on a temp folder under `D:\tmp\cygwin`, and this PC locks it differently |
-| `test_bundle_imports.py` | setup.py tools import inside the bundle | the checkout has no llama.cpp tree (`engine/third_party/strata-ggml` is the vendored ggml) and `STRATA_GGUF_PY` is not set, so `gguf-py` is not found |
-| `test_bench_standard.py` | one request-outcome case | the outcome (`connection_TimeoutError` against `timeout`) depends on the network this PC sees; the pair moves — 2026-11-02: the round-total case fails, the other passes |
-| `test_launch_tui.py` | `FolderStep::test_default_folder_and_free_space_and_change` | seen 2026-11-02: the step reads this PC's default folder and free space, which is not what the fixture describes; the same nature as the checkout cases below |
+| `test_update_with_model.py` | 9 | its harness never asked for an engine, and this checkout takes an engine from the feed only when asked (`--engine`, or `STRATA_ENGINE_FROM_FEED=1`), so the engine step was skipped and none of the model questions ran. `ModelCase.setUp` asks for the step the way `test_updater.py`'s `Cli` does. The default path, where the engine is not taken from the feed, is checked there by `test_the_engine_step_is_skipped_by_default` |
+| `test_launch_stale_engine_update_failed.py` | 3 | rewritten for this fork's rule: a launch never spawns `strata update`, and the engine that runs is the package built in the checkout, so the stale-engine answer names `tools/packaging/build_engine_win_local.py` as the next step |
+| `test_launcher_heal.py` | 1 | the launcher header names `bin\strata-direct.ps1`, the file this checkout ships |
 
-Three more are this checkout, not the code. `test_discovery.py` and `test_shared_models_folder.py` expect a machine with no
-Strata install visible, and this checkout answers as one: its root holds the launch files (`strata-swift-iq2_xs.json` and two
-more), so `Catalog.root` is the checkout. `test_no_acquisition.py` scans the modules a start loads by their path under the
-checkout's root, so a module under `.venv/Lib/site-packages` was counted as project code; that case skips `.venv` now.
+The five left fail on a clean upstream v0.2.20 checkout on this PC as well (checked 2026-11-24 in `E:\LocalTemp\opencode\pristine-v0220`,
+upstream commit `a34979fc9`), so none of them comes from a fork change:
 
-None of the eleven says anything about the engine step of the launch or of `strata update`. The groups that do test them pass:
-`test_launch_engine_first.py` (20 cases), `test_updater.py` (49), `test_round8_fixes.py` (25), `test_no_acquisition.py` (13),
-`test_component_start.py`, `test_make_guard.py`, `test_profiles.py`, `test_launch_monitor.py` (81 together), `test_issues_022.py`
-and `test_tui2_023_install.py` (34).
+| File | Case | Why it fails here | Clean v0.2.20 |
+|---|---|---|---|
+| `test_private_files.py` | `ElevatedRunLockoutTests::test_default_dacl_allows_reopening_child_process_for_qos` | the case runs its script in a child Python, and that child has no path to the checkout's `terminal` folder: the `.venv` has no `.pth` file and the case sets no `PYTHONPATH`, so the child answers `ModuleNotFoundError: No module named 'strata_control'` | yes |
+| `test_test_start_missing_library.py` | `BinarySmoke::test_the_default_test_start_with_no_model_keeps_the_log` | `updater.default_test_start` reads `component.id`, and the case's `SimpleNamespace` for the component gives none: `AttributeError` (upstream's own test bug, not a fork one) | yes |
+| `test_tui2_023_install.py` | `WindowsInstaller::test_a_folder_with_accented_letters_is_unpacked` | the installer unpacks inside this PC's temp folder, and Windows refuses that path: "Cannot extract through symlink `\\?\C:\Users\karam\AppData\Local\Temp`", so nothing is installed and the "Installed. Run: strata launch" line never appears | yes |
+| `test_tui2_023_install.py` | `WindowsInstaller::test_the_whole_cause_is_printed_not_the_first_six_lines` | the same refusal: the cause that is printed is the unpack error, so the fixture's last line is missing from the output | yes |
+| `test_update_bat_stub.py` | `Run::test_without_the_stub_the_old_file_ends_with_the_error_and_exit_1` | `cmd` prints "The batch file cannot be found." in the console's code page (this PC is a Russian Windows, OEM code page 866), and the case reads the child's text as cp1251, so the ASCII sentence is not found in `stderr` | yes |
+
+None of the seven rows the old table listed fails any more. The six files it named that are in this checkout — `test_bundle_imports.py`,
+`test_bench_standard.py`, `test_launch_tui.py`, `test_discovery.py`, `test_shared_models_folder.py`, `test_no_acquisition.py` (248 cases) —
+pass in this run, and they pass in the clean v0.2.20 checkout too (248 passed, 9 subtests, no failures). `test_launch_dsv41.py` is not in
+this checkout, and not in upstream v0.2.20: the row cannot fall any more. The checkout facts the old rows blamed — the launch files in the
+checkout's root, the missing llama.cpp tree, this PC's default folder — do not break these cases any more.
+
+The groups that check the engine step of the launch and of `strata update` pass whole: `test_launch_engine_first.py` (20),
+`test_updater.py` (56), `test_round8_fixes.py` (26), `test_no_acquisition.py` (12), `test_component_start.py` (8),
+`test_make_guard.py` (22), `test_profiles.py` (21), `test_launch_monitor.py` (11), `test_issues_022.py` (33) and
+`test_update_with_model.py` (40).
