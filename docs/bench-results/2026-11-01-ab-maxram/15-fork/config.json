@@ -1,0 +1,45 @@
+{
+  "engine_options": {
+    "--pack": "swift-iq2_xs",
+    "--native": "Swift-Qwen3.8-Flash-Next-GSQ-RCO-IQ2_XS-00001-of-00002.gguf",
+    "--ple-gguf": "Swift-Qwen3.8-Flash-Next-GSQ-RCO-IQ2_XS-00001-of-00002.gguf",
+    "--expert-profile": "expert-profile.bin",
+    "--expert-cache": "auto",
+    "--prefill": "auto",
+    "--spec": "4",
+    "--mtp": "rt",
+    "--max-context": "262144",
+    "--kv": "q4_0",
+    "--kv-resident": "32768",
+    "--vision": true,
+    "--conversation-cache-slots": "8",
+    "--conversation-cache-min-tokens": "<redacted>",
+    "--conversation-cache-min-free-mib": "512",
+    "--spec-min-p": "0.50",
+    "--conversation-cache-mib": "12288",
+    "--vram-reserve-mib": "200"
+  },
+  "other_engine_options": {
+    "--pack": "swift-iq2_xs",
+    "--native": "Swift-Qwen3.8-Flash-Next-GSQ-RCO-IQ2_XS-00001-of-00002.gguf",
+    "--ple-gguf": "Swift-Qwen3.8-Flash-Next-GSQ-RCO-IQ2_XS-00001-of-00002.gguf",
+    "--max-context": "262144",
+    "--vision": true,
+    "--conversation-cache-slots": "8",
+    "--conversation-cache-min-tokens": "<redacted>",
+    "--conversation-cache-min-free-mib": "512",
+    "--conversation-cache-mib": "12288"
+  },
+  "server_defaults": {
+    "temperature": 1.0,
+    "top_p": 0.95,
+    "top_k": 20,
+    "min_p": 0.0,
+    "presence_penalty": 0.5,
+    "repeat_penalty": 1.0,
+    "n_predict": -1
+  },
+  "total_slots": 1,
+  "context": 262144,
+  "source": "effective engine arguments of the profile"
+}

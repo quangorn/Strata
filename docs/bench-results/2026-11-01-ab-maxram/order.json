@@ -1,0 +1,108 @@
+{
+ "plan": [
+  {
+   "index": 1,
+   "arm": "orig",
+   "run_in_arm": 1
+  },
+  {
+   "index": 1,
+   "arm": "fork",
+   "run_in_arm": 2
+  },
+  {
+   "index": 2,
+   "arm": "fork",
+   "run_in_arm": 3
+  },
+  {
+   "index": 2,
+   "arm": "orig",
+   "run_in_arm": 4
+  },
+  {
+   "index": 3,
+   "arm": "orig",
+   "run_in_arm": 5
+  },
+  {
+   "index": 3,
+   "arm": "fork",
+   "run_in_arm": 6
+  },
+  {
+   "index": 4,
+   "arm": "fork",
+   "run_in_arm": 7
+  },
+  {
+   "index": 4,
+   "arm": "orig",
+   "run_in_arm": 8
+  },
+  {
+   "index": 5,
+   "arm": "orig",
+   "run_in_arm": 9
+  },
+  {
+   "index": 5,
+   "arm": "fork",
+   "run_in_arm": 10
+  },
+  {
+   "index": 6,
+   "arm": "fork",
+   "run_in_arm": 11
+  },
+  {
+   "index": 6,
+   "arm": "orig",
+   "run_in_arm": 12
+  },
+  {
+   "index": 7,
+   "arm": "orig",
+   "run_in_arm": 13
+  },
+  {
+   "index": 7,
+   "arm": "fork",
+   "run_in_arm": 14
+  },
+  {
+   "index": 8,
+   "arm": "fork",
+   "run_in_arm": 15
+  },
+  {
+   "index": 8,
+   "arm": "orig",
+   "run_in_arm": 16
+  },
+  {
+   "index": 9,
+   "arm": "orig",
+   "run_in_arm": 17
+  },
+  {
+   "index": 9,
+   "arm": "fork",
+   "run_in_arm": 18
+  },
+  {
+   "index": 10,
+   "arm": "fork",
+   "run_in_arm": 19
+  },
+  {
+   "index": 10,
+   "arm": "orig",
+   "run_in_arm": 20
+  }
+ ],
+ "arms": {
+  "orig": "A/B max_ram: release 0.1.55 (component 99866a47+cuda13.0, bundled cuBLAS 13.0)",
+  "fork": "A/B max_ram: fork 0.1.55-local (build c62d5e3a-dirty, CUDA 13.4, bundled cuBLAS 13.4)"
+ }
+}

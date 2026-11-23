@@ -1,0 +1,1341 @@
+{
+ "runs": {
+  "orig": [
+   {
+    "index": 1,
+    "arm": "orig",
+    "run_in_arm": 1,
+    "exit": 6,
+    "seconds": 114.0,
+    "out": "C:\\Projects\\Strata\\bench\\results\\2026-11-01-ab-maxram\\01-orig",
+    "at": "2026-11-01T10:37:40",
+    "status": "nonconforming",
+    "status_reasons": [
+     "no model file could be hashed"
+    ],
+    "engine_version": "0.1.55",
+    "expected_version": "0.1.55",
+    "version_ok": true,
+    "decode": {
+     "short": 133.2,
+     "prompt-4k": 129.18,
+     "prompt-16k": 141.95
+    },
+    "sanity": "12/12",
+    "required_s": 82.5,
+    "acceptable": true
+   },
+   {
+    "index": 4,
+    "arm": "orig",
+    "run_in_arm": 2,
+    "exit": 6,
+    "seconds": 110.7,
+    "out": "C:\\Projects\\Strata\\bench\\results\\2026-11-01-ab-maxram\\04-orig",
+    "at": "2026-11-01T10:43:06",
+    "status": "nonconforming",
+    "status_reasons": [
+     "no model file could be hashed"
+    ],
+    "engine_version": "0.1.55",
+    "expected_version": "0.1.55",
+    "version_ok": true,
+    "decode": {
+     "short": 140.06,
+     "prompt-4k": 125.91,
+     "prompt-16k": 126.06
+    },
+    "sanity": "11/12",
+    "required_s": 85.016,
+    "acceptable": true
+   },
+   {
+    "index": 5,
+    "arm": "orig",
+    "run_in_arm": 3,
+    "exit": 6,
+    "seconds": 105.6,
+    "out": "C:\\Projects\\Strata\\bench\\results\\2026-11-01-ab-maxram\\05-orig",
+    "at": "2026-11-01T10:44:51",
+    "status": "nonconforming",
+    "status_reasons": [
+     "no model file could be hashed"
+    ],
+    "engine_version": "0.1.55",
+    "expected_version": "0.1.55",
+    "version_ok": true,
+    "decode": {
+     "short": 136.07,
+     "prompt-4k": 137.91,
+     "prompt-16k": 145.26
+    },
+    "sanity": "11/12",
+    "required_s": 83.328,
+    "acceptable": true
+   },
+   {
+    "index": 8,
+    "arm": "orig",
+    "run_in_arm": 4,
+    "exit": 6,
+    "seconds": 113.8,
+    "out": "C:\\Projects\\Strata\\bench\\results\\2026-11-01-ab-maxram\\08-orig",
+    "at": "2026-11-01T10:50:15",
+    "status": "nonconforming",
+    "status_reasons": [
+     "no model file could be hashed"
+    ],
+    "engine_version": "0.1.55",
+    "expected_version": "0.1.55",
+    "version_ok": true,
+    "decode": {
+     "short": 130.36,
+     "prompt-4k": 129.06,
+     "prompt-16k": 119.03
+    },
+    "sanity": "12/12",
+    "required_s": 88.375,
+    "acceptable": true
+   },
+   {
+    "index": 9,
+    "arm": "orig",
+    "run_in_arm": 5,
+    "exit": 6,
+    "seconds": 106.9,
+    "out": "C:\\Projects\\Strata\\bench\\results\\2026-11-01-ab-maxram\\09-orig",
+    "at": "2026-11-01T10:52:02",
+    "status": "nonconforming",
+    "status_reasons": [
+     "no model file could be hashed"
+    ],
+    "engine_version": "0.1.55",
+    "expected_version": "0.1.55",
+    "version_ok": true,
+    "decode": {
+     "short": 145.85,
+     "prompt-4k": 130.72,
+     "prompt-16k": 135.04
+    },
+    "sanity": "11/12",
+    "required_s": 83.078,
+    "acceptable": true
+   },
+   {
+    "index": 12,
+    "arm": "orig",
+    "run_in_arm": 6,
+    "exit": 6,
+    "seconds": 113.9,
+    "out": "C:\\Projects\\Strata\\bench\\results\\2026-11-01-ab-maxram\\12-orig",
+    "at": "2026-11-01T10:57:30",
+    "status": "nonconforming",
+    "status_reasons": [
+     "no model file could be hashed"
+    ],
+    "engine_version": "0.1.55",
+    "expected_version": "0.1.55",
+    "version_ok": true,
+    "decode": {
+     "short": 141.01,
+     "prompt-4k": 122.43,
+     "prompt-16k": 117.19
+    },
+    "sanity": "12/12",
+    "required_s": 88.078,
+    "acceptable": true
+   },
+   {
+    "index": 13,
+    "arm": "orig",
+    "run_in_arm": 7,
+    "exit": 6,
+    "seconds": 108.6,
+    "out": "C:\\Projects\\Strata\\bench\\results\\2026-11-01-ab-maxram\\13-orig",
+    "at": "2026-11-01T10:59:19",
+    "status": "nonconforming",
+    "status_reasons": [
+     "no model file could be hashed"
+    ],
+    "engine_version": "0.1.55",
+    "expected_version": "0.1.55",
+    "version_ok": true,
+    "decode": {
+     "short": 140.52,
+     "prompt-4k": 140.35,
+     "prompt-16k": 136.54
+    },
+    "sanity": "12/12",
+    "required_s": 82.891,
+    "acceptable": true
+   },
+   {
+    "index": 16,
+    "arm": "orig",
+    "run_in_arm": 8,
+    "exit": 6,
+    "seconds": 107.6,
+    "out": "C:\\Projects\\Strata\\bench\\results\\2026-11-01-ab-maxram\\16-orig",
+    "at": "2026-11-01T11:04:42",
+    "status": "nonconforming",
+    "status_reasons": [
+     "no model file could be hashed"
+    ],
+    "engine_version": "0.1.55",
+    "expected_version": "0.1.55",
+    "version_ok": true,
+    "decode": {
+     "short": 139.93,
+     "prompt-4k": 135.51,
+     "prompt-16k": 133.93
+    },
+    "sanity": "12/12",
+    "required_s": 85.234,
+    "acceptable": true
+   },
+   {
+    "index": 17,
+    "arm": "orig",
+    "run_in_arm": 9,
+    "exit": 6,
+    "seconds": 108.5,
+    "out": "C:\\Projects\\Strata\\bench\\results\\2026-11-01-ab-maxram\\17-orig",
+    "at": "2026-11-01T11:06:30",
+    "status": "nonconforming",
+    "status_reasons": [
+     "no model file could be hashed"
+    ],
+    "engine_version": "0.1.55",
+    "expected_version": "0.1.55",
+    "version_ok": true,
+    "decode": {
+     "short": 132.9,
+     "prompt-4k": 128.91,
+     "prompt-16k": 132.12
+    },
+    "sanity": "12/12",
+    "required_s": 82.734,
+    "acceptable": true
+   },
+   {
+    "index": 20,
+    "arm": "orig",
+    "run_in_arm": 10,
+    "exit": 6,
+    "seconds": 105.7,
+    "out": "C:\\Projects\\Strata\\bench\\results\\2026-11-01-ab-maxram\\20-orig",
+    "at": "2026-11-01T11:11:53",
+    "status": "nonconforming",
+    "status_reasons": [
+     "no model file could be hashed"
+    ],
+    "engine_version": "0.1.55",
+    "expected_version": "0.1.55",
+    "version_ok": true,
+    "decode": {
+     "short": 140.06,
+     "prompt-4k": 125.12,
+     "prompt-16k": 132.3
+    },
+    "sanity": "12/12",
+    "required_s": 83.031,
+    "acceptable": true
+   }
+  ],
+  "fork": [
+   {
+    "index": 2,
+    "arm": "fork",
+    "run_in_arm": 1,
+    "exit": 6,
+    "seconds": 108.8,
+    "out": "C:\\Projects\\Strata\\bench\\results\\2026-11-01-ab-maxram\\02-fork",
+    "at": "2026-11-01T10:39:29",
+    "status": "nonconforming",
+    "status_reasons": [
+     "no model file could be hashed"
+    ],
+    "engine_version": "0.1.55-local",
+    "expected_version": "0.1.55-local",
+    "version_ok": true,
+    "decode": {
+     "short": 129.74,
+     "prompt-4k": 134.34,
+     "prompt-16k": 136.38
+    },
+    "sanity": "11/12",
+    "required_s": 86.329,
+    "acceptable": true
+   },
+   {
+    "index": 3,
+    "arm": "fork",
+    "run_in_arm": 2,
+    "exit": 6,
+    "seconds": 105.9,
+    "out": "C:\\Projects\\Strata\\bench\\results\\2026-11-01-ab-maxram\\03-fork",
+    "at": "2026-11-01T10:41:15",
+    "status": "nonconforming",
+    "status_reasons": [
+     "no model file could be hashed"
+    ],
+    "engine_version": "0.1.55-local",
+    "expected_version": "0.1.55-local",
+    "version_ok": true,
+    "decode": {
+     "short": 147.04,
+     "prompt-4k": 139.51,
+     "prompt-16k": 135.83
+    },
+    "sanity": "11/12",
+    "required_s": 80.031,
+    "acceptable": true
+   },
+   {
+    "index": 6,
+    "arm": "fork",
+    "run_in_arm": 3,
+    "exit": 6,
+    "seconds": 103.7,
+    "out": "C:\\Projects\\Strata\\bench\\results\\2026-11-01-ab-maxram\\06-fork",
+    "at": "2026-11-01T10:46:35",
+    "status": "nonconforming",
+    "status_reasons": [
+     "no model file could be hashed"
+    ],
+    "engine_version": "0.1.55-local",
+    "expected_version": "0.1.55-local",
+    "version_ok": true,
+    "decode": {
+     "short": 139.18,
+     "prompt-4k": 140.54,
+     "prompt-16k": 125.01
+    },
+    "sanity": "12/12",
+    "required_s": 81.438,
+    "acceptable": true
+   },
+   {
+    "index": 7,
+    "arm": "fork",
+    "run_in_arm": 4,
+    "exit": 6,
+    "seconds": 106.2,
+    "out": "C:\\Projects\\Strata\\bench\\results\\2026-11-01-ab-maxram\\07-fork",
+    "at": "2026-11-01T10:48:21",
+    "status": "nonconforming",
+    "status_reasons": [
+     "no model file could be hashed"
+    ],
+    "engine_version": "0.1.55-local",
+    "expected_version": "0.1.55-local",
+    "version_ok": true,
+    "decode": {
+     "short": 129.01,
+     "prompt-4k": 128.93,
+     "prompt-16k": 129.61
+    },
+    "sanity": "12/12",
+    "required_s": 84.11,
+    "acceptable": true
+   },
+   {
+    "index": 10,
+    "arm": "fork",
+    "run_in_arm": 5,
+    "exit": 6,
+    "seconds": 110.4,
+    "out": "C:\\Projects\\Strata\\bench\\results\\2026-11-01-ab-maxram\\10-fork",
+    "at": "2026-11-01T10:53:52",
+    "status": "nonconforming",
+    "status_reasons": [
+     "no model file could be hashed"
+    ],
+    "engine_version": "0.1.55-local",
+    "expected_version": "0.1.55-local",
+    "version_ok": true,
+    "decode": {
+     "short": 142.12,
+     "prompt-4k": 141.5,
+     "prompt-16k": 126.94
+    },
+    "sanity": "12/12",
+    "required_s": 84.672,
+    "acceptable": true
+   },
+   {
+    "index": 11,
+    "arm": "fork",
+    "run_in_arm": 6,
+    "exit": 6,
+    "seconds": 104.3,
+    "out": "C:\\Projects\\Strata\\bench\\results\\2026-11-01-ab-maxram\\11-fork",
+    "at": "2026-11-01T10:55:37",
+    "status": "nonconforming",
+    "status_reasons": [
+     "no model file could be hashed"
+    ],
+    "engine_version": "0.1.55-local",
+    "expected_version": "0.1.55-local",
+    "version_ok": true,
+    "decode": {
+     "short": 140.07,
+     "prompt-4k": 144.04,
+     "prompt-16k": 131.47
+    },
+    "sanity": "12/12",
+    "required_s": 81.61,
+    "acceptable": true
+   },
+   {
+    "index": 14,
+    "arm": "fork",
+    "run_in_arm": 7,
+    "exit": 6,
+    "seconds": 111.4,
+    "out": "C:\\Projects\\Strata\\bench\\results\\2026-11-01-ab-maxram\\14-fork",
+    "at": "2026-11-01T11:01:11",
+    "status": "nonconforming",
+    "status_reasons": [
+     "no model file could be hashed"
+    ],
+    "engine_version": "0.1.55-local",
+    "expected_version": "0.1.55-local",
+    "version_ok": true,
+    "decode": {
+     "short": 141.71,
+     "prompt-4k": 131.37,
+     "prompt-16k": 125.78
+    },
+    "sanity": "12/12",
+    "required_s": 85.625,
+    "acceptable": true
+   },
+   {
+    "index": 15,
+    "arm": "fork",
+    "run_in_arm": 8,
+    "exit": 6,
+    "seconds": 103.5,
+    "out": "C:\\Projects\\Strata\\bench\\results\\2026-11-01-ab-maxram\\15-fork",
+    "at": "2026-11-01T11:02:54",
+    "status": "nonconforming",
+    "status_reasons": [
+     "no model file could be hashed"
+    ],
+    "engine_version": "0.1.55-local",
+    "expected_version": "0.1.55-local",
+    "version_ok": true,
+    "decode": {
+     "short": 142.36,
+     "prompt-4k": 139.92,
+     "prompt-16k": 144.25
+    },
+    "sanity": "12/12",
+    "required_s": 80.359,
+    "acceptable": true
+   },
+   {
+    "index": 18,
+    "arm": "fork",
+    "run_in_arm": 9,
+    "exit": 6,
+    "seconds": 110.7,
+    "out": "C:\\Projects\\Strata\\bench\\results\\2026-11-01-ab-maxram\\18-fork",
+    "at": "2026-11-01T11:08:21",
+    "status": "nonconforming",
+    "status_reasons": [
+     "no model file could be hashed"
+    ],
+    "engine_version": "0.1.55-local",
+    "expected_version": "0.1.55-local",
+    "version_ok": true,
+    "decode": {
+     "short": 138.46,
+     "prompt-4k": 131.98,
+     "prompt-16k": 125.68
+    },
+    "sanity": "11/12",
+    "required_s": 85.094,
+    "acceptable": true
+   },
+   {
+    "index": 19,
+    "arm": "fork",
+    "run_in_arm": 10,
+    "exit": 6,
+    "seconds": 106.8,
+    "out": "C:\\Projects\\Strata\\bench\\results\\2026-11-01-ab-maxram\\19-fork",
+    "at": "2026-11-01T11:10:08",
+    "status": "nonconforming",
+    "status_reasons": [
+     "no model file could be hashed"
+    ],
+    "engine_version": "0.1.55-local",
+    "expected_version": "0.1.55-local",
+    "version_ok": true,
+    "decode": {
+     "short": 138.18,
+     "prompt-4k": 132.04,
+     "prompt-16k": 134.6
+    },
+    "sanity": "12/12",
+    "required_s": 83.657,
+    "acceptable": true
+   }
+  ]
+ },
+ "bad_runs": [],
+ "per_arm": {
+  "orig": {
+   "short": {
+    "n": 10,
+    "median": 140.0,
+    "mean": 138.0,
+    "mad": 2.47,
+    "iqr": 7.52,
+    "std": 4.72,
+    "cv_pct": 3.42,
+    "min": 130.36,
+    "max": 145.85,
+    "values": [
+     133.2,
+     140.06,
+     136.07,
+     130.36,
+     145.85,
+     141.01,
+     140.52,
+     139.93,
+     132.9,
+     140.06
+    ]
+   },
+   "prompt-4k": {
+    "n": 10,
+    "median": 129.12,
+    "mean": 130.51,
+    "mad": 3.61,
+    "iqr": 10.4,
+    "std": 5.76,
+    "cv_pct": 4.41,
+    "min": 122.43,
+    "max": 140.35,
+    "values": [
+     129.18,
+     125.91,
+     137.91,
+     129.06,
+     130.72,
+     122.43,
+     140.35,
+     135.51,
+     128.91,
+     125.12
+    ]
+   },
+   "prompt-16k": {
+    "n": 10,
+    "median": 133.12,
+    "mean": 131.94,
+    "mad": 5.24,
+    "iqr": 13.59,
+    "std": 9.01,
+    "cv_pct": 6.83,
+    "min": 117.19,
+    "max": 145.26,
+    "values": [
+     141.95,
+     126.06,
+     145.26,
+     119.03,
+     135.04,
+     117.19,
+     136.54,
+     133.93,
+     132.12,
+     132.3
+    ]
+   }
+  },
+  "fork": {
+   "short": {
+    "n": 10,
+    "median": 139.62,
+    "mean": 138.79,
+    "mad": 2.29,
+    "iqr": 6.11,
+    "std": 5.58,
+    "cv_pct": 4.02,
+    "min": 129.01,
+    "max": 147.04,
+    "values": [
+     129.74,
+     147.04,
+     139.18,
+     129.01,
+     142.12,
+     140.07,
+     141.71,
+     142.36,
+     138.46,
+     138.18
+    ]
+   },
+   "prompt-4k": {
+    "n": 10,
+    "median": 136.93,
+    "mean": 136.42,
+    "mad": 4.73,
+    "iqr": 8.95,
+    "std": 5.24,
+    "cv_pct": 3.84,
+    "min": 128.93,
+    "max": 144.04,
+    "values": [
+     134.34,
+     139.51,
+     140.54,
+     128.93,
+     141.5,
+     144.04,
+     131.37,
+     139.92,
+     131.98,
+     132.04
+    ]
+   },
+   "prompt-16k": {
+    "n": 10,
+    "median": 130.54,
+    "mean": 131.56,
+    "mad": 4.81,
+    "iqr": 10.21,
+    "std": 6.22,
+    "cv_pct": 4.73,
+    "min": 125.01,
+    "max": 144.25,
+    "values": [
+     136.38,
+     135.83,
+     125.01,
+     129.61,
+     126.94,
+     131.47,
+     125.78,
+     144.25,
+     125.68,
+     134.6
+    ]
+   }
+  }
+ },
+ "comparison": {
+  "short": {
+   "orig": {
+    "n": 10,
+    "median": 140.0,
+    "mean": 138.0,
+    "mad": 2.47,
+    "iqr": 7.52,
+    "std": 4.72,
+    "cv_pct": 3.42,
+    "min": 130.36,
+    "max": 145.85,
+    "values": [
+     133.2,
+     140.06,
+     136.07,
+     130.36,
+     145.85,
+     141.01,
+     140.52,
+     139.93,
+     132.9,
+     140.06
+    ]
+   },
+   "fork": {
+    "n": 10,
+    "median": 139.62,
+    "mean": 138.79,
+    "mad": 2.29,
+    "iqr": 6.11,
+    "std": 5.58,
+    "cv_pct": 4.02,
+    "min": 129.01,
+    "max": 147.04,
+    "values": [
+     129.74,
+     147.04,
+     139.18,
+     129.01,
+     142.12,
+     140.07,
+     141.71,
+     142.36,
+     138.46,
+     138.18
+    ]
+   },
+   "bootstrap": {
+    "diff_of_medians": 0.37,
+    "ci95": [
+     -7.08,
+     4.04
+    ],
+    "p_two_sided_boot": 0.752
+   },
+   "mann_whitney": {
+    "u": 44.0,
+    "z": -0.416,
+    "p": 0.6775
+   },
+   "paired_diff": {
+    "n_pairs": 10,
+    "median": -0.12,
+    "mean": -0.79,
+    "positive_pairs": 5,
+    "values": [
+     3.46,
+     -6.98,
+     -3.11,
+     1.35,
+     3.73,
+     0.94,
+     -1.19,
+     -2.43,
+     -5.56,
+     1.88
+    ],
+    "sign_test_p": 1.0
+   }
+  },
+  "prompt-4k": {
+   "orig": {
+    "n": 10,
+    "median": 129.12,
+    "mean": 130.51,
+    "mad": 3.61,
+    "iqr": 10.4,
+    "std": 5.76,
+    "cv_pct": 4.41,
+    "min": 122.43,
+    "max": 140.35,
+    "values": [
+     129.18,
+     125.91,
+     137.91,
+     129.06,
+     130.72,
+     122.43,
+     140.35,
+     135.51,
+     128.91,
+     125.12
+    ]
+   },
+   "fork": {
+    "n": 10,
+    "median": 136.93,
+    "mean": 136.42,
+    "mad": 4.73,
+    "iqr": 8.95,
+    "std": 5.24,
+    "cv_pct": 3.84,
+    "min": 128.93,
+    "max": 144.04,
+    "values": [
+     134.34,
+     139.51,
+     140.54,
+     128.93,
+     141.5,
+     144.04,
+     131.37,
+     139.92,
+     131.98,
+     132.04
+    ]
+   },
+   "bootstrap": {
+    "diff_of_medians": -7.81,
+    "ci95": [
+     -13.05,
+     1.12
+    ],
+    "p_two_sided_boot": 0.078
+   },
+   "mann_whitney": {
+    "u": 20.0,
+    "z": -2.23,
+    "p": 0.0257
+   },
+   "paired_diff": {
+    "n_pairs": 10,
+    "median": -4.78,
+    "mean": -5.91,
+    "positive_pairs": 2,
+    "values": [
+     -5.16,
+     -13.6,
+     -2.63,
+     0.13,
+     -10.78,
+     -21.61,
+     8.98,
+     -4.41,
+     -3.07,
+     -6.92
+    ],
+    "sign_test_p": 0.1094
+   }
+  },
+  "prompt-16k": {
+   "orig": {
+    "n": 10,
+    "median": 133.12,
+    "mean": 131.94,
+    "mad": 5.24,
+    "iqr": 13.59,
+    "std": 9.01,
+    "cv_pct": 6.83,
+    "min": 117.19,
+    "max": 145.26,
+    "values": [
+     141.95,
+     126.06,
+     145.26,
+     119.03,
+     135.04,
+     117.19,
+     136.54,
+     133.93,
+     132.12,
+     132.3
+    ]
+   },
+   "fork": {
+    "n": 10,
+    "median": 130.54,
+    "mean": 131.56,
+    "mad": 4.81,
+    "iqr": 10.21,
+    "std": 6.22,
+    "cv_pct": 4.73,
+    "min": 125.01,
+    "max": 144.25,
+    "values": [
+     136.38,
+     135.83,
+     125.01,
+     129.61,
+     126.94,
+     131.47,
+     125.78,
+     144.25,
+     125.68,
+     134.6
+    ]
+   },
+   "bootstrap": {
+    "diff_of_medians": 2.57,
+    "ci95": [
+     -7.07,
+     9.26
+    ],
+    "p_two_sided_boot": 0.567
+   },
+   "mann_whitney": {
+    "u": 44.0,
+    "z": -0.416,
+    "p": 0.6776
+   },
+   "paired_diff": {
+    "n_pairs": 10,
+    "median": 1.64,
+    "mean": 0.39,
+    "positive_pairs": 5,
+    "values": [
+     5.57,
+     -9.77,
+     20.25,
+     -10.58,
+     8.1,
+     -14.28,
+     10.76,
+     -10.32,
+     6.44,
+     -2.3
+    ],
+    "sign_test_p": 1.0
+   }
+  }
+ },
+ "details": {
+  "orig": [
+   {
+    "index": 1,
+    "arm": "orig",
+    "prompt": {
+     "short": 188.771758,
+     "prompt-4k": 2071.251455,
+     "prompt-16k": 2849.56614
+    },
+    "trunc": {
+     "short": [
+      0,
+      3
+     ],
+     "prompt-4k": [
+      3,
+      3
+     ],
+     "prompt-16k": [
+      3,
+      3
+     ]
+    }
+   },
+   {
+    "index": 4,
+    "arm": "orig",
+    "prompt": {
+     "short": 179.738562,
+     "prompt-4k": 2083.80002,
+     "prompt-16k": 2848.823059
+    },
+    "trunc": {
+     "short": [
+      0,
+      3
+     ],
+     "prompt-4k": [
+      2,
+      3
+     ],
+     "prompt-16k": [
+      3,
+      3
+     ]
+    }
+   },
+   {
+    "index": 5,
+    "arm": "orig",
+    "prompt": {
+     "short": 193.661972,
+     "prompt-4k": 2082.633695,
+     "prompt-16k": 2846.59614
+    },
+    "trunc": {
+     "short": [
+      1,
+      3
+     ],
+     "prompt-4k": [
+      2,
+      3
+     ],
+     "prompt-16k": [
+      3,
+      3
+     ]
+    }
+   },
+   {
+    "index": 8,
+    "arm": "orig",
+    "prompt": {
+     "short": 187.942397,
+     "prompt-4k": 2069.052674,
+     "prompt-16k": 2848.030867
+    },
+    "trunc": {
+     "short": [
+      0,
+      3
+     ],
+     "prompt-4k": [
+      3,
+      3
+     ],
+     "prompt-16k": [
+      3,
+      3
+     ]
+    }
+   },
+   {
+    "index": 9,
+    "arm": "orig",
+    "prompt": {
+     "short": 194.34629,
+     "prompt-4k": 2084.649078,
+     "prompt-16k": 2851.400731
+    },
+    "trunc": {
+     "short": [
+      0,
+      3
+     ],
+     "prompt-4k": [
+      3,
+      3
+     ],
+     "prompt-16k": [
+      3,
+      3
+     ]
+    }
+   },
+   {
+    "index": 12,
+    "arm": "orig",
+    "prompt": {
+     "short": 191.11442,
+     "prompt-4k": 2070.413273,
+     "prompt-16k": 2851.152675
+    },
+    "trunc": {
+     "short": [
+      1,
+      3
+     ],
+     "prompt-4k": [
+      3,
+      3
+     ],
+     "prompt-16k": [
+      2,
+      3
+     ]
+    }
+   },
+   {
+    "index": 13,
+    "arm": "orig",
+    "prompt": {
+     "short": 197.233607,
+     "prompt-4k": 2081.786277,
+     "prompt-16k": 2846.39836
+    },
+    "trunc": {
+     "short": [
+      1,
+      3
+     ],
+     "prompt-4k": [
+      2,
+      3
+     ],
+     "prompt-16k": [
+      3,
+      3
+     ]
+    }
+   },
+   {
+    "index": 16,
+    "arm": "orig",
+    "prompt": {
+     "short": 191.399453,
+     "prompt-4k": 2078.614596,
+     "prompt-16k": 2850.607104
+    },
+    "trunc": {
+     "short": [
+      1,
+      3
+     ],
+     "prompt-4k": [
+      2,
+      3
+     ],
+     "prompt-16k": [
+      3,
+      3
+     ]
+    }
+   },
+   {
+    "index": 17,
+    "arm": "orig",
+    "prompt": {
+     "short": 160.751566,
+     "prompt-4k": 2081.256992,
+     "prompt-16k": 2844.570199
+    },
+    "trunc": {
+     "short": [
+      0,
+      3
+     ],
+     "prompt-4k": [
+      2,
+      3
+     ],
+     "prompt-16k": [
+      2,
+      3
+     ]
+    }
+   },
+   {
+    "index": 20,
+    "arm": "orig",
+    "prompt": {
+     "short": 186.71193,
+     "prompt-4k": 2082.52773,
+     "prompt-16k": 2843.533638
+    },
+    "trunc": {
+     "short": [
+      0,
+      3
+     ],
+     "prompt-4k": [
+      2,
+      3
+     ],
+     "prompt-16k": [
+      3,
+      3
+     ]
+    }
+   }
+  ],
+  "fork": [
+   {
+    "index": 2,
+    "arm": "fork",
+    "prompt": {
+     "short": 179.570896,
+     "prompt-4k": 2080.410694,
+     "prompt-16k": 2848.971644
+    },
+    "trunc": {
+     "short": [
+      1,
+      3
+     ],
+     "prompt-4k": [
+      3,
+      3
+     ],
+     "prompt-16k": [
+      1,
+      3
+     ]
+    }
+   },
+   {
+    "index": 3,
+    "arm": "fork",
+    "prompt": {
+     "short": 193.905817,
+     "prompt-4k": 2081.362827,
+     "prompt-16k": 2851.202283
+    },
+    "trunc": {
+     "short": [
+      0,
+      3
+     ],
+     "prompt-4k": [
+      2,
+      3
+     ],
+     "prompt-16k": [
+      2,
+      3
+     ]
+    }
+   },
+   {
+    "index": 6,
+    "arm": "fork",
+    "prompt": {
+     "short": 193.079238,
+     "prompt-4k": 2067.06732,
+     "prompt-16k": 2851.698455
+    },
+    "trunc": {
+     "short": [
+      0,
+      3
+     ],
+     "prompt-4k": [
+      2,
+      3
+     ],
+     "prompt-16k": [
+      3,
+      3
+     ]
+    }
+   },
+   {
+    "index": 7,
+    "arm": "fork",
+    "prompt": {
+     "short": 193.905817,
+     "prompt-4k": 2072.300137,
+     "prompt-16k": 2847.140177
+    },
+    "trunc": {
+     "short": [
+      1,
+      3
+     ],
+     "prompt-4k": [
+      3,
+      3
+     ],
+     "prompt-16k": [
+      2,
+      3
+     ]
+    }
+   },
+   {
+    "index": 10,
+    "arm": "fork",
+    "prompt": {
+     "short": 196.028513,
+     "prompt-4k": 2084.436749,
+     "prompt-16k": 2847.239115
+    },
+    "trunc": {
+     "short": [
+      1,
+      3
+     ],
+     "prompt-4k": [
+      3,
+      3
+     ],
+     "prompt-16k": [
+      3,
+      3
+     ]
+    }
+   },
+   {
+    "index": 11,
+    "arm": "fork",
+    "prompt": {
+     "short": 195.679797,
+     "prompt-4k": 2071.146645,
+     "prompt-16k": 2850.260032
+    },
+    "trunc": {
+     "short": [
+      0,
+      3
+     ],
+     "prompt-4k": [
+      2,
+      3
+     ],
+     "prompt-16k": [
+      3,
+      3
+     ]
+    }
+   },
+   {
+    "index": 14,
+    "arm": "fork",
+    "prompt": {
+     "short": 196.679438,
+     "prompt-4k": 2083.057662,
+     "prompt-16k": 2850.359187
+    },
+    "trunc": {
+     "short": [
+      1,
+      3
+     ],
+     "prompt-4k": [
+      3,
+      3
+     ],
+     "prompt-16k": [
+      3,
+      3
+     ]
+    }
+   },
+   {
+    "index": 15,
+    "arm": "fork",
+    "prompt": {
+     "short": 192.307692,
+     "prompt-4k": 2068.425308,
+     "prompt-16k": 2854.43049
+    },
+    "trunc": {
+     "short": [
+      0,
+      3
+     ],
+     "prompt-4k": [
+      1,
+      3
+     ],
+     "prompt-16k": [
+      3,
+      3
+     ]
+    }
+   },
+   {
+    "index": 18,
+    "arm": "fork",
+    "prompt": {
+     "short": 189.515137,
+     "prompt-4k": 2085.498828,
+     "prompt-16k": 2848.724011
+    },
+    "trunc": {
+     "short": [
+      1,
+      3
+     ],
+     "prompt-4k": [
+      2,
+      3
+     ],
+     "prompt-16k": [
+      3,
+      3
+     ]
+    }
+   },
+   {
+    "index": 19,
+    "arm": "fork",
+    "prompt": {
+     "short": 194.591863,
+     "prompt-4k": 2066.232521,
+     "prompt-16k": 2850.80547
+    },
+    "trunc": {
+     "short": [
+      2,
+      3
+     ],
+     "prompt-4k": [
+      2,
+      3
+     ],
+     "prompt-16k": [
+      2,
+      3
+     ]
+    }
+   }
+  ]
+ }
+}

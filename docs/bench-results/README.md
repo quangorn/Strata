@@ -4,7 +4,7 @@ Raw results and short reports from measurement runs, one folder per run, named b
 the Strata version, hardware and method of its own day, and none is a statement about a later release. Current numbers are in the
 [docs](../README.md) and the [README](../../README.md); how to measure is in [BENCHMARK_PROTOCOL.md](../BENCHMARK_PROTOCOL.md).
 
-This page is built by `python tools/bench_results_index.py` (`--check` fails when a folder is missing from it). 149 folders and 3 loose files, 2224 files in all.
+This page is built by `python tools/bench_results_index.py` (`--check` fails when a folder is missing from it). 162 folders and 3 loose files, 2448 files in all.
 
 
 ## 2026-09
@@ -154,10 +154,22 @@ This page is built by `python tools/bench_results_index.py` (`--check` fails whe
 | [2026-10-11-gfx1100-qsa-scores](2026-10-11-gfx1100-qsa-scores/) | Exact gfx1100 QSA scorer: measured prefill benefit, opt-in only | 7 |
 | [2026-10-11-rtx-5090-callback-affinity](2026-10-11-rtx-5090-callback-affinity/) | RTX 5090: adaptive-overlap callback affinity (#1975) | 1 |
 | [2026-10-12-community-gfx1103](2026-10-12-community-gfx1103/) | Radeon 780M (gfx1103) on ROCm 10.1: dot4 + WMMA + a hipBLASLt table (2026-10-12) | 23 |
+| [2026-10-12-community-rtx-4080-qwen3-8-flash-next-q2-0](2026-10-12-community-rtx-4080-qwen3-8-flash-next-q2-0/) | Community benchmark on NVIDIA GeForce RTX 4080 | 3 |
+| [2026-10-12-community-rtx-4080-qwen3-8-flash-next-q2-0-2](2026-10-12-community-rtx-4080-qwen3-8-flash-next-q2-0-2/) | Community benchmark on NVIDIA GeForce RTX 4080 | 3 |
 | [2026-10-12-hc-persist-gfx1030](2026-10-12-hc-persist-gfx1030/) | STRATA_HC_PERSIST=1: the verifier's hyper-connection read as one persistent kernel (gfx1030) | 2 |
 | [2026-10-12-p40-sm61-kernels](2026-10-12-p40-sm61-kernels/) | Tesla P40 (sm_61): wide dequantization, the dense GEMMs as cublasSgemm (opt-in), expert mode 8 and a matvec table (2026-10-12) | 16 |
+| [2026-10-14-community-rtx-4080-swift-iq2-xs](2026-10-14-community-rtx-4080-swift-iq2-xs/) | Community benchmark on NVIDIA GeForce RTX 4080 | 3 |
+| [2026-10-18-community-rtx-4080-swift-iq2-xs](2026-10-18-community-rtx-4080-swift-iq2-xs/) | Community benchmark on NVIDIA GeForce RTX 4080 | 3 |
 | [2026-10-20-0.2.1-bench](2026-10-20-0.2.1-bench/) | First real strata bench run on the released 0.2.1 (terminal 0.2.1, engine 0.1.46 cuda12 Linux packages) | 43 |
 | [2026-10-20-0.2.1-idle-gpu](2026-10-20-0.2.1-idle-gpu/) | The idle GPUs (proposal 2507-0): what the existing switches do on NVIDIA | 15 |
+| [2026-10-22-ab-pp0.0](2026-10-22-ab-pp0.0/) | (no Markdown page) | 2 |
+| [2026-10-22-ab-pp0.5](2026-10-22-ab-pp0.5/) | (no Markdown page) | 2 |
+| [2026-10-22-community-rtx-4080-swift-iq2-xs](2026-10-22-community-rtx-4080-swift-iq2-xs/) | Community benchmark on NVIDIA GeForce RTX 4080 | 2 |
+| [2026-10-22-cuda-cuda12](2026-10-22-cuda-cuda12/) | (no Markdown page) | 2 |
+| [2026-10-22-cuda-cuda13](2026-10-22-cuda-cuda13/) | (no Markdown page) | 2 |
+| [2026-10-27-community-rtx-4080-swift-iq2-xs](2026-10-27-community-rtx-4080-swift-iq2-xs/) | Community benchmark on NVIDIA GeForce RTX 4080 | 2 |
+| [2026-10-27-standard-e50](2026-10-27-standard-e50/) | Strata standard benchmark: NVIDIA GeForce RTX 4080 | 8 |
+| [2026-10-27-standard-e52](2026-10-27-standard-e52/) | Strata standard benchmark: NVIDIA GeForce RTX 4080 | 8 |
 | [2026-10-31-standard-rtx-4080-4e360c35](2026-10-31-standard-rtx-4080-4e360c35/) | Strata standard benchmark: NVIDIA GeForce RTX 4080 | 7 |
 | [2026-10-31-standard-rtx-4080-521a8fee](2026-10-31-standard-rtx-4080-521a8fee/) | Strata standard benchmark: NVIDIA GeForce RTX 4080 | 7 |
 | [2026-10-31-standard-rtx-4080-cbc1a827](2026-10-31-standard-rtx-4080-cbc1a827/) | Strata standard benchmark: NVIDIA GeForce RTX 4080 | 7 |
@@ -168,6 +180,7 @@ This page is built by `python tools/bench_results_index.py` (`--check` fails whe
 
 | Folder | What | Files |
 | --- | --- | ---: |
+| [2026-11-01-ab-maxram](2026-11-01-ab-maxram/) | A/B: release 0.1.55 vs fork 0.1.55-local, preset IQ2_XS max_ram | 184 |
 | [2026-11-14-rdna2-pcie-auto](2026-11-14-rdna2-pcie-auto/) | PcieAuto on gfx103x: the decode miss split from the CPU pool's speed (#4007) | 3 |
 | [2026-11-20-q36-kv-precision](2026-11-20-q36-kv-precision/) | q36 --kv fp32/fp16/fp8/fp4 — memory width for the K/V cache | 1 |
 

@@ -1,0 +1,1 @@
+export PATH="/cygdrive/c/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v13.4/bin/x64:$PATH"
