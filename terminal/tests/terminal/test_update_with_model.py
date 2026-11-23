@@ -53,6 +53,11 @@ def free_port() -> int:
 class ModelCase(UpdaterCase):
     def setUp(self):
         super().setUp()
+        # this checkout takes the engine from the feed only when asked (`--engine`, or STRATA_ENGINE_FROM_FEED=1), so the engine
+        # steps these tests read about are asked for here; `test_the_engine_step_is_skipped_by_default` in test_updater.py covers the default path.
+        patch = mock.patch.dict(os.environ, {"STRATA_ENGINE_FROM_FEED": "1"})
+        patch.start()
+        self.addCleanup(patch.stop)
         self.install_current("0.1.45")
         self.lines: list[str] = []
         self.events: list[dict] = []
