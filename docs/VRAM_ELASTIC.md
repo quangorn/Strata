@@ -1,7 +1,7 @@
-# POST /v1/vram: what it does and what it answers (opt-in, one NVIDIA GPU, #533, #1034)
+# POST /v1/vram: what it does and what it answers (opt-in; NVIDIA, across a layer split per card or one device; #533, #1034)
 
-This page is written from `serve/server.py` and the engine's `VRAM` command (`src/program/generate.cpp`,
-`src/core/expert_cache.cpp`), and the cases the unit tests in `serve/test_vram.py` pin. A line marked **(code)** is
+This page is written from `terminal/serve/server.py` and the engine's `VRAM` command (`engine/src/program/generate.cpp`,
+`engine/src/core/expert_cache.cpp`), and the cases the unit tests in `terminal/serve/test_vram.py` pin. A line marked **(code)** is
 read from the code and has no test of its own; treat it as a statement of intent, not a promise from a measurement.
 The measurements are in [DETAILS.md](DETAILS.md) (RTX 5070, Q2_0).
 
@@ -14,9 +14,10 @@ them again when more is free. Nothing resizes on its own. Only the expert cache 
 MTP head, the CUDA context and the prompt buffers stay, so Strata never gives back "everything".
 
 The engine switches the feature off at start, with one line in its log (`--vram-elastic is off: ...`), when it is not
-a `--serve` engine, with a layer split, with helper caches on other GPUs, with a segment below 64 MiB, and on HIP
-(NVIDIA only). If the driver offers no virtual memory management the start fails with an error naming it **(code)**.
-Without the flag nothing changes: the same answers as without it.
+a `--serve` engine, with helper caches on other GPUs (`--peer-device`, an expert-profile tier), with a segment below 64 MiB, and on HIP
+(NVIDIA only). If the driver offers no virtual memory management the cache is one block and the engine starts all the same
+(`--vram-elastic is off: the driver or this GPU offers no virtual memory management`) **(code; not run on such a driver)**.
+Without the flag nothing changes: the same answers as without it. Across a `--layer-split` each card keeps its own segmented cache, so by default one call keeps the reserve on every card at once; pass a `"device"` to free just that CUDA device and leave the others with their full expert cache.
 
 ## The request
 
@@ -24,6 +25,7 @@ Without the flag nothing changes: the same answers as without it.
 POST /v1/vram
 Content-Type: application/json          (anything else: 415)
 {"reserve_mib": 8000}                    (a whole number of MiB, 0 or more; null = the reserve the engine started with)
+{"reserve_mib": 4096, "device": 1}       (free only CUDA device 1; every other card keeps its full expert cache)
 ```
 
 - The server's API key applies as for the other `/v1` routes. A request that carries a foreign `Origin` is refused
@@ -31,13 +33,15 @@ Content-Type: application/json          (anything else: 415)
 - `reserve_mib` is the free VRAM you want left on the card after the call (it counts what any program holds, not only
   Strata). Below 0, a string, a boolean or a fraction: 400.
 - `null` and `0` are the grow-back requests: `null` keeps the `--vram-reserve-mib` the engine started with, `0` keeps
-  nothing free on purpose.
+  nothing free on purpose. With a layer split these apply to every card; add `"device"` to aim one call at that device only.
+- `device` is an optional CUDA index (the engine's grammar is `VRAM <reserve_mib> [dev]`, reserve first). It needs an explicit
+  `reserve_mib` (`device` with a null reserve: 400); below 0, a string or a boolean: 400. Absent means every card. On one GPU it is the only card (and so optional).
 
 ## What comes back
 
 | Case | Status | Body |
 |---|---|---|
-| Done (or nothing to do) | 200 | `{"status": "ok", "reserve_mib", "expert_slots", "expert_slots_full", "expert_cache_mib", "expert_cache_full_mib", "vram_free_mib", "prompt_chunk"}` |
+| Done (or nothing to do) | 200 | `{"status": "ok", "reserve_mib", "expert_slots", "expert_slots_full", "expert_cache_mib", "expert_cache_full_mib", "vram_free_mib", "prompt_chunk"}` plus a `"per_device"` map (`"<cuda index>": {"mapped_mib", "free_mib"}`, every card after the call) and, when one device was named, `"device"` and `"vram_free_on_device_mib"` |
 | The model is unloaded | 200 | `{"status": "not loaded", "reserve_mib": N, "note": "applied when the model loads"}` |
 | Bad `reserve_mib` | 400 | `invalid_request_error` |
 | The engine refuses the command | 400 | `invalid_request_error`, the engine's reason in `message`. The engine stays up. |
@@ -107,24 +111,42 @@ expert outside the cache), but I have not run a fault-injection test of these tw
 
 ## The image encoder on demand
 
-With `"elastic": true` in the config's `"vision"` section (and `"vram_elastic": true`; without it the server says so
-and starts the encoder with the model, as before) the GPU encoder is not started with the server or with a load:
+On an NVIDIA card with one GPU the GPU picture reader is on demand **by default** (since 0.2.9): it is not started with the server or with a
+load, the first picture starts it (1.2-1.4 s on an RTX A6000, 1,342 MiB of VRAM), and `"elastic_idle_s"` (default 120) without a picture stops
+it, so between pictures it holds no VRAM. Its room comes from the reserve (`--vram-reserve-mib`; setup's 700 for a GPU reader becomes 2048, a
+number the person or the app chose is kept). A start that finds no room (the reserve used by another program, the card busy, the reader not
+starting) is read by the CPU reader, which is the same program without `--gpu`, with the same picture tokens; the next start tries the card again.
+`"elastic": false` in the config's `"vision"` section keeps the reader on the card as before; `"elastic": true` asks for it on any card the
+reader runs on. Intel and a Mac keep their readers as they were (not measured there). AMD works the same way (the HIP reader, with the CPU reader beside it) but is
+off by default: there is no shrinking expert cache on HIP, so the reader's room stays in the reserve and the experts get nothing back (Radeon AI PRO R9700, Qwen
+UD-Q4_K_XL: 7,959 slots on demand, 7,943 with the reader on the card, 8,411 with the CPU reader), and the first picture after a start takes 5 s longer (the HIP reader starts
+in 4.9 s, 1,480 MiB). It releases its VRAM when idle (30,585 to 32,098 MiB while it runs, back to 30,618 after 120 s). `"elastic": true` in the vision section asks for it. Not by default with a layer split, batch slots,
+`--kv-grow` or `--peer-device`.
+
+With `"vram_elastic": true` as well (opt-in) the expert cache gives the room instead of the reserve:
 
 - **A picture's turn** (the same FIFO turn an encode always takes): if the encoder is not running, the engine's
-  `VRAM` command first keeps `"elastic_mib"` (default 2048) free on top of the reserve - the last `POST /v1/vram`, or 0
+  `VRAM` command first keeps `"elastic_mib"` free (when it is not set: 2,048 MiB at the default picture limit of 1,024 tokens; from a limit of about 4,700 tokens up, what the reader is estimated to need at that limit, for example 3,674 MiB at 16,384 or with no limit (0)) on top of the reserve - the last `POST /v1/vram`, or 0
   when none was made - and then the encoder starts. If the cache cannot shrink (the resident low-RAM mode, an engine
-  without `--vram-elastic`, a layer split) it starts anyway, as a non-elastic encoder would, and the log says why; on a
-  layer split the server says at start that the encoder's VRAM has to be kept free with `--vram-reserve-mib`. An
-  encoder that fails to start (out of VRAM) ends the request with a `503`; the next picture tries again.
+  without `--vram-elastic`, a layer split) the encoder starts in the VRAM that is free, if that is 1,536 MiB or more, and the CPU reader reads
+  the picture if it is not; the log says why. On a layer split the server says at start that the encoder's VRAM has to be kept free
+  with `--vram-reserve-mib`. An encoder that fails to start with no CPU reader to take over ends the request with a `503`; the next picture tries again.
 - **Idle** for `"elastic_idle_s"` (default 120) without a picture: a thread stops the encoder between requests and
   sends `VRAM` with that reserve again, so the cache grows back to the size it had (0, not the start's reserve: that
   would leave it a segment or more smaller).
+- **A CPU reader that took over** needs no VRAM: the cache grows back at once.
+- **A CPU reader by choice** (no `"gpu"` in the vision section) needs none either: it just starts, without the `VRAM` command.
 - **`POST /v1/vram` while the encoder runs** keeps the asked reserve on top of the encoder's share; the encoder's stop
   then goes back to the asked reserve.
-- An unload of the model stops the encoder too. The log lines start with `[strata] images:` **(code; the unit tests in
-  `serve/test_vision_elastic.py` pin each case)**.
+- An unload of the model stops the encoder too. A picture that was encoded before (a conversation sends its pictures with every turn)
+  starts no reader. The log lines start with `[strata] images:` **(code; the unit tests in `terminal/serve/test_vision_elastic.py` pin each case)**.
 
 `--vram-elastic` turns `--kv-grow` off (the engine says so at start): with both asked, the whole K/V is in VRAM.
+
+Measured (RTX A6000 as a 24 GB card, reserve 25,264 MiB, Qwen3.8-Flash-Next IQ3_S, 8K context, 5 interleaved pairs, median of 6 x 200 tokens per
+start): reader on the card 8,079 expert slots and 99.7-102.9 tok/s; on demand with the shrinking cache 8,766 slots and 96.8-99.8 tok/s (slower in
+4 pairs of 5, median ratio 0.978), so the shrinking cache is not the default. On demand inside a 2,048 MiB reserve (the default): 20,623 slots against
+20,627 with the reader on the card (48 GB card), VRAM in use between pictures 1,350 MiB lower.
 
 ## What to build on
 
