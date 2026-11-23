@@ -6,7 +6,7 @@
 #   2. <root>\python\python.exe            the private runtime shipped in the terminal archive
 #   3. <root>\.venv\Scripts\python.exe     a source checkout set up by SETUP.bat
 #   4. py -3 / python on PATH, 3.10+       a developer convenience, never a requirement
-# Run it with:  powershell -NoProfile -ExecutionPolicy Bypass -File terminal\bin\strata-direct.ps1 ...
+# Run it with:  powershell -NoProfile -ExecutionPolicy Bypass -File bin\strata-direct.ps1 ...
 # A symlinked copy of this launcher (a fork keeps its launcher in its checkout and links it into the terminal's bin) reads
 # `strata-root.txt` from this folder: one line naming the root whose strata.py to run, because PowerShell looks for strata.py
 # next to the link, not next to what the link points at.
