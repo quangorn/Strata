@@ -286,7 +286,7 @@ class EngineIsFreshEnough(unittest.TestCase):
             with mock.patch.object(ec, "status", return_value=before), mock.patch.object(Runner, "_spawn", return_value=proc):
                 r.ensure_engine()
             self.assertTrue(any(level == "warn" and "older than this model needs" in text for level, text in events), events)
-            self.assertTrue(any("packaging/build_engine_win_local.py" in n for n in r.notices), r.notices)
+            self.assertTrue(any("tools/packaging/build_engine_win_local.py" in n for n in r.notices), r.notices)
             self.assertFalse(any("strata update" in n for n in r.notices), r.notices)
 
 

@@ -766,11 +766,11 @@ def _serving_or_empty(ctx: Context) -> list[dict]:
 
 def engine_skipped(ctx: Context) -> dict:
     """The engine section when the engine is not this install's to get: this fork builds its engine in the checkout
-    (`packaging/build_engine_win_local.py`), so no engine package is read from the feed and none is downloaded. It also keeps
-    a local package out of the feed's version rules, which read only digits (a package built here names itself 0.1.45-local)."""
+    (`tools/packaging/build_engine_win_local.py`), so no engine package is read from the feed and none is downloaded. It also keeps
+    a local package out of the feed's version rules, which read only digits (a package built here names itself 0.1.66-local)."""
     return {"installed": None, "offered": None, "reasons": [], "status": "skipped",
             "note": "the engine is not taken from the feed on this PC: it is built in the checkout "
-                    "(packaging/build_engine_win_local.py writes its package into the component folder). "
+                    "(tools/packaging/build_engine_win_local.py writes its package into the component folder). "
                     "Run with STRATA_ENGINE_FROM_FEED=1 to fetch one from the feed.",
             "download_bytes": 0, "previous": State(ctx.components).section("engine").get("previous"),
             "pinned": State(ctx.components).section("engine").get("pinned"), "problem": None}

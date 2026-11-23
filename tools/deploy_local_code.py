@@ -2,15 +2,18 @@
 """Copy this checkout's own Python changes into the Control component that runs on this PC.
 
 This PC takes everything from upstream as binaries, and this checkout owns two things: the engine and the picture reader,
-built by `packaging/build_engine_win_local.py`, and the Python of the launch and update scripts, patched here. A model serves
-as `components\\control\\<version>\\python\\python.exe -m serve.server`, so the patched files have to be in the Control folder
-that is active. The terminal is NOT touched: the terminal `strata` on this PC (terminal/current, an upstream release) has a
+built by `tools/packaging/build_engine_win_local.py`, and the Python of the launch and update scripts, patched here. A model
+serves as `components\\control\\<version>\\python\\python.exe -m serve.server`, so the patched files have to be in the
+Control folder that is active. The Control bundle is flat: `strata_cli`, `strata_control` and `serve` sit at its root, while
+upstream keeps them under `terminal/` in the repository, so the copy strips that first path part. The terminal is NOT
+touched: the terminal `strata` on this PC (terminal/current, an upstream release) has a
 code base far older than this checkout, and putting files from a newer code base into an older install folder mixes two
 versions of the same modules. The launch runs from this checkout instead: `bin\\strata.ps1` (or `bin\\strata.cmd`) uses its
 `.venv`, and the same launcher upstream ships.
 
 The files copied are the ones this checkout changed against upstream (`git diff --name-only upstream/main HEAD`, plus the
-files that are edited and not committed), limited to `strata.py`, `setup.py`, `strata_cli/`, `strata_control/` and `serve/`.
+files that are edited and not committed), limited to `terminal/strata.py`, `terminal/setup.py`, `terminal/strata_cli/`,
+`terminal/strata_control/` and `terminal/serve/`.
 Nothing else of the install is touched and nothing is downloaded. A Control folder's files are not hashed on a start
 (`components/control/active.json` records the archive's SHA-256), so the copy is not refused; an engine package's files are
 checked by SHA-256 against their manifest (`strata_control/engine_component.py`), which is why the engine reaches this PC
@@ -35,7 +38,9 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 
-#: the parts of a Strata install this checkout owns: the CLI, the control library, the server and the two entry scripts
+#: the parts of a Strata install this checkout owns: the CLI, the control library, the server and the two entry scripts.
+#: Upstream keeps them under `terminal/`; the Control bundle is flat, so `terminal/` is stripped on the way in.
+TERMINAL = "terminal"
 PARTS = ("strata_cli", "strata_control", "serve")
 LOOSE = ("strata.py", "setup.py")
 SKIP = ("__pycache__", ".pytest_cache", ".venv")
@@ -74,25 +79,29 @@ def git(*args) -> list[str]:
         return []
 
 
-def owned() -> list[Path]:
-    """The files this checkout owns as paths relative to its root: the ones it changed against upstream, the ones edited
-    and not committed, and the new ones it added. Only the parts of an install it owns are kept."""
+def owned() -> list[tuple[Path, Path]]:
+    """The files this checkout owns as (source, install) paths: the ones it changed against upstream, the ones edited
+    and not committed, and the new ones it added. Only the parts of an install it owns are kept; the `terminal/` prefix
+    upstream uses is dropped, because the Control bundle is flat."""
     names = set(git("diff", "--name-only", "upstream/main", "HEAD"))            # committed fork changes
     names |= set(git("diff", "--name-only"))                                     # edited, not committed
     names |= set(git("ls-files", "--others", "--exclude-standard"))              # added, not tracked
     found = []
     for name in sorted(names):
         rel = Path(name.replace("\\", "/"))
-        if not rel.parts:
+        if len(rel.parts) < 2 or rel.parts[0] != TERMINAL:
             continue
-        top = rel.parts[0]
-        if top not in PARTS and rel.as_posix() not in LOOSE:
+        install = Path(*rel.parts[1:])                                           # the Control bundle's own path
+        if not install.parts:
             continue
-        if any(part in rel.parts for part in SKIP):
+        top = install.parts[0]
+        if top not in PARTS and install.as_posix() not in LOOSE:
+            continue
+        if any(part in install.parts for part in SKIP):
             continue
         if not (ROOT / rel).is_file():
             continue
-        found.append(rel)
+        found.append((rel, install))
     return found
 
 
@@ -121,19 +130,19 @@ def main(argv=None) -> int:
     copied = 0
     for label, folder in found:
         print(f"{label}: {folder}")
-        for rel in src:
+        for rel, install in src:
             s = ROOT / rel
-            t = folder / rel
+            t = folder / install
             existed = t.is_file()
             if existed and digest(s) == digest(t):
                 continue
             if step == "plan":
-                print(f"  {'new' if not existed else 'patched'}  {rel}")
+                print(f"  {'new' if not existed else 'patched'}  {install}")
                 copied += 1
                 continue
             t.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(s, t)
-            print(f"  {'added' if not existed else 'updated'}  {rel}")
+            print(f"  {'added' if not existed else 'updated'}  {install}")
             copied += 1
         if step == "deploy":
             for part in PARTS:                                     # stale byte-code under the copied modules is dropped

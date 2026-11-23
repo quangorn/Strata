@@ -1,5 +1,5 @@
 """`strata launch` settles the engine before it touches the model, and never downloads one: this fork builds its engine in the checkout
-(`packaging/build_engine_win_local.py`), so the start takes the engine package that is installed and says in plain words when it is old,
+(`tools/packaging/build_engine_win_local.py`), so the start takes the engine package that is installed and says in plain words when it is old,
 or when there is none. With no usable engine it does NOT refuse (the owner decision of 2026-10-18, kept): it warns (the reason from
 `engine_component.status`, and the next step), asks whether to download the model anyway (the answer is yes unless the person says no;
 --yes skips the question), downloads, and ends with a message that names the engine problem and the next step, exit code 0.
@@ -83,7 +83,7 @@ class EngineBeforeModel(unittest.TestCase):
         self.assertIn("Strata couldn't find an engine for this computer", warning)
         self.assertIn("The model will download, but it may not run until you install the right engine (next step:", warning)
         self.assertIn(NO_ENGINE_STEP, warning)
-        self.assertIn("packaging/build_engine_win_local.py", NO_ENGINE_STEP)
+        self.assertIn("tools/packaging/build_engine_win_local.py", NO_ENGINE_STEP)
         self.assertNotIn("The app never downloads", warning)          # not the generic line
 
     def test_the_generic_missing_package_line_is_said_plainly(self):

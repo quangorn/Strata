@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Stamp the BUILD.json of a local engine build in a source checkout (packaging/build_engine_win_local.py).
+"""Stamp the BUILD.json of a local engine build in a source checkout (tools/packaging/build_engine_win_local.py).
 
-    python packaging/stamp_local_build.py <stage>/BUILD.json --version 0.1.55 --archs 89 --cuda-root "C:/.../CUDA/v13.4"
+    python tools/packaging/stamp_local_build.py <stage>/BUILD.json --version 0.1.66 --archs 89 --cuda-root "C:/.../CUDA/v13.4"
 
 Writes the fields setup.py's own stamp writes for a compiled engine (`source`, `version`, `archs`, `cuda_dirs`) plus
 the toolkit, so `package_engine.py` has a record to ship beside the binary. `vision_archs` is written by

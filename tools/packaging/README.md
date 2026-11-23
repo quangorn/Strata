@@ -40,16 +40,16 @@ The Python contracts, the owner transport, the checks and the engine build recip
 
 ## A local Windows CUDA engine (this PC)
 
-`packaging/build_engine_win_local.py` builds the CUDA engine from this checkout on this PC and puts it in the per-user component
+`tools/packaging/build_engine_win_local.py` builds the CUDA engine from this checkout on this PC and puts it in the per-user component
 folder. It is the quick way to try a branch or a fix on a real model: nothing is downloaded or uploaded, and the build is kept
 between runs, so a second run after a source edit recompiles only what changed.
 
 ```sh
-/usr/bin/python3 packaging/build_engine_win_local.py plan     # show paths, archs and versions; build nothing
-/usr/bin/python3 packaging/build_engine_win_local.py engine   # strata.exe and strata_kq.dll only
-/usr/bin/python3 packaging/build_engine_win_local.py vision   # only the picture reader, into the last build
-/usr/bin/python3 packaging/build_engine_win_local.py package  # only the package from the last build
-/usr/bin/python3 packaging/build_engine_win_local.py          # all three: engine, picture reader, package
+/usr/bin/python3 tools/packaging/build_engine_win_local.py plan     # show paths, archs and versions; build nothing
+/usr/bin/python3 tools/packaging/build_engine_win_local.py engine   # strata.exe and strata_kq.dll only
+/usr/bin/python3 tools/packaging/build_engine_win_local.py vision   # only the picture reader, into the last build
+/usr/bin/python3 tools/packaging/build_engine_win_local.py package  # only the package from the last build
+/usr/bin/python3 tools/packaging/build_engine_win_local.py          # all three: engine, picture reader, package
 ```
 
 Run it in cygwin bash with cygwin's `/usr/bin/python3`. In cmd or PowerShell the checkout's own
@@ -70,7 +70,7 @@ Settings are environment variables, all optional:
 | `BUILD_DIR` | `build-c13-win` | the build folder, kept between runs |
 | `STAGE` | `<build>/stage` | where `strata.exe`, `strata_kq.dll` and `BUILD.json` are staged |
 | `OUT` | `%LOCALAPPDATA%\Strata\components\engine` | where the package is written |
-| `VERSION_SUFFIX` | `-local` | the suffix the engine prints (`strata 0.1.55-local`); empty reports the release version |
+| `VERSION_SUFFIX` | `-local` | the suffix the engine prints (`strata 0.1.66-local`); empty reports the release version |
 | `STRATA_PORTABLE` | `OFF` | `ON` builds for other PCs (AVX2 floor, static MSVC runtime) |
 | `STRATA_ISA_FLOOR` | AVX2 | `avx` or `none` for a CPU without AVX2 |
 | `EXTRA_FLAGS` | empty | more Release flags for C, C++ and nvcc |
@@ -82,18 +82,18 @@ To test a branch without touching the installed component, point the build, stag
 ```sh
 BUILD_DIR=/cygdrive/c/Projects/Strata-fork/build-c13-win \
 STAGE='D:\tmp\my-branch\stage' OUT='D:\tmp\my-branch\out' VERSION_SUFFIX=-mybranch \
-  /usr/bin/python3 packaging/build_engine_win_local.py engine
+  /usr/bin/python3 tools/packaging/build_engine_win_local.py engine
 ```
 
 The script removes `strata.exe` before the relink, so a binary left from an older commit cannot pass for the new build, and it
 runs the new `strata.exe --version` before staging. A run config can then name that binary directly in `"exe"`; the installed
 `component:strata-engine` package is not rebuilt unless `package` (or the default `all`) writes into `OUT`. The script needs a
-Windows PC with an NVIDIA card; Linux builds use `packaging/build_cuda_linux.sh`, and the Mac uses `packaging/build_vision_mac.sh`.
+Windows PC with an NVIDIA card; Linux builds use `tools/packaging/build_cuda_linux.sh`, and the Mac uses `tools/packaging/build_vision_mac.sh`.
 
 ### Updating this PC (the fork's own routine)
 
 The engine and the picture reader are built here; everything else comes from upstream as binaries, so nothing on this PC
-downloads an engine, and an engine is never fetched by `strata launch` (`strata_cli/launch/runner.py` reads the component
+downloads an engine, and an engine is never fetched by `strata launch` (`terminal/strata_cli/launch/runner.py` reads the component
 folder and says in plain words when the package there is older than a model needs; the next step is to rebuild it here).
 `strata update` takes Control from the signed feed and skips the engine, which is the default in this checkout
 (`STRATA_ENGINE_FROM_FEED=1` asks for an engine package from the feed, and `--engine` says the same for one run).
@@ -104,8 +104,8 @@ strata launch --stop                     # 2. a serving engine holds strata.exe 
 strata update                            # 3. Control from the feed; the engine step is off
 python tools/deploy_local_code.py        # 4. this checkout's own Python changes into components/control/<active>: the folder that
                                          #    runs the server. The terminal is not touched: its upstream release is an older code
-                                         #    base, and the launch runs from this checkout (`bin\strata.ps1` with its `.venv`)
-python3 packaging/build_engine_win_local.py   # 5. engine, picture reader, package 0.1.55-local-windows-x86_64-cuda-cuda13. The cygwin
+                                         #    base, and the launch runs from this checkout (`bin\strata.ps1` with its `.venv`, which forwards to `terminalin`)
+python3 tools/packaging/build_engine_win_local.py   # 5. engine, picture reader, package 0.1.66-local-windows-x86_64-cuda-cuda13. The cygwin
                                          #    interpreter: the script turns Windows paths into /cygdrive/c/..., which a Windows
                                          #    interpreter cannot open. `tools/rebuild_engine.sh` is this routine in one file.
 strata launch --preset iq2_xs-low_ram    # 6. the engine is the newest package, the reader ships in its folder
@@ -113,11 +113,13 @@ strata launch --preset iq2_xs-low_ram    # 6. the engine is the newest package, 
 
 `tools/deploy_local_code.py plan` lists the files that differ without writing them. The set it copies is what git says this
 checkout changed against upstream (`git diff --name-only upstream/main HEAD`, plus the files edited and not committed), limited
-to `strata.py`, `setup.py`, `strata_cli/`, `strata_control/` and `serve/`: four files today. Run step 4 after every Control
+to `terminal/strata.py`, `terminal/setup.py`, `terminal/strata_cli/`, `terminal/strata_control/` and
+`terminal/serve/` (the copy strips the `terminal/` prefix, because the Control bundle is flat): three files today
+(`runner.py`, `update_cmd.py`, `updater.py`). Run step 4 after every Control
 update: a new Control version arrives as a new folder, and the patched files must go in there too. A Control folder's files are
 not hashed when it starts (`components/control/active.json` records the archive's SHA-256), so copying them is not refused; an
 engine package's files are checked against their manifest on every start, which is why the engine reaches this PC only as a
-package, built here. `packaging/repack_local_portable.sh` is the same routine for the `STRATA_PORTABLE=ON` build: it stops the
+package, built here. `tools/packaging/repack_local_portable.sh` is the same routine for the `STRATA_PORTABLE=ON` build: it stops the
 model, deletes the packages this checkout built, builds and packages the portable one, and verifies it.
 
 `docs/LOCAL_FORK_CHECKS.md` lists the checks that the offline suite cannot make: each one stops the serving model and starts
@@ -126,21 +128,24 @@ it again, so they are run by hand, one at a time, when the machine is free.
 ## The launch on PATH (the fork's launcher, first entry)
 
 User PATH's **first** entry is `C:\Projects\Strata-fork\bin`, and the entry `terminal\current\bin` was removed. `strata` and
-`strata launch` therefore run this checkout's code (its `bin\strata.cmd`, `.ps1`, `strata`), not the upstream terminal's.
+`strata launch` therefore run this checkout's code. Its `bin\strata.cmd`, `bin\strata.ps1` and `bin\strata` are thin
+forwarders to the terminal's own launchers (`terminal\bin\strata.cmd`, `strata-direct.ps1`, `strata`), which upstream moved
+there: everything about Python selection and the environment lives in one place, upstream's.
 Nothing in the terminal needs to be changed, and nothing has to be re-made after an update: `packaging/install.ps1:142-148`
 is the only place Strata writes PATH, and it appends `terminal\current\bin` after what is already there, so a new terminal
 release cannot take `strata` away from this checkout. The junction `current` is moved to a new version folder by the same
 script (`install.ps1:127-129`), which is also why the terminal's bin is not the place for a fork's launcher: a symlink there
 is deleted when the same version is reinstalled (`install.ps1:122-126`) and bypassed when `current` moves, and cmd and
-PowerShell look for `strata.py` next to the link, not next to what the link points at, so the launcher needs a
-`strata-root.txt` marker in that folder (the launchers here read it, and the shell launcher follows the link itself). The
+PowerShell look for `strata.py` next to the link, not next to what the link points at, so a launcher placed there needs a
+`strata-root.txt` marker in that folder (the launchers in `terminal\bin` read it, and the shell launcher follows the link
+itself). The
 launchers upstream shipped in `terminal\current\bin` are untouched, and the copies from the 0.1.48.1 archive are kept in
 `terminal\upstream-bin-0.1.48.1`.
 
-The Python each launcher picks needs the screens' packages: the `.cmd` and `.ps1` take this checkout's `.venv` (it has
-`rich` and `textual`), and the shell launcher `bin/strata` takes a Python 3.10+ from PATH, so `rich==15.0.0` and
-`textual==8.2.8` (the pin in `requirements-monitor.txt`) are installed in the cygwin interpreter with `python3 -m pip install
---user`.
+The Python the launchers pick needs the screens' packages (`rich` and `textual`): the fork's forwarders name this checkout's
+`.venv` through `STRATA_PYTHON` (it has both), because the terminal launcher looks for `.venv` beside its own `strata.py`
+(`terminal\.venv`), not at the checkout root. Without the checkout `.venv` the terminal launcher falls back to a Python 3.10+ from
+PATH, and `rich==15.0.0` / `textual==8.2.8` (the pin in `requirements-monitor.txt`) have to be installed there.
 
 ```sh
 # the one change made, in PowerShell: the checkout's bin first, the terminal entry dropped, entries unique
@@ -150,7 +155,7 @@ powershell -NoProfile -Command "$parts=[Environment]::GetEnvironmentVariable('Pa
   [Environment]::SetEnvironmentVariable('Path', ($u -join ';'), 'User')"
 ```
 
-Check it in a new terminal window: `strata --version` must say `strata 0.2.9 (build 0.1.55; python ... C:\Projects\Strata-fork\.venv\Scripts\python.exe)`.
+Check it in a new terminal window: `strata --version` must say `strata 0.2.20 (build 0.1.66; python ... C:\Projects\Strata-fork\.venv\Scripts\python.exe)`.
 
 ## The private Node runtime
 

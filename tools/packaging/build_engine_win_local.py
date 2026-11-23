@@ -3,11 +3,11 @@
 
 Run it from cygwin bash (any Python 3.10+), or from cmd / PowerShell with the checkout's `.venv` python:
 
-    python3 packaging/build_engine_win_local.py            engine, picture reader, package
-    python3 packaging/build_engine_win_local.py plan       show what it would do (nothing is built)
-    python3 packaging/build_engine_win_local.py engine     only strata.exe + strata_kq.dll (pictures stay off)
-    python3 packaging/build_engine_win_local.py vision     only the picture reader, into the last build
-    python3 packaging/build_engine_win_local.py package    only the package from the last build
+    python3 tools/packaging/build_engine_win_local.py            engine, picture reader, package
+    python3 tools/packaging/build_engine_win_local.py plan       show what it would do (nothing is built)
+    python3 tools/packaging/build_engine_win_local.py engine     only strata.exe + strata_kq.dll (pictures stay off)
+    python3 tools/packaging/build_engine_win_local.py vision     only the picture reader, into the last build
+    python3 tools/packaging/build_engine_win_local.py package    only the package from the last build
 
 Needs Visual Studio 2022 Build Tools with the C++ workload, and a CUDA Toolkit (13.4 on this PC). Nothing is
 downloaded, nothing is uploaded, and nothing in the release path is changed.
@@ -16,7 +16,7 @@ Settings are environment variables, all optional:
 
     ARCHS          CUDA architectures, semicolons. Default 89 (RTX 4080); the release cuda13 list is 75;86;89;120
     BUILD_JOBS     compile jobs (default 24). A 24-job build of this tree on this PC (48 GB RAM) needed at most
-                   4 GB, so the default is fine here; `packaging/build_vision_windows.bat:17` uses 4 for the reason
+                   4 GB, so the default is fine here; `tools/packaging/build_vision_windows.bat:17` uses 4 for the reason
                    it names ("the CUDA compiler uses RAM"), and I have not measured what one nvcc job needs on a
                    smaller machine. Drop this if the PC starts paging: BUILD_JOBS=8 is enough to keep 24 cores busy
                    on the C++ side
@@ -24,55 +24,59 @@ Settings are environment variables, all optional:
     STRATA_VCVARS  a vcvars64.bat that vswhere cannot find (setup.py reads the same name)
     VCVARS_VER     an MSVC toolset to pick, e.g. 14.42 (`vcvars64.bat -vcvars_ver=...`). CUDA checks the MSVC
                    version in crt/host_config.h: CUDA 13.4 accepts _MSC_VER below 1960, so this PC's newest
-                   toolset (14.44.35207, _MSC_VER 1944) needs nothing. Measured 2026-11-02: all 169 CUDA and C++
+                   toolset (14.44.35207, _MSC_VER 1944) needs nothing. Measured 2026-11-02 (0.1.55 tree): all 169 CUDA and C++
                    targets compiled with it. Set this only when a toolkit rejects the toolset (CUDA 13.0 refused
                    1944, which is where this knob comes from).
     MIN_DRIVER     the driver the package is recorded for (default this PC's, from nvidia-smi; the release
                    value 580.65 is CUDA 13.0's, so do not use it for a build of a newer toolkit)
-    VERSION        default the version in CMakeLists.txt. A build number goes here (`VERSION=0.1.55.1`): it names
+    VERSION        default the version in engine/CMakeLists.txt. A build number goes here (`VERSION=0.1.66.1`): it names
                    the package folder and the manifest only. Do NOT bump the engine's own version string
                    (CMakeLists `project(VERSION)`): `engine_version` is part of the conversation identity
-                   (`src/program/generate.cpp:10507`, `src/core/conversation_file.cpp:880`), and a start deletes
+                   (`engine/src/program/generate.cpp:10507`, `engine/src/core/conversation_file.cpp:880`), and a start deletes
                    every disk index whose identity differs (`src/core/conversation_disk.cpp:210-211, 247-248`).
                    Measured 2026-11-02: bumping `project(VERSION)` to 0.1.55.1 emptied the disk store.
     VERSION_SUFFIX the suffix the engine adds to its own version string (default `-local`), so a forked build names
-                   itself `strata 0.1.55-local` and its INFO line reads `engine=0.1.55-local`; the web monitor shows
-                   that (`serve/server.py:1156-1158` takes the engine's INFO line over the manifest, and
-                   `serve/web/app.js:575` prints `v<version>`). Set it empty for a binary that reports exactly the
-                   release's `0.1.55`; BUILD.json and the package manifest keep a plain numeric version
+                   itself `strata <version>-local` and its INFO line reads `engine=<version>-local`; the web monitor shows
+                   that (`terminal/serve/server.py` takes the engine's INFO line over the manifest, and
+                   `terminal/serve/web/app.js` prints `v<version>`). Set it empty for a binary that reports exactly the
+                   release's version; BUILD.json and the package manifest keep a plain numeric version
     BUILD_DIR / VISION_BUILD_DIR / STAGE / OUT (default %LOCALAPPDATA%\\Strata\\components\\engine)
                    the build folders are kept between runs: `cmake --build` recompiles only what changed, so a run
-                   after a source edit costs the changed files, not all 169 CUDA and C++ targets. Only `strata.exe`
-                   is removed before the relink (`packaging/build_engine_win_local.py:277`), and a cmake reconfigure
+                   after a source edit costs the changed files, not all 144 CUDA and C++ targets (0.1.66, measured 2026-11-23). Only `strata.exe`
+                   is removed before the relink (`tools/packaging/build_engine_win_local.py:277`), and a cmake reconfigure
                    on the same folder keeps the object files. Delete a build folder when its generator or its cached
                    flags change, as setup.py does (`setup.py:5786` `fresh_if_other_generator`)
     STRATA_PORTABLE  ON builds for other PCs (AVX2 floor, static MSVC runtime); default OFF: this PC
     EXTRA_FLAGS      more compiler flags for the Release build, appended to C, C++ and nvcc. Default empty
 
 Optimization: the build is `CMAKE_BUILD_TYPE=Release`, which is what the release recipes use
-(`packaging/build_cuda_linux.sh:34`): MSVC gets its Release flags (`/O2 /Ob2 /DNDEBUG`, plus `/Zi` and
-`/OPT:REF /OPT:ICF` for the PDB, `CMakeLists.txt:31`), nvcc its default `-O2`, and ggml-cpu is built for this CPU
+(`tools/packaging/build_cuda_linux.sh:34`): MSVC gets its Release flags (`/O2 /Ob2 /DNDEBUG`, plus `/Zi` and
+`/OPT:REF /OPT:ICF` for the PDB, `engine/CMakeLists.txt:31`), nvcc its default `-O2`, and ggml-cpu is built for this CPU
 (`STRATA_NATIVE_EXPERTS=ON`, `GGML_NATIVE ON`). The project's own fast-math flags are per file
-(`--use_fast_math` on the CUDA kernel files, `CMakeLists.txt:650`, and on the MMQ libraries, `CMakeLists.txt:2253`);
+(`--use_fast_math` on the CUDA kernel files, `engine/CMakeLists.txt:650`, and on the MMQ libraries, `engine/CMakeLists.txt:2253`);
 do NOT add `--use_fast_math` to EXTRA_FLAGS for the whole build: it changes rounding outside those files
-(`CMakeLists.txt:652-655` keeps Q8_K's multiply and magic-bias rounding as separate FP32 operations).
+(`engine/CMakeLists.txt:652-655` keeps Q8_K's multiply and magic-bias rounding as separate FP32 operations).
 
-CPU floor: a ready-made x86 engine needs AVX2 (`CMakeLists.txt:35-38`), and Strata's AVX-512 kernels are per file
-behind a run-time CPU check (`CMakeLists.txt:36`, `/arch:AVX512` on `iq_avx512.cpp` and `nvfp4_avx512.cpp`), so
+CPU floor: a ready-made x86 engine needs AVX2 (`engine/CMakeLists.txt:35-38`), and Strata's AVX-512 kernels are per file
+behind a run-time CPU check (`engine/CMakeLists.txt:36`, `/arch:AVX512` on `iq_avx512.cpp` and `nvfp4_avx512.cpp`), so
 building on a CPU without AVX-512 is the normal case: those kernels are compiled and never run. A CPU with no
 AVX2 needs the experimental floor `STRATA_ISA_FLOOR=avx` (Sandy/Ivy Bridge) or `none` (SSE4.2), which setup.py
 passes as `-DSTRATA_ISA_FLOOR` (`setup.py:5842`); leave it empty for AVX2.
 
 What has been run on this PC (RTX 4080 sm_89, driver 610.88, CUDA 13.4, MSVC 14.44, 48 GB RAM): the engine
-(169 ninja targets) and the picture reader (275 targets), at 24 jobs (peak RAM 4 GB) and at 8, the package
-(`package_engine.py --verify`: ok, 6 files, manifest sha256 `36d385581b5a…`), `strata components engine --full`
+(144 ninja targets on 0.1.66, 2026-11-23; 169 on 0.1.55, 2026-11-02) and the picture reader (17 targets), at 24 jobs
+(peak RAM 4 GB) and at 8, the package
+(`package_engine.py --verify`: ok, 6 files, manifest sha256 `36d385581b5a…` on 0.1.55; 10 files, manifest sha256
+`a8ed4705134187f340c4ed6293ee8bee2cdc2aaf1314430cc8edd634ca7c3a73` on 0.1.66-local, 2026-11-23),
+`strata components engine --full`
 (the local package is chosen, nothing downloaded with `STRATA_NO_ACQUIRE=1`), and `strata.exe --version` printing
-`strata 0.1.55-local`. 2026-11-02: a build of this tree with CUDA 13.4 and the newest toolset (14.44.35207)
-compiled all 169 CUDA and C++ targets, 96 executables, exit 0. Not measured: a build with `VCVARS_VER` set.
+`strata 0.1.55-local` on 0.1.55 and `strata 0.1.66-local` on 0.1.66. 2026-11-02: a build of this tree with CUDA 13.4
+and the newest toolset (14.44.35207) compiled all 169 CUDA and C++ targets, 96 executables, exit 0; 2026-11-23: the
+0.1.66 tree built 144 targets, exit 0. Not measured: a build with `VCVARS_VER` set.
 
 MSVC is used through `vcvars64.bat`: its environment is read once and given to cmake, ninja and the picture
-reader, so the build works from a cygwin shell with no "x64 Native Tools" prompt. `packaging/build_vision_windows.bat`
-is called as it is (it stamps `vision_archs` into the stage's `BUILD.json`), and `packaging/package_engine.py` runs on
+reader, so the build works from a cygwin shell with no "x64 Native Tools" prompt. `tools/packaging/build_vision_windows.bat`
+is called as it is (it stamps `vision_archs` into the stage's `BUILD.json`), and `tools/packaging/package_engine.py` runs on
 the checkout's own Windows Python, because a package check uses Windows path rules (`strata_control/longpath.py`).
 """
 
@@ -85,9 +89,9 @@ import subprocess
 import sys
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT / "packaging"))
-import stamp_local_build          # the BUILD.json stamp (packaging/stamp_local_build.py)
+ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(ROOT / "tools" / "packaging"))
+import stamp_local_build          # the BUILD.json stamp (tools/packaging/stamp_local_build.py)
 
 
 def wpath(p) -> str:
@@ -105,14 +109,18 @@ def wpath(p) -> str:
 
 def upath(p) -> str:
     """`p` as a path THIS Python opens. A cygwin Python cannot open `C:\\...` (the env values it inherits from
-    Windows are Windows paths), so every path kept in a Path goes through here; on a Windows Python nothing changes."""
+    Windows are Windows paths), so every path kept in a Path goes through here; on a Windows Python nothing changes
+    (a `cygpath` on PATH must not be used there: it would turn `C:\\...` into `/cygdrive/c/...`, which the Windows
+    Python cannot open)."""
     s = str(p)
     if re.match(r"^[A-Za-z]:[\\/]", s):
-        try:
-            got = subprocess.run(["cygpath", "-u", s], capture_output=True, text=True, timeout=20).stdout.strip()
-            return got or s.replace("\\", "/")
-        except OSError:
-            return s.replace("\\", "/")
+        if sys.platform == "cygwin":
+            try:
+                got = subprocess.run(["cygpath", "-u", s], capture_output=True, text=True, timeout=20).stdout.strip()
+                return got or s.replace("\\", "/")
+            except OSError:
+                return s.replace("\\", "/")
+        return s.replace("\\", "/")
     return s
 
 
@@ -126,6 +134,24 @@ def prog(name) -> str:
     return shutil.which(n) or n
 
 
+def posix_env(env: dict | None) -> dict | None:
+    """The environment with `PATH` in the form a Cygwin Python hands a non-Cygwin child. Cygwin converts a POSIX PATH to the
+    Windows form for that child; a Windows-form PATH passed as is comes out mangled (`C:\\...` becomes `C;E:\\...`, so
+    `cl` is not found). On a Windows Python the environment is already in the form the child reads, so nothing changes."""
+    if env is None or sys.platform != "cygwin":
+        return env
+    path = env.get("PATH")
+    if not path:
+        return env
+    out = dict(env)
+    try:
+        got = subprocess.run(["cygpath", "-p", "-u", path], capture_output=True, text=True, timeout=60).stdout.strip()
+    except OSError:
+        got = ""
+    out["PATH"] = got or path
+    return out
+
+
 def run(cmd, env=None, cwd=ROOT) -> int:
     """A command with a printed line, and its exit code. The program is launched in the form THIS Python can
     resolve (a cygwin Python needs `/cygdrive/c/...`; it does not turn arguments into Windows paths for a
@@ -136,7 +162,7 @@ def run(cmd, env=None, cwd=ROOT) -> int:
     argv = [str(c) for c in cmd]
     argv[0] = prog(argv[0])
     print("  " + " ".join(str(c) for c in cmd), flush=True)
-    return subprocess.run(argv, env=env, cwd=str(cwd) if cwd else None).returncode
+    return subprocess.run(argv, env=posix_env(env), cwd=str(cwd) if cwd else None).returncode
 
 
 def vcvars() -> Path | None:
@@ -203,8 +229,24 @@ def driver() -> str:
 
 
 def version() -> str:
-    m = re.search(r"project\(strata VERSION (\d+\.\d+(?:\.\d+)*)", (ROOT / "CMakeLists.txt").read_text(encoding="utf-8"))
-    return m.group(1) if m else "0.1.55"
+    m = re.search(r"project\(strata VERSION (\d+\.\d+(?:\.\d+)*)", (ROOT / "engine" / "CMakeLists.txt").read_text(encoding="utf-8"))
+    return m.group(1) if m else "0.1.66"
+
+
+def engine_targets(cmake: str, build: Path, env=None) -> list[str]:
+    """`['strata', 'strata_kq']` when the build tree has the `strata_kq` target (a build with the MMQ library), `['strata']`
+    when ninja names it unknown (the default since 0.2.20). The tree is asked with a dry run, the way the release's
+    `build_cuda_windows.py:engine_targets` does; any other failure stops the build. `cmake` is in the form THIS Python
+    launches, `build` is the build folder as a Path."""
+    r = subprocess.run([cmake, "--build", wpath(build), "--target", "strata_kq", "--", "-n"], capture_output=True,
+                       text=True, env=posix_env(env), errors="replace")
+    if r.returncode == 0:
+        return ["strata", "strata_kq"]
+    text = (r.stdout or "") + (r.stderr or "")
+    if "unknown target 'strata_kq'" in text or re.search(r"No rule to make target.*strata_kq", text):
+        return ["strata"]
+    print(text)
+    raise SystemExit(f"cannot tell whether the build tree {build} has the strata_kq target")
 
 
 def main(argv=None) -> int:
@@ -217,13 +259,13 @@ def main(argv=None) -> int:
     stage = Path(upath(os.environ.get("STAGE") or build_dir / "stage"))
     vision_dir = Path(upath(os.environ.get("VISION_BUILD_DIR") or ROOT / "build-vision-cuda13-win"))
     out = Path(upath(os.environ.get("OUT") or Path(os.environ.get("LOCALAPPDATA", "")) / "Strata/components/engine"))
-    # "-local" keeps the package beside the release one instead of on top of it: the release package 0.1.55 is
+    # "-local" keeps the package beside the release one instead of on top of it: the release package 0.1.66 is
     # signed and immutable, and a package step on the same version refuses to overwrite it. resolve() picks the
-    # newest version, and "0.1.55-local" is newer than "0.1.55" (strata_control/engine_component.py:252),
+    # newest version, and "0.1.66-local" is newer than "0.1.66" (strata_control/engine_component.py:252),
     # with the driver tie-break (610.88 vs 580.65) going the same way.
     ver = os.environ.get("VERSION") or (version() + "-local")
-    # the engine's own version string, compiled in (`CMakeLists.txt:27` defines STRATA_VERSION; `src/program/generate.cpp:2921`
-    # prints it for --version, and `src/program/generate.cpp:12266` writes the INFO engine= line the web monitor shows).
+    # the engine's own version string, compiled in (`engine/CMakeLists.txt:27` defines STRATA_VERSION; `engine/src/program/generate.cpp:2921`
+    # prints it for --version, and `engine/src/program/generate.cpp:12266` writes the INFO engine= line the web monitor shows).
     # The suffix marks a forked build; BUILD.json and the manifest keep the plain numeric version, because setup.py reads
     # a binary's version with a digits-only pattern (`setup.py:6824-6831`) and compares it (`setup.py:6842-6850`).
     suffix = os.environ.get("VERSION_SUFFIX", "-local")
@@ -240,7 +282,7 @@ def main(argv=None) -> int:
         print("no CUDA Toolkit: install one, or set CUDA_ROOT to its folder")
         return 1
 
-    print(f"source  : {ROOT}")
+    print(f"source  : {ROOT / 'engine'}")
     print(f"vcvars  : {wpath(v)}")
     print(f"cuda    : {wpath(root)}")
     print(f"archs   : {';'.join(str(a) for a in archs)}   jobs: {jobs}   portable: {'ON' if portable else 'OFF'}")
@@ -273,25 +315,23 @@ def main(argv=None) -> int:
         real = ";".join(f"{a}-real" for a in archs)
         # cmake wants forward slashes, and the Windows form of the path (a cygwin /cygdrive path is not one)
         cuda_fwd = wpath(root).replace("\\", "/")
-        ggml_fwd = wpath(ROOT / "third_party/llama.cpp").replace("\\", "/")
         flag_defs = [f"-DCMAKE_{which}_FLAGS_RELEASE={extra}" for which in ("C", "CXX", "CUDA")] if extra else []
-        if run([wpath(cmake), "-G", "Ninja", "-S", wpath(ROOT), "-B", wpath(build_dir),
+        if run([wpath(cmake), "-G", "Ninja", "-S", wpath(ROOT / "engine"), "-B", wpath(build_dir),
                 "-DCMAKE_MAKE_PROGRAM=" + wpath(ninja), "-DCMAKE_BUILD_TYPE=Release",
                 "-DSTRATA_ENABLE_CUDA=ON", "-DSTRATA_BUILD_TESTS=OFF", "-DSTRATA_Q6K_EXPERTS=ON",
-                "-DSTRATA_MMQ_KQUANTS=ON", "-DSTRATA_NATIVE_EXPERTS=ON", "-DSTRATA_EXPERIMENTAL_SM60=OFF",
+                "-DSTRATA_NATIVE_EXPERTS=ON", "-DSTRATA_EXPERIMENTAL_SM60=OFF",
                 f"-DSTRATA_PORTABLE={'ON' if portable else 'OFF'}", f"-DSTRATA_ISA_FLOOR={isafloor}",
                 f"-DSTRATA_VERSION_SUFFIX={suffix}",
                 *flag_defs,
                 f"-DCMAKE_CUDA_ARCHITECTURES={real};{archs[-1]}-virtual",
                 "-DCMAKE_C_COMPILER=cl", "-DCMAKE_CXX_COMPILER=cl",
                 f"-DCMAKE_CUDA_COMPILER={cuda_fwd}/bin/nvcc.exe",
-                f"-DCUDAToolkit_ROOT={cuda_fwd}",
-                f"-DSTRATA_GGML_DIR={ggml_fwd}"], env=env) != 0:
+                f"-DCUDAToolkit_ROOT={cuda_fwd}"], env=env) != 0:
             return 1
         exe = build_dir / "strata.exe"
         exe.unlink(missing_ok=True)           # a binary left from an older commit must not pass for this build
-        if run([wpath(cmake), "--build", wpath(build_dir), "--target", "strata", "--target", "strata_kq",
-                "-j", str(jobs)], env=env) != 0:
+        targets = engine_targets(prog(cmake), build_dir, env)
+        if run([wpath(cmake), "--build", wpath(build_dir), "--target", *targets, "-j", str(jobs)], env=env) != 0:
             return 1
         if not exe.exists():
             print(f"no {exe}")
@@ -309,7 +349,7 @@ def main(argv=None) -> int:
     # ---------------------------------------------------------------- picture reader
     if step in ("all", "vision"):
         env["VISION_ARCHS"] = ";".join(str(a) for a in archs)
-        bat = wpath(ROOT / "packaging/build_vision_windows.bat")
+        bat = wpath(ROOT / "tools/packaging/build_vision_windows.bat")
         if run(["cmd", "/c", bat, "cuda13", wpath(stage)], env=env) != 0:
             return 1
         if step == "vision":
@@ -317,7 +357,7 @@ def main(argv=None) -> int:
 
     # ---------------------------------------------------------------- package
     py = ROOT / ".venv/Scripts/python.exe"
-    tool = wpath(ROOT / "packaging/package_engine.py")      # a Windows Python reads the script by its own path form
+    tool = wpath(ROOT / "tools/packaging/package_engine.py")      # a Windows Python reads the script by its own path form
     args = [str(py) if py.exists() else sys.executable, tool, "--src", wpath(stage), "--backend", "cuda",
             "--platform", "windows-x86_64", "--version", ver, "--variant", "cuda13"]
     for a in archs:
@@ -325,7 +365,7 @@ def main(argv=None) -> int:
     args += ["--arch", f"compute_{archs[-1]}"]   # the PTX the build carries for newer cards (build_cuda_linux.sh:63)
     args += ["--min-driver", f"nvidia={min_driver}", "--out", wpath(out)]
     # the DLLs the engine imports must travel in the package, or a clean PC fails with 0xC0000135 (binary_deps.py,
-    # packaging/binary_deps.py:6). A local build's strata.exe imports the CUDA cuBLAS and the MSVC C++ runtime, so
+    # tools/packaging/binary_deps.py:6). A local build's strata.exe imports the CUDA cuBLAS and the MSVC C++ runtime, so
     # the packager copies them from these folders; the release recipe ships the same cuBLAS DLLs.
     crt = Path(upath(env.get("VCToolsRedistDir", ""))) / "x64/Microsoft.VC143.CRT"
     for d in (root / "bin/x64", root / "bin", crt):

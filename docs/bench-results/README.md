@@ -4,7 +4,7 @@ Raw results and short reports from measurement runs, one folder per run, named b
 the Strata version, hardware and method of its own day, and none is a statement about a later release. Current numbers are in the
 [docs](../README.md) and the [README](../../README.md); how to measure is in [BENCHMARK_PROTOCOL.md](../BENCHMARK_PROTOCOL.md).
 
-This page is built by `python tools/bench_results_index.py` (`--check` fails when a folder is missing from it). 143 folders and 3 loose files, 2188 files in all.
+This page is built by `python tools/bench_results_index.py` (`--check` fails when a folder is missing from it). 149 folders and 3 loose files, 2224 files in all.
 
 
 ## 2026-09
@@ -158,12 +158,18 @@ This page is built by `python tools/bench_results_index.py` (`--check` fails whe
 | [2026-10-12-p40-sm61-kernels](2026-10-12-p40-sm61-kernels/) | Tesla P40 (sm_61): wide dequantization, the dense GEMMs as cublasSgemm (opt-in), expert mode 8 and a matvec table (2026-10-12) | 16 |
 | [2026-10-20-0.2.1-bench](2026-10-20-0.2.1-bench/) | First real strata bench run on the released 0.2.1 (terminal 0.2.1, engine 0.1.46 cuda12 Linux packages) | 43 |
 | [2026-10-20-0.2.1-idle-gpu](2026-10-20-0.2.1-idle-gpu/) | The idle GPUs (proposal 2507-0): what the existing switches do on NVIDIA | 15 |
+| [2026-10-31-standard-rtx-4080-4e360c35](2026-10-31-standard-rtx-4080-4e360c35/) | Strata standard benchmark: NVIDIA GeForce RTX 4080 | 7 |
+| [2026-10-31-standard-rtx-4080-521a8fee](2026-10-31-standard-rtx-4080-521a8fee/) | Strata standard benchmark: NVIDIA GeForce RTX 4080 | 7 |
+| [2026-10-31-standard-rtx-4080-cbc1a827](2026-10-31-standard-rtx-4080-cbc1a827/) | Strata standard benchmark: NVIDIA GeForce RTX 4080 | 7 |
+| [2026-10-31-standard-rtx-4080-d5d09a91](2026-10-31-standard-rtx-4080-d5d09a91/) | Strata standard benchmark: NVIDIA GeForce RTX 4080 | 7 |
+| [2026-10-31-standard-rtx-4080-e3c6d880](2026-10-31-standard-rtx-4080-e3c6d880/) | Strata standard benchmark: NVIDIA GeForce RTX 4080 | 7 |
 
 ## 2026-11
 
 | Folder | What | Files |
 | --- | --- | ---: |
 | [2026-11-14-rdna2-pcie-auto](2026-11-14-rdna2-pcie-auto/) | PcieAuto on gfx103x: the decode miss split from the CPU pool's speed (#4007) | 3 |
+| [2026-11-20-q36-kv-precision](2026-11-20-q36-kv-precision/) | q36 --kv fp32/fp16/fp8/fp4 — memory width for the K/V cache | 1 |
 
 ## Loose files
 

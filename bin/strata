@@ -1,0 +1,28 @@
+#!/bin/sh
+# The fork's checkout launcher: `bin/` is the first entry of the user PATH on this PC, so `strata` here runs
+# this checkout. Upstream moved the Terminal into `terminal/`, so this script forwards to the terminal's own
+# launcher (`terminal/bin/strata`), which finds `terminal/strata.py` and the interpreter.
+#
+# The one thing it adds: the checkout's own `.venv` (it carries `rich` and `textual`, which the screens need) is
+# named through STRATA_PYTHON, because the terminal launcher looks for `.venv` beside its own `strata.py`
+# (`terminal/.venv`), not at the checkout root.
+set -eu
+
+# Resolve this script's real directory, following symlinks, so `strata` can live on PATH.
+self=$0
+while [ -L "$self" ]; do
+  dir=$(CDPATH= cd -- "$(dirname -- "$self")" && pwd -P)
+  target=$(readlink "$self")
+  case $target in
+    /*) self=$target ;;
+    *) self=$dir/$target ;;
+  esac
+done
+HERE=$(CDPATH= cd -- "$(dirname -- "$self")" && pwd -P)
+
+if [ -x "$HERE/../.venv/Scripts/python.exe" ]; then
+  STRATA_PYTHON="$HERE/../.venv/Scripts/python.exe"
+  export STRATA_PYTHON
+fi
+
+exec "$HERE/../terminal/bin/strata" "$@"

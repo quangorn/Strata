@@ -8,10 +8,10 @@
 #   6. strata launch --preset ...        the newest package is the engine, the reader ships in its folder
 #
 # Nothing downloads an engine: `strata launch` reads the component folder and says in plain words when the package there is
-# older than a model needs, and `strata update` skips the engine by default (see packaging/README.md, "Updating this PC").
+# older than a model needs, and `strata update` skips the engine by default (see tools/packaging/README.md, "Updating this PC").
 # Set PRESET to the model you serve (the default is the one running now). STRATA_PORTABLE=ON is passed through to step 5.
 set -e
-cd /cygdrive/c/Projects/Strata-fork
+cd "$(dirname "$0")/.."
 PY=./.venv/Scripts/python.exe
 # the build runs with the cygwin interpreter: it turns every Windows path into its `/cygdrive/c/...` form, which a
 # Windows interpreter cannot open, so `python3` here and not the `.venv` python (see the script's `upath()`)
@@ -19,12 +19,12 @@ PRESET="${PRESET:-iq2_xs-low_ram}"
 
 git pull --ff-only
 
-$PY strata.py launch --stop
+$PY terminal/strata.py launch --stop
 
-$PY strata.py update
+$PY terminal/strata.py update
 
 $PY tools/deploy_local_code.py
 
-python3 packaging/build_engine_win_local.py
+python3 tools/packaging/build_engine_win_local.py
 
-$PY strata.py launch --preset "$PRESET"
+$PY terminal/strata.py launch --preset "$PRESET"

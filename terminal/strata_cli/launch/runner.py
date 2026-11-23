@@ -190,7 +190,7 @@ STAGES = ("engine", "model", "config", "tune", "start", "access")
 ENGINE_BUILD_STEP = ("Build a newer one here: `python tools/packaging/build_engine_win_local.py` (it packages the engine, the picture reader and "
                      "the libraries it loads), then start again.")
 
-NO_ENGINE_STEP = ("build the engine for this computer with `python packaging/build_engine_win_local.py`, which puts its package in the "
+NO_ENGINE_STEP = ("build the engine for this computer with `python tools/packaging/build_engine_win_local.py`, which puts its package in the "
                   "component folder, and start again; if this stays, your graphics card is not one Strata supports yet, "
                   "and the model files stay on this computer for when it is")
 
@@ -970,7 +970,7 @@ class Runner:
     # ---- 1. the engine
     def ensure_engine(self) -> None:
         """The engine of this computer, as it is installed. Nothing is downloaded here, and nothing is fetched from an update feed:
-        this fork's engine is the package built in the checkout (`packaging/build_engine_win_local.py`), so a start uses what is in the
+        this fork's engine is the package built in the checkout (`tools/packaging/build_engine_win_local.py`), so a start uses what is in the
         component folder and says in plain words when it is old, or when there is none. A warning, never a refusal (the owner rule):
         the model is downloaded and started with the engine that is here, and the final message names what to build."""
         self.warn_wsl_amd()
