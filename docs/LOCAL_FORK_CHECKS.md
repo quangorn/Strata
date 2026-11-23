@@ -60,3 +60,62 @@ The groups that check the engine step of the launch and of `strata update` pass 
 `test_updater.py` (56), `test_round8_fixes.py` (26), `test_no_acquisition.py` (12), `test_component_start.py` (8),
 `test_make_guard.py` (22), `test_profiles.py` (21), `test_launch_monitor.py` (11), `test_issues_022.py` (33) and
 `test_update_with_model.py` (40).
+
+## The engine parity tests (ctest)
+
+The fork's build script `tools/packaging/build_engine_win_local.py` builds the engine: its `engine` step compiles `strata.exe`
+and `strata_kq.dll`, the `vision` step the picture reader `strata-vision.exe`. It builds no test executable, so a `ctest` run
+in `build-c13-win` straight after that script answers `0% tests passed, 88 tests failed out of 88` — every test is "Not Run",
+because none of the test executables is in the folder (measured 2026-11-24: `ctest -N` lists 88 tests and prints
+"Could not find executable …" for every one of them).
+
+The 88 tests come from `engine/cmake/strata_gpu_engine.cmake`, which registers them when CUDA is on. The folder's cache has
+`STRATA_BUILD_TESTS=OFF` (read from `build-c13-win/CMakeCache.txt`, 2026-11-24), and its generator is Ninja: a full build of the
+folder with `ninja -k 0 -j 24` inside the vcvars64 environment builds the test executables anyway. `cl.exe` needs vcvars, and
+`cmake`, `ctest` and `ninja` here are this checkout's `.venv/Scripts` copies.
+
+A full build of `build-c13-win` (measured 2026-11-24): `build.ninja` has 108 executable targets, 100 of them built. `strata.exe`,
+the libraries and `strata-device.exe` — the binary of `cuda_device_selftest` — build. The tests need 76 unique executables, and
+73 of them build. Eight targets do not build; three of them are test executables:
+
+| Target | Why it does not build (the message as printed) |
+|---|---|
+| `flag_order_test.exe` | `flag_order_test.cu(31): error: identifier "__ATOMIC_SEQ_CST" is undefined` and `identifier "__atomic_load_n" is undefined`: the test uses GCC's atomic builtins, which nvcc with the MSVC host compiler has none of |
+| `gemm_w16_parity.exe` | `gemm_w16_parity.cu(101): error: identifier "setenv" is undefined`: the file calls POSIX `setenv` with no `_WIN32` branch. The fork's pattern is `_putenv_s` (`engine/src/kernels/hc_persist_parity.cpp`, `engine/src/prefill/kva_test.cpp`) |
+| `pinned_shared_win_test.exe` | link fails: `strata_core.lib(pinned.cu.obj) : error LNK2019: unresolved external symbol strata::kernels::cpu::expert_layout()`, referenced in `numa_arena_usable`; `fatal error LNK1120: 1 unresolved externals`. The link line has no CPU-expert library |
+
+The same `LNK2019` takes down three binaries that are not tests: `strata-load.exe`, `strata-overlap.exe`, `strata-concurrent.exe`.
+Two more targets fail for the same kind of reason and are not tests either: `dflash2_ring_test.cpp(190)` and `(193)` —
+`error C3861: setenv: identifier not found` and `unsetenv`, and `q8_gemv_bench.cpp` —
+`native_mmvq.hpp(115): error C4430` and `error C2143` (MSVC reads a GCC-only construct in the header).
+
+The run after the full build, with this checkout's `.venv/Scripts/ctest.exe --test-dir build-c13-win` (measured 2026-11-24):
+**81 Passed, 1 Skipped, 3 Failed, 3 Not Run**, and `ctest` answers `93% tests passed, 6 tests failed out of 88` (it counts a
+"Not Run" as a failure; the Skipped test is not counted). `Total Test time (real) = 422.88 sec`.
+
+The three that Failed:
+
+| Test | Time | What it printed |
+|---|---|---|
+| `gr_parity` | 0.61 s | its first line is `q8 sync: an illegal memory access was encountered`; every check it prints passes ("real dims 2560/4/320 BF16 pass", "… FP32 pass", "native pinned GR pass", "fused GR read + q8_1 (STRATA_QFUSE), T 1..8, direct and graph replays: pass"), and the exit code is nonzero |
+| `kv_window_parity` | 23.26 s | 11 `FAIL int8` lines (`streamed attention differs (140, 2)`, `ring attention differs (140, 2)`, … `(1459, 6)`) and `FAIL int8: a host copy differs from the resident reference (4, 0)`; its counters end with `int8 graph : … host/ring-host bad 4` |
+| `ple_parity` | 0.01 s | `ple_parity: required PLE table is missing or incompatible: ../../Q2_0/Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00002-of-00002.gguf (cannot open …)`: the test needs a Q2_0 expert pack that is not in this tree |
+
+The Skipped test is `pinned_alias_test`: `pinned_alias_test: SKIP (Windows HIP only)`, return code 77. Seventeen tests are
+registered with `SKIP_RETURN_CODE "77"` (read from `CTestTestfile.cmake`, 2026-11-24); in this run one used it.
+`cuda_device_selftest` (`strata-device.exe --selftest`) passed.
+
+The GPU part: 73 of the 76 test executables link the CUDA runtime (read from `build.ninja`, 2026-11-24), so they need a GPU; the
+three CPU-only ones are `auto_cache_test`, `ple_residency_test`, `qwen35_sampling_test`. The serving model is up here
+(`IQ2_XS low_ram` on 127.0.0.1:8080) and holds about 14.3 GiB of the card's 16 GiB, so about 1.6 GiB is free — measured
+2026-11-24, the model was not stopped for any of this. No test printed an out-of-memory message (searched
+`build-c13-win/Testing/Temporary/LastTest.log`, 2026-11-24): the only CUDA error line in the whole run is `gr_parity`'s
+"an illegal memory access was encountered", and its checks all pass. The GPU parity tests run on synthetic data in a small
+buffer, so 1.6 GiB of free memory is enough for them. None of the 88 tests starts the engine or loads a model, and none needs
+the model stopped; the one test that wants a model file (`ple_parity`) fails by saying the file is missing, not by touching the
+serving model.
+
+What to do: run `ctest` after a full build of the build folder. `tools/packaging/build_engine_win_local.py` builds the engine
+and the reader only, and its folders have no test executables, so a `ctest` run there answers 88 failures out of 88 and says
+nothing about the engine. A full build needs vcvars for `cl.exe`; the build does not stop the serving model, and the run is done
+with the model up.
