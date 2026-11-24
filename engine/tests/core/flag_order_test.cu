@@ -7,6 +7,9 @@
 #include <cstdio>
 #include <cstdlib>
 #include <thread>
+#if defined(_WIN32)
+#include <intrin.h>
+#endif
 
 using strata::core::FlagRaise;
 using strata::core::flag_raise_max;
@@ -28,7 +31,13 @@ __global__ void consumer(volatile uint32_t* flag, uint32_t want, volatile uint32
     *seen = *staging;        // what the graph's PCIe group would read
 }
 
-static uint32_t rd(volatile uint32_t* p) { return __atomic_load_n((uint32_t*) p, __ATOMIC_SEQ_CST); }
+static uint32_t rd(volatile uint32_t* p) {
+#if defined(_WIN32)   // MSVC has no __atomic_load_n (the same exchange flag_order.hpp uses)
+    return (uint32_t) _InterlockedCompareExchange((volatile long*) p, 0, 0);
+#else
+    return __atomic_load_n((uint32_t*) p, __ATOMIC_SEQ_CST);
+#endif
+}
 
 static int run_device(int dev) {
     CK(cudaSetDevice(dev));
