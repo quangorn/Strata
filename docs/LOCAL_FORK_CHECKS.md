@@ -89,6 +89,19 @@ Two more targets fail for the same kind of reason and are not tests either: `dfl
 `error C3861: setenv: identifier not found` and `unsetenv`, and `q8_gemv_bench.cpp` —
 `native_mmvq.hpp(115): error C4430` and `error C2143` (MSVC reads a GCC-only construct in the header).
 
+All eight are fixed in this checkout (measured 2026-11-24, the same folder, the same command). The fixes are the fork's
+own pattern, not new machinery: `engine/tests/core/flag_order_test.cu` takes the `_InterlockedCompareExchange` branch
+that `include/strata/core/flag_order.hpp` already uses; `engine/src/prefill/gemm_w16_parity.cu` and
+`engine/src/core/dflash2_ring_test.cpp` map `setenv`/`unsetenv` to `_putenv_s` under `_WIN32`, as
+`engine/src/kernels/hc_persist_parity.cpp` does; `engine/cmake/strata_gpu_engine.cmake` adds
+`$<TARGET_NAME_IF_EXISTS:strata_kernels_cpu>` to the four link lines (the pattern from
+`engine/src/split/CMakeLists.txt:112`; the target is made in `engine/sycl/CMakeLists.txt:176` when native experts are
+on); `engine/include/strata/kernels/native_mmvq.hpp` declares `int8_t` and only included `<cstddef>`, so it gets
+`<cstdint>`. A full build of `build-c13-win` then builds 108 of 108 executable targets, all 76 test executables, exit 0.
+The ctest run that follows answers **86 Passed, 1 Skipped, 2 Failed, 0 Not Run** — `98% tests passed, 2 tests failed out
+of 88` in 413.91 s. `kv_window_parity`, which failed in the first run (23.26 s, 11 `FAIL int8` lines), passed in this
+run: it is the one parity test whose result moved between runs, and the model was up both times.
+
 The run after the full build, with this checkout's `.venv/Scripts/ctest.exe --test-dir build-c13-win` (measured 2026-11-24):
 **81 Passed, 1 Skipped, 3 Failed, 3 Not Run**, and `ctest` answers `93% tests passed, 6 tests failed out of 88` (it counts a
 "Not Run" as a failure; the Skipped test is not counted). `Total Test time (real) = 422.88 sec`.
