@@ -68,9 +68,9 @@ Settings are environment variables, all optional:
 | `ARCHS` | `89` (RTX 4080) | CUDA architectures, semicolons; the release cuda13 list is `75;86;89;120` |
 | `BUILD_JOBS` | `24` | compile jobs; a 24-job build of this tree on this PC (48 GB) needed at most 4 GB |
 | `BUILD_DIR` | `build-c13-win` | the build folder, kept between runs |
-| `STAGE` | `<build>/stage` | where `strata.exe`, `strata_kq.dll` and `BUILD.json` are staged |
+| `STAGE` | `<build>/stage` | where `strata.exe`, `strata_kq.dll` (if the build tree has that target) and `BUILD.json` are staged |
 | `OUT` | `%LOCALAPPDATA%\Strata\components\engine` | where the package is written |
-| `VERSION_SUFFIX` | `-local` | the suffix the engine prints (`strata 0.1.66-local`); empty reports the release version |
+| `VERSION_SUFFIX` | `-local` | the suffix the engine prints (`strata 0.1.67-local`); empty reports the release version |
 | `STRATA_PORTABLE` | `OFF` | `ON` builds for other PCs (AVX2 floor, static MSVC runtime) |
 | `STRATA_ISA_FLOOR` | AVX2 | `avx` or `none` for a CPU without AVX2 |
 | `EXTRA_FLAGS` | empty | more Release flags for C, C++ and nvcc |
@@ -105,7 +105,7 @@ strata update                            # 3. Control from the feed; the engine 
 python tools/deploy_local_code.py        # 4. this checkout's own Python changes into components/control/<active>: the folder that
                                          #    runs the server. The terminal is not touched: its upstream release is an older code
                                          #    base, and the launch runs from this checkout (`bin\strata.ps1` with its `.venv`, which forwards to `terminalin`)
-python3 tools/packaging/build_engine_win_local.py   # 5. engine, picture reader, package 0.1.66-local-windows-x86_64-cuda-cuda13. The cygwin
+python3 tools/packaging/build_engine_win_local.py   # 5. engine, picture reader, package 0.1.67-local-windows-x86_64-cuda-cuda13. The cygwin
                                          #    interpreter: the script turns Windows paths into /cygdrive/c/..., which a Windows
                                          #    interpreter cannot open. `tools/rebuild_engine.sh` is this routine in one file.
 strata launch --preset iq2_xs-low_ram    # 6. the engine is the newest package, the reader ships in its folder
@@ -155,7 +155,7 @@ powershell -NoProfile -Command "$parts=[Environment]::GetEnvironmentVariable('Pa
   [Environment]::SetEnvironmentVariable('Path', ($u -join ';'), 'User')"
 ```
 
-Check it in a new terminal window: `strata --version` must say `strata 0.2.20 (build 0.1.66; python ... C:\Projects\Strata-fork\.venv\Scripts\python.exe)`.
+Check it in a new terminal window: `strata --version` must say `strata 0.2.21 (build 0.1.67; python 3.12.10 at C:\Projects\Strata-fork\.venv\Scripts\python.exe)` (measured 2026-11-24 in this checkout).
 
 ## The private Node runtime
 

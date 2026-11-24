@@ -5,7 +5,7 @@ Run it from cygwin bash (any Python 3.10+), or from cmd / PowerShell with the ch
 
     python3 tools/packaging/build_engine_win_local.py            engine, picture reader, package
     python3 tools/packaging/build_engine_win_local.py plan       show what it would do (nothing is built)
-    python3 tools/packaging/build_engine_win_local.py engine     only strata.exe + strata_kq.dll (pictures stay off)
+    python3 tools/packaging/build_engine_win_local.py engine     only strata.exe, plus strata_kq.dll when the build tree has that target (pictures stay off)
     python3 tools/packaging/build_engine_win_local.py vision     only the picture reader, into the last build
     python3 tools/packaging/build_engine_win_local.py package    only the package from the last build
 

@@ -113,9 +113,10 @@ version rule ("`0.1.67-local` is not a version number"), which is the known limi
 ## Tests
 
 - The Terminal and Control suite: `./.venv/Scripts/python.exe -m pytest terminal/tests/terminal -q` runs without a
-  GPU, without downloads and with a serving model stopped. On this PC (measured 2026-11-24, after the upstream
-  0.2.20 merge): 3781 passed, 138 skipped, 1666 subtests passed in 2583 s, with 5 failures. All five fail on a clean
-  upstream v0.2.20 checkout on this PC too; their causes are listed in `docs/LOCAL_FORK_CHECKS.md`.
+  GPU, without downloads and without stopping a serving model. On this PC (measured 2026-11-24, after the upstream 0.2.21
+  merge and the fork's test fixes): **3968 passed, 138 skipped, 2142 subtests passed in 2321 s, with 3 failures**. All three
+  fail on a clean upstream v0.2.21 checkout on this PC too. The causes, the three cases the fork's own test edits close, and
+  the ctest numbers (409 tests, `99% tests passed, 4 tests failed out of 409` in 1703 s) are in `docs/LOCAL_FORK_CHECKS.md`.
 - Setup's own tests run without a GPU or downloads: `python terminal/tools/test_setup_<name>.py` (for example
   `terminal/tools/test_setup_amd.py`, `terminal/tools/test_setup_choices.py`).
 - The app's UI tests: `npm test` in `app/host`. Engine parity tests: `ctest` in the build folder.
