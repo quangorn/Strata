@@ -21,8 +21,10 @@ static double now_s() {
 }
 
 static void bench_type(Type wt, Type at, int n, size_t total_bytes, const char* regime) {
-    const TypeInfo* wi = type_info(wt);
-    const TypeInfo* ai = type_info(at);
+    // `type_info` is qualified: MSVC reads the plain name as std::type_info (error C2872, an ambiguous symbol), where GCC picks
+    // strata::quant::type_info by ADL. Every other caller in this tree writes it qualified (tests/quant/quant_parity.cpp:298).
+    const TypeInfo* wi = strata::quant::type_info(wt);
+    const TypeInfo* ai = strata::quant::type_info(at);
     const DotKernel* k1 = dot_kernel(wt, Arith::Avx2);
     const DotX4Kernel* k4 = dot_x4_kernel(wt, Arith::Avx2);
     if (wi == nullptr || ai == nullptr || k1 == nullptr || k4 == nullptr) {
