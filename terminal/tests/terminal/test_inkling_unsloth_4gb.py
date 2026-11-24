@@ -164,6 +164,7 @@ class TestInklingUnslothDirectCatalog(unittest.TestCase):
                  mock.patch.object(setup, "data_folder_for", return_value=(data_dir, "explicit")), \
                  mock.patch.object(setup, "pip_install"), \
                  mock.patch.object(setup, "free_gb", return_value=500.0), \
+                 mock.patch.object(setup, "ram_free_gb", return_value=16.0), \
                  mock.patch.object(setup, "inkling_fetch", side_effect=fake_fetch), \
                  mock.patch.object(setup, "engine_step", return_value=(None, eng_dir, {"component": "strata-inkling"}, [], gpu_4gb, "none")), \
                  mock.patch.object(setup, "engine_exe", return_value="component:strata-inkling"), \
@@ -280,6 +281,7 @@ class TestSetupRamExpertsFlag(unittest.TestCase):
                  mock.patch.object(setup, "data_folder_for", return_value=(data_dir, "explicit")), \
                  mock.patch.object(setup, "pip_install"), \
                  mock.patch.object(setup, "free_gb", return_value=500.0), \
+                 mock.patch.object(setup, "ram_free_gb", return_value=ram_gb), \
                  mock.patch.object(setup, "inkling_fetch", side_effect=fake_fetch), \
                  mock.patch.object(setup, "inkling_tokenizer_dir", return_value=root / "tok"), \
                  mock.patch.object(setup, "engine_step", return_value=(None, eng_dir, {"component": "strata-inkling"}, [], gpu, "none")), \
