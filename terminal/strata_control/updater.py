@@ -2110,19 +2110,22 @@ def _model_check(ctx: Context, feed: feedmod.Feed, state: State, *, engine: bool
     gate.consent(serving, "It would update the " + " and the ".join(changes) + ".")
 
 
-def _shape_steps(ctx: Context, feed: feedmod.Feed, engine: bool) -> list:
+def _shape_steps(ctx: Context, feed: feedmod.Feed, engine: bool, shape_feed: bool = False) -> list:
     """One step for each model-shape engine installed here (strata_control/shape_engine.py): the explicit update brings it up to the feed's, beside the older one; the Strata engine is
-    not touched. A PC that never installed one has no such step."""
-    if not engine:
+    not touched. A PC that never installed one has no such step.
+    `shape_feed` False (upstream's rule, and this fork's default): the shape step runs only inside the engine step. This fork closes the Strata engine to the feed
+    (`engine_skipped`), so the shape engines get their own word: `STRATA_SHAPE_ENGINE_FROM_FEED=1` opens the shape step alone, and `--engine` opens both."""
+    if not engine and not shape_feed:
         return []
     from strata_control import shape_engine
     return [(shape_engine.component_id(shape), (lambda shape=shape: shape_engine.update_one(ctx, feed, shape, install_missing=False)))
             for shape in shape_engine.installed_shapes(ctx.components)]
 
 
-def run_update(ctx: Context, *, engine: bool = True, control: bool = True, app: bool = False) -> dict:
+def run_update(ctx: Context, *, engine: bool = True, control: bool = True, app: bool = False, shape_engine: bool = False) -> dict:
     """`strata update`: the feed once, then the engine, Control and (if asked) the app installer, each reported separately.
-    A component that fails does not undo one that succeeded; the exit code is the worst one."""
+    A component that fails does not undo one that succeeded; the exit code is the worst one.
+    `shape_engine` True with the engine step off: the engines of model shapes are fetched without the Strata engine (see `_shape_steps`)."""
     require_acquisition("the update")
     results, failure = [], None
     with update_lock(ctx.components):
@@ -2131,7 +2134,7 @@ def run_update(ctx: Context, *, engine: bool = True, control: bool = True, app: 
         state.save()
         _model_check(ctx, feed, state, engine=engine, control=control)
         steps = ([("engine", lambda: update_engine(ctx, feed, state))] if engine else []) + \
-                _shape_steps(ctx, feed, engine) + \
+                _shape_steps(ctx, feed, engine, shape_engine) + \
                 ([("control", lambda: update_control(ctx, feed, state))] if control else []) + \
                 ([("app", lambda: update_app(ctx, feed))] if app else [])
         for name, step in steps:

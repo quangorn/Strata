@@ -2,6 +2,8 @@
 
     strata update                 Control from the signed feed; NOT the engine, which this fork builds in the checkout
     strata update --engine        fetch an engine package for this PC as upstream does (the same as STRATA_ENGINE_FROM_FEED=1)
+    STRATA_SHAPE_ENGINE_FROM_FEED=1   the engine of a model shape (Inkling-2-Mini, Hy4-Flash: `<components>/shapes/<shape>/engine/`) is fetched from the feed;
+                                      the Strata engine stays the package built in the checkout. `--engine` opens both, `--no-engine` closes both
     strata update --check         read the feed and say what would change; downloads nothing else
     strata update --app           also download and verify the desktop app's installer
     strata components update      the same as `strata update` (Control; the engine is off by default here)
@@ -50,6 +52,28 @@ def engine_from_feed(environ=None) -> bool:
     """Whether `strata update` may take an engine package from the feed: off by default on this PC, on with ENV_ENGINE_FEED=1."""
     environ = os.environ if environ is None else environ
     return environ.get(ENV_ENGINE_FEED, "").strip().lower() in ("1", "true", "yes", "on")
+
+
+#: The engine of a model shape (Inkling-2-Mini, Hy4-Flash, …) is its own component in `<components>/shapes/<shape>/engine/` and travels
+#: in the feed as `shape_engines` (`strata_control/shape_engine.py`). This fork closes the Strata engine to the feed, and that closed the
+#: shape step with it, so the shape engines get their own word: set this to 1 (or true/yes/on) and `strata update` brings an installed
+#: shape engine up to date beside the older one, while the Strata engine stays the package built in the checkout. `--engine` opens both.
+ENV_SHAPE_ENGINE_FEED = "STRATA_SHAPE_ENGINE_FROM_FEED"
+
+
+def shape_engine_from_feed(environ=None) -> bool:
+    """Whether `strata update` may take a model-shape engine from the feed: off by default on this PC (the engine step is off here), on with ENV_SHAPE_ENGINE_FEED=1."""
+    environ = os.environ if environ is None else environ
+    return environ.get(ENV_SHAPE_ENGINE_FEED, "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def feed_steps(eng: bool, no_engine: bool, environ=None) -> tuple[bool, bool]:
+    """The two engine steps of one `strata update` run, as (the Strata engine, the engines of model shapes).
+    `--engine` opens both; `STRATA_ENGINE_FROM_FEED=1` opens the Strata engine; `STRATA_SHAPE_ENGINE_FROM_FEED=1` opens the shape engines alone
+    (this fork's word, see `ENV_SHAPE_ENGINE_FEED`); `--no-engine` closes both."""
+    if no_engine:
+        return (False, False)
+    return (bool(eng) or engine_from_feed(environ), bool(eng) or shape_engine_from_feed(environ))
 
 
 def default_feed() -> str:
@@ -375,7 +399,7 @@ def run(a) -> int:
         ctx.source = _feed_source(a, root)
         if signing.extra_keys_in_effect() and not machine:
             print(f"note: trusting the extra keys in {os.environ.get(signing.ENV_EXTRA_KEYS)} (a test setup)", file=sys.stderr)
-        engine = (getattr(a, "engine", False) or engine_from_feed()) and not a.no_engine
+        engine, shape = feed_steps(getattr(a, "engine", False), a.no_engine)
         if a.check:
             report = updater.check(ctx, engine=engine)
             if machine:
@@ -387,7 +411,7 @@ def run(a) -> int:
             print(f"Strata update ({ctx.source})")
         from strata_control import engine_update
         out = engine_update.update_with_models(ctx, _gate_for(a, ctx, machine), show=None if machine else _show_results,
-                                               engine=engine, control=not a.no_control, app=a.app)
+                                               engine=engine, control=not a.no_control, app=a.app, shape_engine=shape)
         if machine:
             print(json.dumps({"schema_version": 1, "ok": out["exit_code"] == 0, **out}, ensure_ascii=False))
         elif out["exit_code"] == engine_update.EXIT_NOT_RESTARTED:
