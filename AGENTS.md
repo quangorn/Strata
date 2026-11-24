@@ -28,8 +28,13 @@ layer that points at `terminal/` (`strata`, `strata.cmd`, `strata.ps1` + `strata
 
 - RTX 4080 (sm_89), driver 610.88, CUDA Toolkit 13.4, Visual Studio 2022 Build Tools (MSVC 14.44.35207), 48 GB RAM,
   Cygwin bash as the daily shell.
-- `strata` on PATH is this checkout's launcher (`bin/` is PATH's first entry). The serving model is `IQ2_XS low_ram`;
-  its launch files (`strata-swift-iq2_xs.json` and two more) sit in the checkout root, so `Catalog.root` is the checkout.
+- `strata` on PATH is this checkout's launcher (`bin/` is PATH's first entry). The serving model is `IQ2_XS low_ram`:
+  its run config, tuning and log are `%LOCALAPPDATA%\Strata\launch\iq2_xs-*`, its model, pack and picture files are
+  `C:\Projects\Strata-data` beside the checkout, and it runs on the engine package in `components\engine`. The Inkling-2-Mini
+  run config `strata-inkling-2-mini-sq-15.json` sits in the checkout root; that model's engine is the shape component
+  `components\shapes\inkling2\engine`, which is taken from the feed (`STRATA_SHAPE_ENGINE_FROM_FEED=1`), because a local build
+  of it cannot be installed: `strata-inkling` built in the tree names itself `0.1.67` without the `-local` suffix and answers
+  no `--geometry` flag, and an engine that cannot name its shape is refused at install (measured 2026-11-24).
 - `.venv` in the checkout is the Python for setup, tests and packaging; `cmake` and `ninja` used by the packaging
   scripts come from it. The Cygwin `/usr/bin/cmake` is **not** a native build: it cannot make VS solutions, and ninja
   is not on the Cygwin PATH.
@@ -48,19 +53,26 @@ The fork's version rule: the engine's compiled-in version string (`STRATA_VERSIO
 `STRATA_VERSION_SUFFIX`) is part of the conversation identity. The parked conversation-disk tier matches every saved
 index by model + settings fingerprint, which includes `engine_version`, and a start deletes every index whose identity
 differs. Measured 2026-11-02: bumping `project(VERSION …)` to `0.1.55.1` emptied the disk store of all saved
-conversations at the next start. Put the build number in `VERSION` only — `VERSION=0.1.66.1 python3 …` names the
-package folder and the manifest, `resolve()` picks `0.1.66.1-local` over `0.1.66-local` by the manifest version,
-and the engine keeps naming itself `0.1.66-local`. The next model start takes the new engine; restart the preset when
+conversations at the next start. Put the build number in `VERSION` only — `VERSION=0.1.67.1 python3 …` names the
+package folder and the manifest, `resolve()` picks `0.1.67.1-local` over `0.1.67-local` by the manifest version,
+and the engine keeps naming itself `0.1.67-local`. Upstream's 0.2.21 raised `project(VERSION)` to `0.1.67` itself,
+so the merge moved the engine string and the package with it: the build of this checkout names itself `0.1.67-local`
+and its package is `0.1.67-local-windows-x86_64-cuda-cuda13` (measured 2026-11-24: `strata.exe --version`, and the
+package verified by `package_engine.py --verify`). The next model start takes the new engine; restart the preset when
 the work is done, not during the build. (The disk tier and the conversation-cache rules it depends on are parked on
 `fork/conversation-cache-disk`; until they are ported, the identity rule protects nothing on disk.)
 
 Environment knobs, all optional: `ARCHS` (default 89 = this card; the release cuda13 list is `75;86;89;120`),
 `BUILD_JOBS` (default 24; a 24-job build of this tree needed at most 4 GB RAM), `VCVARS_VER` (CUDA 13.4 accepts MSVC
 `_MSC_VER` below 1960, so this PC's toolset 14.44.35207 compiles without it — set the knob only for a toolkit that
-rejects it), `VERSION_SUFFIX` (default `-local`: a forked build names itself `strata 0.1.66-local`), `VERSION` (the
+rejects it), `VERSION_SUFFIX` (default `-local`: a forked build names itself `strata 0.1.67-local`), `VERSION` (the
 build number: package folder and manifest only, never bump the engine string). Build folders are kept between runs;
-delete one when its generator or cached flags change. `STRATA_PORTABLE=ON` is the release-shape build (AVX2 floor,
-static MSVC runtime), repacked over the local package with `tools/packaging/repack_local_portable.sh`.
+delete one when its generator or cached flags change — and when its source folder moves, because the cache records
+where the source is: `build-c13-win`'s cache came from the pre-split root `CMakeLists.txt`, and `build-vision-cuda13-win`
+refused to reconfigure after the picture reader moved to `terminal/tools/vision` (measured 2026-11-24: both answer
+"the source … does not match the source … used to generate cache", and the folders are `build-0.1.67-win` and a fresh
+vision folder now). `STRATA_PORTABLE=ON` is the release-shape build (AVX2 floor, static MSVC runtime), repacked over
+the local package with `tools/packaging/repack_local_portable.sh`.
 Do not add `--use_fast_math` to `EXTRA_FLAGS` for a whole build: it changes rounding outside the kernel files.
 
 A hand CMake build (no packaging): use a native Windows CMake, the VS Build Tools copy works
@@ -73,10 +85,13 @@ cmake -S engine -B build-cuda -G "Visual Studio 17 2022" -A x64 \
 cmake --build build-cuda --config Release --parallel
 ```
 
-The engine is `build-cuda/Release/strata.exe` (without `STRATA_VERSION_SUFFIX` it names itself plain `0.1.66`); the
-test executables sit in the same folder and `ctest` runs them. A `--parallel` VS build leaves its MSBuild node-reuse
-workers alive after the build ends — kill the stray `MSBuild.exe` once the build is done. CUDA kernels compile for
-`native` (sm_89 here); the guard in `engine/CMakeLists.txt` refuses anything below sm_75.
+The engine is `build-cuda/Release/strata.exe` (without `STRATA_VERSION_SUFFIX` it names itself plain `0.1.67`); the
+test executables sit in the same folder and `ctest` runs them, with `-DSTRATA_BUILD_TESTS=ON`: some tests are registered
+by a subfolder's `CMakeLists.txt` (`engine/src/inkling2/CMakeLists.txt:270` registers `sk_tier_test` in `src/inkling2/`)
+and a tests-OFF cache registers the test without building its executable, which ctest answers "Not Run" (measured
+2026-11-24). A `--parallel` VS build leaves its MSBuild node-reuse workers alive after the build ends — kill the stray
+`MSBuild.exe` once the build is done. CUDA kernels compile for `native` (sm_89 here); the guard in
+`engine/CMakeLists.txt` refuses anything below sm_75.
 
 MSVC has no `setenv`/`unsetenv`: tests that set the environment use the `#if defined(_WIN32)` + `_putenv_s`
 pattern (`engine/src/kernels/hc_persist_parity.cpp`, `engine/src/prefill/kva_test.cpp`). Follow it in new tests.
@@ -87,6 +102,13 @@ Warnings C4244 and C4996 (`strerror`) are tolerated, `STRATA_WERROR` is off by d
 `python tools/deploy_local_code.py` copies the fork's launch and control files (`terminal/serve/server.py`,
 `terminal/strata_cli/**`, `terminal/strata_control/**`) into the active component folder. A running server keeps the
 code it loaded, so deploy first, then stop and start the model.
+
+`strata update` takes Control from the signed feed and skips the engine (the package built in the checkout is the one
+that runs). `STRATA_SHAPE_ENGINE_FROM_FEED=1` opens the model-shape engines: `strata update` brings an installed shape
+engine (Inkling-2-Mini, Hy4-Flash) to the newest of the feed beside the older one, in `components/shapes/<shape>/engine/`,
+without touching the Strata engine (`terminal/strata_cli/update_cmd.py:feed_steps`). This is the only way to get a shape
+engine on this PC: a local build of one cannot be installed. `--engine` opens both steps, and on this PC it fails on the
+version rule ("`0.1.67-local` is not a version number"), which is the known limit, not a bug to fix here.
 
 ## Tests
 
