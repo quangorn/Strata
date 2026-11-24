@@ -2,12 +2,13 @@
 
 This is the **quangorn/Strata** fork of `Niko1221/Strata` (remote `upstream`). This PC runs its own engine, its own
 launch code, and one update routine: nothing here downloads an engine, every package is built on this PC.
-Version 0.2.20, engine 0.1.66. Read **[docs/AI_REFERENCE.md](docs/AI_REFERENCE.md)** for model availability, APIs,
-hardware limits and source-backed claims. Read **[docs/LOCAL_FORK_CHECKS.md](docs/LOCAL_FORK_CHECKS.md)** before
-changing `terminal/serve/server.py`, `terminal/strata_cli/launch/runner.py` or
-`terminal/strata_control/updater.py`: those checks need real restarts and are not in the offline suite.
+Version 0.2.21, engine 0.1.67. The public model families are Qwen3.8-Flash-Next and Qwen3.6-35B-A3B. Read
+**[docs/AI_REFERENCE.md](docs/AI_REFERENCE.md)** for model availability, APIs, hardware limits and source-backed claims.
+Read **[docs/LOCAL_FORK_CHECKS.md](docs/LOCAL_FORK_CHECKS.md)** before changing `terminal/serve/server.py`,
+`terminal/strata_cli/launch/runner.py` or `terminal/strata_control/updater.py`: those checks need real restarts and
+are not in the offline suite.
 
-## Layout (upstream 0.2.20)
+## Layout (upstream 0.2.21)
 
 Upstream split the repository into four trees; the fork's checkout is the same shape:
 
